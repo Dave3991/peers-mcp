@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using System.Net.Http.Json;
 using System.Text.Json;
 using Peers.Shared;
@@ -35,6 +36,11 @@ try
             PrintBrokerStatus(brokerStatus);
             Console.WriteLine($"\nBroker ready on http://127.0.0.1:{broker.Port} (pid {broker.Pid}).");
             return 0;
+        }
+
+        case "claude":
+        {
+            return await RunClaudeAsync(args.Skip(1).ToArray());
         }
 
         case "status":
@@ -151,6 +157,41 @@ static async Task<BrokerStatus?> RequireHealthyBrokerAsync()
     return null;
 }
 
+static async Task<int> RunClaudeAsync(string[] forwardedArgs)
+{
+    if (OwnsFlag(forwardedArgs, "--channels") || OwnsFlag(forwardedArgs, "--dangerously-load-development-channels"))
+    {
+        Console.Error.WriteLine("'peers-cli claude' automatically sets the Claude channel flags. Remove '--channels' and '--dangerously-load-development-channels'.");
+        return 1;
+    }
+
+    var psi = new ProcessStartInfo
+    {
+        FileName = "claude",
+        UseShellExecute = false,
+    };
+
+    psi.ArgumentList.Add("--dangerously-load-development-channels");
+    psi.ArgumentList.Add("server:peers");
+
+    foreach (var arg in forwardedArgs)
+        psi.ArgumentList.Add(arg);
+
+    using var process = Process.Start(psi);
+    if (process is null)
+    {
+        Console.Error.WriteLine("Failed to start 'claude'. Ensure the command is installed and on PATH.");
+        return 1;
+    }
+
+    await process.WaitForExitAsync();
+    return process.ExitCode;
+}
+
+static bool OwnsFlag(string[] args, string flag) =>
+    args.Any(arg => string.Equals(arg, flag, StringComparison.Ordinal) ||
+                    arg.StartsWith(flag + "=", StringComparison.Ordinal));
+
 static string? GetArg(string[] args, string name)
 {
     var idx = Array.IndexOf(args, name);
@@ -192,6 +233,7 @@ static void PrintUsage()
         Commands:
           broker-status           Show broker health and discovery-file state
           broker-start            Launch the broker if needed and wait until healthy
+          claude [args...]        Start Claude Code with `server:peers` development channel enabled
           status                  Show broker status and connected peers
           register [tool]         Register a simulated peer (--repo, --branch, --summary)
           scratchpads             List all scratchpads

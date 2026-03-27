@@ -33,8 +33,15 @@ public sealed class PeerService(PeerRepository peers, EventRepository events)
         };
 
         await peers.InsertAsync(peer, ct);
+
+        var otherPeers = await peers.ListAsync(repoRoot: req.RepoRoot, includeExpired: false, ct: ct);
+        var recipientPeerIds = otherPeers
+            .Where(p => p.PeerId != id)
+            .Select(p => p.PeerId)
+            .ToArray();
+
         await events.InsertAsync(EventTypes.PeerRegistered,
-            JsonSerializer.Serialize(new { peer_id = id, tool = req.Tool, repo_root = req.RepoRoot }), ct: ct);
+            JsonSerializer.Serialize(new { peer_id = id, tool = req.Tool, repo_root = req.RepoRoot, recipient_peer_ids = recipientPeerIds }), ct: ct);
 
         return new RegisterPeerResponse { PeerId = id };
     }
@@ -54,8 +61,13 @@ public sealed class PeerService(PeerRepository peers, EventRepository events)
     {
         var count = await peers.ExpireStaleAsync(ct);
         if (count > 0)
+        {
+            var activePeers = await peers.ListAsync(includeExpired: false, ct: ct);
+            var recipientPeerIds = activePeers.Select(p => p.PeerId).ToArray();
+
             await events.InsertAsync(EventTypes.PeerExpired,
-                JsonSerializer.Serialize(new { expired_count = count }), ct: ct);
+                JsonSerializer.Serialize(new { expired_count = count, recipient_peer_ids = recipientPeerIds }), ct: ct);
+        }
         return count;
     }
 }

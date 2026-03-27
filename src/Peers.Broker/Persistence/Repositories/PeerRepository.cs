@@ -123,6 +123,36 @@ public sealed class PeerRepository(SqliteConnectionFactory db)
         }, ct);
     }
 
+    /// <summary>
+    /// Resolve a peer by exact ID or unique prefix. Returns null if no match or ambiguous.
+    /// </summary>
+    public async Task<Peer?> GetByPrefixAsync(string prefixOrId, CancellationToken ct = default)
+    {
+        // Try exact match first (fast path)
+        var exact = await GetAsync(prefixOrId, ct);
+        if (exact is not null)
+            return exact;
+
+        return await db.ReadAsync(async conn =>
+        {
+            using var cmd = conn.CreateCommand();
+            cmd.CommandText = "SELECT * FROM peers WHERE peer_id LIKE @prefix AND expired_at IS NULL";
+            cmd.Parameters.AddWithValue("@prefix", prefixOrId + "%");
+            await using var reader = await cmd.ExecuteReaderAsync(ct);
+
+            if (!await reader.ReadAsync(ct))
+                return null;
+
+            var first = ReadPeer(reader);
+
+            // Ambiguous if more than one match
+            if (await reader.ReadAsync(ct))
+                return null;
+
+            return first;
+        }, ct);
+    }
+
     public async Task<int> ExpireStaleAsync(CancellationToken ct = default)
     {
         return await db.WriteAsync(async conn =>

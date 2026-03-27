@@ -1,7 +1,6 @@
 using System.ComponentModel;
 using System.Text.Json;
 using ModelContextProtocol.Server;
-using Peers.Shared.Models;
 
 namespace Peers.Mcp.Tools;
 
@@ -29,139 +28,45 @@ public sealed class PollTools
     }
 
     [McpServerTool(Name = "peer_inbox"), Description(
-        "Read directed collaboration events addressed to this peer in a human-friendly form. " +
-        "Advances the session event cursor like peer_poll.")]
+        "Read buffered directed collaboration events for this session. " +
+        "Use this when automatic push delivery is unavailable or silent.")]
     public static async Task<string> Inbox(
-        BrokerClient client,
         SessionState state,
-        [Description("Max events to read before filtering directed inbox items (default 100)")] int? limit = null)
+        [Description("Maximum number of buffered inbox items to drain (default drains all)")] int? limit = null)
     {
         if (state.PeerId is null) return """{"error":"Not registered. Call peer_register first."}""";
 
-        var resp = await client.PollAsync(state.PeerId, state.LastCursor, limit ?? 100);
-        state.LastCursor = resp.Cursor;
-
-        var items = resp.Events
-            .Where(evt => IsDirectedToPeer(evt, state.PeerId) && !IsOwnEvent(evt, state.PeerId))
-            .Select(FormatInboxItem)
-            .Where(item => item is not null)
-            .ToList();
+        var drained = state.DrainChannelMessages(limit);
 
         return JsonSerializer.Serialize(new
         {
-            cursor = resp.Cursor,
-            items,
+            cursor = state.LastCursor,
+            dropped_message_count = drained.DroppedMessageCount,
+            remaining_count = drained.RemainingCount,
+            items = drained.Messages,
         }, JsonOpts);
     }
 
-    private static bool IsDirectedToPeer(PeerEvent evt, string peerId)
+    [McpServerTool(Name = "peer_test_push"), Description(
+        "Send a test push notification to verify push delivery is working. " +
+        "If this message appears in the client, push mode is functional.")]
+    public static async Task<string> TestPush(
+        SessionState state,
+        [Description("Optional test message content")] string? message = null)
     {
+        if (state.PeerId is null) return """{"error":"Not registered. Call peer_register first."}""";
+        if (state.ChannelNotifier is null) return """{"error":"Channel notifier not running."}""";
+
+        var content = message ?? $"Peers push test from peer {state.PeerId} at {DateTime.UtcNow:O}";
+
         try
         {
-            using var doc = JsonDocument.Parse(evt.Payload);
-            return doc.RootElement.TryGetProperty("recipient_peer_ids", out var recipients)
-                && ContainsString(recipients, peerId);
+            await state.ChannelNotifier.SendTestNotificationAsync(content);
+            return JsonSerializer.Serialize(new { ok = true, message = "Test notification sent. If push is working, it should appear in the client." }, JsonOpts);
         }
-        catch
+        catch (Exception ex)
         {
-            return false;
+            return JsonSerializer.Serialize(new { ok = false, error = ex.Message }, JsonOpts);
         }
-    }
-
-    private static bool IsOwnEvent(PeerEvent evt, string peerId)
-    {
-        try
-        {
-            using var doc = JsonDocument.Parse(evt.Payload);
-
-            foreach (var propertyName in new[] { "peer_id", "author_peer_id", "created_by_peer_id", "published_by_peer_id" })
-            {
-                if (doc.RootElement.TryGetProperty(propertyName, out var actor) &&
-                    actor.GetString() == peerId)
-                    return true;
-            }
-        }
-        catch
-        {
-        }
-
-        return false;
-    }
-
-    private static object? FormatInboxItem(PeerEvent evt)
-    {
-        try
-        {
-            using var doc = JsonDocument.Parse(evt.Payload);
-            var root = doc.RootElement;
-
-            return evt.Type switch
-            {
-                EventTypes.ScratchpadCreated => new
-                {
-                    event_id = evt.EventId,
-                    type = evt.Type,
-                    created_at = evt.CreatedAt,
-                    scratchpad_id = GetProp(root, "scratchpad_id"),
-                    scratchpad_type = GetProp(root, "type"),
-                    title = GetProp(root, "title"),
-                    from_peer_id = GetProp(root, "created_by_peer_id"),
-                    message = $"Review request: {GetProp(root, "title") ?? "Untitled"}",
-                },
-                EventTypes.ScratchpadEntryAdded => new
-                {
-                    event_id = evt.EventId,
-                    type = evt.Type,
-                    created_at = evt.CreatedAt,
-                    scratchpad_id = GetProp(root, "scratchpad_id"),
-                    title = GetProp(root, "title"),
-                    from_peer_id = GetProp(root, "author_peer_id"),
-                    content_preview = Preview(GetProp(root, "content")),
-                    message = $"Scratchpad reply: {GetProp(root, "title") ?? "Untitled"}",
-                },
-                EventTypes.ScratchpadClosed => new
-                {
-                    event_id = evt.EventId,
-                    type = evt.Type,
-                    created_at = evt.CreatedAt,
-                    scratchpad_id = GetProp(root, "scratchpad_id"),
-                    title = GetProp(root, "title"),
-                    resolution = Preview(GetProp(root, "resolution"), 400),
-                    message = $"Scratchpad closed: {GetProp(root, "title") ?? "Untitled"}",
-                },
-                _ => null,
-            };
-        }
-        catch
-        {
-            return null;
-        }
-    }
-
-    private static string? GetProp(JsonElement el, string name) =>
-        el.TryGetProperty(name, out var val) ? val.GetString() : null;
-
-    private static bool ContainsString(JsonElement el, string value)
-    {
-        if (el.ValueKind != JsonValueKind.Array)
-            return false;
-
-        foreach (var item in el.EnumerateArray())
-        {
-            if (item.GetString() == value)
-                return true;
-        }
-
-        return false;
-    }
-
-    private static string Preview(string? content, int maxLength = 200)
-    {
-        if (string.IsNullOrWhiteSpace(content))
-            return "(empty)";
-
-        return content.Length > maxLength
-            ? content[..maxLength] + "..."
-            : content;
     }
 }

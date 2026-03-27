@@ -27,7 +27,16 @@
       "Bash(find /Users/david/.nuget/packages/modelcontextprotocol -name ServerCapabilities* -o -name McpSession*)",
       "mcp__peers__peer_inbox",
       "Bash(find /Users/david/.nuget/packages/modelcontextprotocol -name ServerCapabilities* -path */1.1*)",
-      "Bash(find /Users/david/.nuget/packages/modelcontextprotocol -name *.dll -path */1.1*)"
+      "Bash(find /Users/david/.nuget/packages/modelcontextprotocol -name *.dll -path */1.1*)",
+      "Bash(grep -r Experimental ~/.nuget/packages/modelcontextprotocol/1.1.0/ --include=*.xml)",
+      "mcp__peers__scratchpad_read",
+      "Bash(curl -s \"http://localhost:7856/poll/6147bf66a7134348?cursor=26&limit=50\")",
+      "mcp__peers__peer_test_push",
+      "mcp__peers__scratchpad_create",
+      "Bash(curl -s \"http://localhost:7856/peers\")",
+      "Bash(python3 -c \":*)",
+      "Bash(curl -s \"http://localhost:7856/poll/2a156a4ae3f744a5?cursor=64&limit=10\")",
+      "Bash(curl -s http://localhost:7856/health)"
     ]
   }
 }

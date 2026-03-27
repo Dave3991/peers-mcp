@@ -1,6 +1,6 @@
 using System.Text.Json;
-using ModelContextProtocol;
 using ModelContextProtocol.Protocol;
+using ModelContextProtocol.Server;
 using Peers.Shared.Models;
 
 namespace Peers.Mcp.Lifecycle;
@@ -9,19 +9,20 @@ public sealed class ChannelNotifier : IDisposable, IAsyncDisposable
 {
     private readonly BrokerClient _client;
     private readonly SessionState _state;
-    private readonly McpSession _session;
+    private readonly McpServer _server;
     private readonly CancellationTokenSource _cts = new();
     private long _channelCursor;
     private Task? _task;
     private int _disposeStarted;
 
     private static readonly TimeSpan PollInterval = TimeSpan.FromSeconds(5);
+    private const string LoggerName = "peers.channel";
 
-    public ChannelNotifier(BrokerClient client, SessionState state, McpSession session)
+    public ChannelNotifier(BrokerClient client, SessionState state, McpServer server)
     {
         _client = client;
         _state = state;
-        _session = session;
+        _server = server;
     }
 
     public void Start()
@@ -37,6 +38,9 @@ public sealed class ChannelNotifier : IDisposable, IAsyncDisposable
 
     private async Task RunAsync(CancellationToken ct)
     {
+        await Console.Error.WriteLineAsync(
+            $"[Peers] ChannelNotifier started for peer {_state.PeerId}, cursor={_channelCursor}, delivery={DescribeDeliveryMode()}");
+
         while (!ct.IsCancellationRequested)
         {
             try
@@ -50,32 +54,170 @@ public sealed class ChannelNotifier : IDisposable, IAsyncDisposable
                 if (resp.Events.Count == 0)
                     continue;
 
+                await Console.Error.WriteLineAsync($"[Peers] Poll returned {resp.Events.Count} events (cursor {_channelCursor} → {resp.Cursor})");
                 _channelCursor = resp.Cursor;
                 _state.LastCursor = Math.Max(_state.LastCursor, _channelCursor);
 
                 foreach (var evt in resp.Events)
                 {
-                    if (!ShouldDeliver(evt) || IsOwnEvent(evt))
+                    var shouldDeliver = ShouldDeliver(evt);
+                    var isOwn = IsOwnEvent(evt);
+                    if (!shouldDeliver || isOwn)
+                    {
+                        await Console.Error.WriteLineAsync($"[Peers] Skipping event {evt.EventId} ({evt.Type}): shouldDeliver={shouldDeliver}, isOwn={isOwn}");
                         continue;
+                    }
 
-                    var (content, level) = FormatEvent(evt);
-                    if (content is null)
+                    var message = FormatEvent(evt);
+                    if (message is null)
+                    {
+                        await Console.Error.WriteLineAsync($"[Peers] FormatEvent returned null for event {evt.EventId} ({evt.Type})");
                         continue;
+                    }
 
-                    await _session.SendNotificationAsync(
-                        NotificationMethods.LoggingMessageNotification,
-                        new LoggingMessageNotificationParams
-                        {
-                            Level = level,
-                            Logger = "peers.channel",
-                            Data = JsonSerializer.SerializeToElement(content),
-                        },
-                        cancellationToken: ct);
+                    await Console.Error.WriteLineAsync($"[Peers] Delivering event {evt.EventId} ({evt.Type}): {message.Content[..Math.Min(80, message.Content.Length)]}...");
+                    _state.EnqueueChannelMessage(message);
+                    await TryPushAsync(message, ct);
                 }
             }
             catch (OperationCanceledException) { break; }
-            catch { /* swallow and retry next cycle */ }
+            catch (Exception ex)
+            {
+                await Console.Error.WriteLineAsync($"[Peers] ChannelNotifier poll error: {ex.Message}");
+            }
         }
+    }
+
+    public async Task SendTestNotificationAsync(string content, CancellationToken ct = default)
+    {
+        var msgId = $"peers_test_{DateTimeOffset.UtcNow.ToUnixTimeMilliseconds()}";
+        await Console.Error.WriteLineAsync($"[Peers] Sending test notification: {msgId}");
+
+        var message = new PendingChannelMessage
+        {
+            MessageId = msgId,
+            EventId = 0,
+            EventType = "peer_test_push",
+            CreatedAt = DateTime.UtcNow,
+            Content = content,
+            Level = LoggingLevel.Notice,
+            ScratchpadId = null,
+            Title = "Peers test push",
+            FromPeerId = "peers",
+        };
+
+        await TryPushAsync(message, ct, throwOnFailure: true);
+
+        await Console.Error.WriteLineAsync($"[Peers] Test notification sent successfully: {msgId}");
+    }
+
+    private async Task TryPushAsync(PendingChannelMessage message, CancellationToken ct, bool throwOnFailure = false)
+    {
+        var methods = GetPushMethods();
+        Exception? lastFailure = null;
+
+        foreach (var method in methods)
+        {
+            try
+            {
+                switch (method)
+                {
+                    case PushMethod.LoggingMessage:
+                        await TryPushViaLoggingMessageAsync(message, ct);
+                        return;
+                    case PushMethod.ClaudeChannel:
+                        await TryPushViaClaudeChannelAsync(message, ct);
+                        return;
+                }
+            }
+            catch (Exception ex)
+            {
+                lastFailure = ex;
+                await Console.Error.WriteLineAsync(
+                    $"[Peers] {method} push FAILED: {message.MessageId}: {ex.GetType().Name}: {ex.Message}");
+            }
+        }
+
+        if (throwOnFailure && lastFailure is not null)
+            throw lastFailure;
+    }
+
+    private async Task TryPushViaLoggingMessageAsync(PendingChannelMessage message, CancellationToken ct)
+    {
+        await Console.Error.WriteLineAsync($"[Peers] Pushing logging notification: {message.MessageId}");
+
+        await _server.SendNotificationAsync(
+            NotificationMethods.LoggingMessageNotification,
+            new LoggingMessageNotificationParams
+            {
+                Level = message.Level,
+                Logger = LoggerName,
+                Data = JsonSerializer.SerializeToElement(message.Content),
+            },
+            cancellationToken: ct);
+
+        await Console.Error.WriteLineAsync($"[Peers] Logging push succeeded: {message.MessageId}");
+    }
+
+    private async Task TryPushViaClaudeChannelAsync(PendingChannelMessage message, CancellationToken ct)
+    {
+        await Console.Error.WriteLineAsync($"[Peers] Pushing channel notification: {message.MessageId}");
+
+        await _server.SendNotificationAsync(
+            "notifications/claude/channel",
+            new
+            {
+                content = message.Content,
+                meta = new
+                {
+                    chat_id = message.ScratchpadId ?? _state.ChatId,
+                    message_id = message.MessageId,
+                    user = message.FromPeerId ?? "Peers",
+                    user_id = message.FromPeerId ?? "peers",
+                    ts = message.CreatedAt.ToUniversalTime().ToString("O"),
+                    source_type = "peers",
+                },
+            },
+            cancellationToken: ct);
+
+        await Console.Error.WriteLineAsync($"[Peers] Channel push succeeded: {message.MessageId}");
+    }
+
+    private PushMethod[] GetPushMethods()
+    {
+        if (UsesClaudeChannel())
+            return [PushMethod.ClaudeChannel];
+
+        return [PushMethod.LoggingMessage];
+    }
+
+    private bool UsesClaudeChannel()
+    {
+        var tool = _state.Tool;
+        if (!string.IsNullOrWhiteSpace(tool) &&
+            tool.Contains("claude", StringComparison.OrdinalIgnoreCase))
+            return true;
+
+        var clientName = _server.ClientInfo?.Name;
+        return !string.IsNullOrWhiteSpace(clientName)
+            && clientName.Contains("claude", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private string DescribeDeliveryMode()
+    {
+        var methods = GetPushMethods();
+        return string.Join(", ", methods.Select(method => method switch
+        {
+            PushMethod.LoggingMessage => "notifications/message",
+            PushMethod.ClaudeChannel => "notifications/claude/channel",
+            _ => method.ToString(),
+        }));
+    }
+
+    private enum PushMethod
+    {
+        LoggingMessage,
+        ClaudeChannel,
     }
 
     private bool ShouldDeliver(PeerEvent evt)
@@ -103,7 +245,14 @@ public sealed class ChannelNotifier : IDisposable, IAsyncDisposable
         try
         {
             using var doc = JsonDocument.Parse(evt.Payload);
-            foreach (var propertyName in new[] { "peer_id", "author_peer_id", "created_by_peer_id", "published_by_peer_id" })
+
+            // For entry-added events, ownership is determined solely by
+            // who authored the entry, not who created the scratchpad.
+            var propertyNames = evt.Type == EventTypes.ScratchpadEntryAdded
+                ? new[] { "author_peer_id" }
+                : new[] { "peer_id", "author_peer_id", "created_by_peer_id", "published_by_peer_id" };
+
+            foreach (var propertyName in propertyNames)
             {
                 if (doc.RootElement.TryGetProperty(propertyName, out var actor) &&
                     actor.GetString() == _state.PeerId)
@@ -115,47 +264,114 @@ public sealed class ChannelNotifier : IDisposable, IAsyncDisposable
         return false;
     }
 
-    private static (string? content, LoggingLevel level) FormatEvent(PeerEvent evt)
+    private static PendingChannelMessage? FormatEvent(PeerEvent evt)
     {
         try
         {
             using var doc = JsonDocument.Parse(evt.Payload);
             var root = doc.RootElement;
 
-            switch (evt.Type)
+            return evt.Type switch
             {
-                case EventTypes.ScratchpadEntryAdded:
-                    var padId = root.GetProp("scratchpad_id") ?? "unknown";
-                    var title = root.GetProp("title") ?? "Untitled";
-                    var author = root.GetProp("author_peer_id") ?? "unknown";
-                    var entryContent = root.GetProp("content");
-                    var preview = string.IsNullOrWhiteSpace(entryContent)
-                        ? "(empty)"
-                        : entryContent.Length > 200
-                        ? entryContent[..200] + "..."
-                        : entryContent;
-                    return ($"Peers review reply: '{title}' (pad: {padId}, from: {author})\n\n{preview}", LoggingLevel.Warning);
+                EventTypes.ScratchpadEntryAdded => BuildMessage(
+                    evt,
+                    scratchpadId: root.GetProp("scratchpad_id"),
+                    title: root.GetProp("title") ?? "Untitled",
+                    fromPeerId: root.GetProp("author_peer_id"),
+                    level: LoggingLevel.Warning,
+                    content: BuildReplyText(
+                        title: root.GetProp("title") ?? "Untitled",
+                        scratchpadId: root.GetProp("scratchpad_id") ?? "unknown",
+                        fromPeerId: root.GetProp("author_peer_id") ?? "unknown",
+                        entryContent: root.GetProp("content"))),
 
-                case EventTypes.ScratchpadCreated:
-                    title = root.GetProp("title") ?? "Untitled";
-                    var type = root.GetProp("type") ?? "unknown";
-                    var sid = root.GetProp("scratchpad_id") ?? "unknown";
-                    var creator = root.GetProp("created_by_peer_id") ?? "unknown";
-                    return ($"Peers review request: '{title}' (type: {type}, id: {sid}, from: {creator})", LoggingLevel.Warning);
+                EventTypes.ScratchpadCreated => BuildMessage(
+                    evt,
+                    scratchpadId: root.GetProp("scratchpad_id"),
+                    title: root.GetProp("title") ?? "Untitled",
+                    fromPeerId: root.GetProp("created_by_peer_id"),
+                    level: LoggingLevel.Warning,
+                    content: $"Peers review request: '{root.GetProp("title") ?? "Untitled"}' " +
+                             $"(type: {root.GetProp("type") ?? "unknown"}, " +
+                             $"id: {root.GetProp("scratchpad_id") ?? "unknown"}, " +
+                             $"from: {root.GetProp("created_by_peer_id") ?? "unknown"})"),
 
-                case EventTypes.ScratchpadClosed:
-                    var closedId = root.GetProp("scratchpad_id") ?? "unknown";
-                    var closedTitle = root.GetProp("title") ?? "Untitled";
-                    return ($"Peers scratchpad closed: '{closedTitle}' (id: {closedId})", LoggingLevel.Info);
+                EventTypes.ScratchpadClosed => BuildMessage(
+                    evt,
+                    scratchpadId: root.GetProp("scratchpad_id"),
+                    title: root.GetProp("title") ?? "Untitled",
+                    fromPeerId: null,
+                    level: LoggingLevel.Info,
+                    content: $"Peers scratchpad closed: '{root.GetProp("title") ?? "Untitled"}' " +
+                             $"(id: {root.GetProp("scratchpad_id") ?? "unknown"})"),
 
-                default:
-                    return (null, LoggingLevel.Info);
-            }
+                EventTypes.ArtifactPublished => BuildMessage(
+                    evt,
+                    scratchpadId: null,
+                    title: root.GetProp("name") ?? "unknown",
+                    fromPeerId: root.GetProp("published_by_peer_id"),
+                    level: LoggingLevel.Notice,
+                    content: $"Peers artifact published: '{root.GetProp("name") ?? "unknown"}' " +
+                             $"(ns: {root.GetProp("ns") ?? "unknown"}, " +
+                             $"version: {root.GetProp("version") ?? "?"}, " +
+                             $"from: {root.GetProp("published_by_peer_id") ?? "unknown"})"),
+
+                EventTypes.PeerRegistered => BuildMessage(
+                    evt,
+                    scratchpadId: null,
+                    title: "Peer joined",
+                    fromPeerId: root.GetProp("peer_id"),
+                    level: LoggingLevel.Info,
+                    content: $"Peers new peer joined: {root.GetProp("peer_id") ?? "unknown"} " +
+                             $"(tool: {root.GetProp("tool") ?? "unknown"}, " +
+                             $"repo: {root.GetProp("repo_root") ?? "unknown"})"),
+
+                EventTypes.PeerExpired => BuildMessage(
+                    evt,
+                    scratchpadId: null,
+                    title: "Peers expired",
+                    fromPeerId: null,
+                    level: LoggingLevel.Info,
+                    content: $"Peers: {root.GetProp("expired_count") ?? "?"} peer(s) expired"),
+
+                _ => null,
+            };
         }
         catch
         {
-            return (null, LoggingLevel.Info);
+            return null;
         }
+    }
+
+    private static PendingChannelMessage BuildMessage(
+        PeerEvent evt,
+        string? scratchpadId,
+        string title,
+        string? fromPeerId,
+        LoggingLevel level,
+        string content) =>
+        new()
+        {
+            MessageId = $"peers_evt_{evt.EventId}",
+            EventId = evt.EventId,
+            EventType = evt.Type,
+            CreatedAt = evt.CreatedAt,
+            ScratchpadId = scratchpadId,
+            Title = title,
+            FromPeerId = fromPeerId,
+            Level = level,
+            Content = content,
+        };
+
+    private static string BuildReplyText(string title, string scratchpadId, string fromPeerId, string? entryContent)
+    {
+        var preview = string.IsNullOrWhiteSpace(entryContent)
+            ? "(empty)"
+            : entryContent.Length > 200
+            ? entryContent[..200] + "..."
+            : entryContent;
+
+        return $"Peers review reply: '{title}' (pad: {scratchpadId}, from: {fromPeerId})\n\n{preview}";
     }
 
     public async ValueTask DisposeAsync()

@@ -5,7 +5,7 @@ using Peers.Shared.Models;
 
 namespace Peers.Broker.Services;
 
-public sealed class ArtifactService(ArtifactRepository artifacts, EventRepository events)
+public sealed class ArtifactService(ArtifactRepository artifacts, EventRepository events, PeerRepository peers)
 {
     public async Task<PublishArtifactResponse> PublishAsync(PublishArtifactRequest req, CancellationToken ct)
     {
@@ -30,8 +30,15 @@ public sealed class ArtifactService(ArtifactRepository artifacts, EventRepositor
         };
 
         var (saved, version) = await artifacts.PublishAsync(artifact, ct);
+
+        var activePeers = await peers.ListAsync(repoRoot: req.RepoRoot, includeExpired: false, ct: ct);
+        var recipientPeerIds = activePeers
+            .Where(p => p.PeerId != req.PublishedByPeerId)
+            .Select(p => p.PeerId)
+            .ToArray();
+
         await events.InsertAsync(EventTypes.ArtifactPublished,
-            JsonSerializer.Serialize(new { artifact_id = id, ns = req.Namespace, name = req.Name, version }), ct: ct);
+            JsonSerializer.Serialize(new { artifact_id = id, ns = req.Namespace, name = req.Name, version, published_by_peer_id = req.PublishedByPeerId, recipient_peer_ids = recipientPeerIds }), ct: ct);
 
         return new PublishArtifactResponse { ArtifactId = id, Version = version };
     }

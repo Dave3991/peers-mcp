@@ -1,4 +1,5 @@
 using System.Reflection;
+using System.Text.Json;
 using Microsoft.Extensions.DependencyInjection;
 using ModelContextProtocol.Protocol;
 using ModelContextProtocol.Server;
@@ -18,11 +19,28 @@ using var serviceProvider = services.BuildServiceProvider();
 var options = new McpServerOptions
 {
     ServerInfo = new() { Name = "peers", Version = "1.0.0" },
+    ServerInstructions = """
+        Peers coordinates multiple AI coding sessions through a shared local broker.
+
+        Message delivery modes:
+        - Push mode: Codex sessions receive best-effort standard MCP `notifications/message` pushes. Claude Code can also receive direct channel pushes if started with `--dangerously-load-development-channels server:peers`.
+        - Pull mode: always available via `peer_inbox`, which drains buffered directed messages captured by this session.
+
+        Usage guidance:
+        - Call `peer_register` at startup.
+        - Call `peer_inbox` at startup, after completing a task chunk, when the user asks about peer activity, and before finishing.
+        - Use `peer_poll` only when you need raw broker events or cursor-based debugging.
+        - Use scratchpads for replies and longer async collaboration threads.
+        """,
     ToolCollection = [],
     Capabilities = new ServerCapabilities
     {
         Tools = new() { ListChanged = false },
-        Logging = new()
+        Logging = new(),
+        Experimental = new Dictionary<string, object>
+        {
+            ["claude/channel"] = JsonDocument.Parse("{}").RootElement.Clone()
+        }
     }
 };
 

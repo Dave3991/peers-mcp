@@ -39,6 +39,7 @@ public sealed class PeerTools
 
         await state.StopServicesAsync();
         state.PeerId = resp.PeerId;
+        state.Tool = tool;
 
         state.Heartbeat = new HeartbeatService(client, resp.PeerId);
         state.Heartbeat.Start();
@@ -46,7 +47,7 @@ public sealed class PeerTools
         state.ChannelNotifier = new ChannelNotifier(client, state, server);
         state.ChannelNotifier.Start();
 
-        return JsonSerializer.Serialize(new { peer_id = resp.PeerId, message = "Registered. Heartbeat and channel notifications started." });
+        return JsonSerializer.Serialize(new { peer_id = resp.PeerId, message = "Registered. Heartbeat and push notifications started." });
     }
 
     [McpServerTool(Name = "peer_heartbeat"), Description("Renew lease and optionally update status fields.")]

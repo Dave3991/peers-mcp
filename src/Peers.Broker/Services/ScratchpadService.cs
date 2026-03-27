@@ -129,13 +129,15 @@ public sealed class ScratchpadService(ScratchpadRepository pads, EventRepository
         var recipientPeerIds = new HashSet<string>(StringComparer.Ordinal);
         foreach (var target in targets.Where(target => !string.IsNullOrWhiteSpace(target)))
         {
-            var activePeer = await peers.GetAsync(target, ct);
+            // Try exact or prefix match on peer ID
+            var activePeer = await peers.GetByPrefixAsync(target, ct);
             if (activePeer is not null && activePeer.ExpiredAt is null)
             {
                 recipientPeerIds.Add(activePeer.PeerId);
                 continue;
             }
 
+            // Fall back to repo root match
             var repoPeers = await peers.ListAsync(repoRoot: target, includeExpired: false, ct: ct);
             foreach (var repoPeer in repoPeers)
                 recipientPeerIds.Add(repoPeer.PeerId);
