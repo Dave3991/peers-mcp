@@ -34,6 +34,46 @@ public sealed class PeerRepository(SqliteConnectionFactory db)
         }, ct);
     }
 
+    public async Task ReactivateAsync(Peer peer, CancellationToken ct = default)
+    {
+        await db.WriteAsync(async conn =>
+        {
+            using var cmd = conn.CreateCommand();
+            cmd.CommandText = """
+                UPDATE peers SET
+                    tool = @tool,
+                    machine_id = @machine,
+                    repo_root = @repo,
+                    worktree_root = @worktree,
+                    branch = @branch,
+                    commit_sha = @commit,
+                    role = @role,
+                    summary = @summary,
+                    focus_paths = @focus,
+                    capabilities = @caps,
+                    parent_peer_id = @parent,
+                    lease_expires_at = @lease,
+                    expired_at = NULL,
+                    updated_at = datetime('now')
+                WHERE peer_id = @id
+                """;
+            cmd.Parameters.AddWithValue("@id", peer.PeerId);
+            cmd.Parameters.AddWithValue("@tool", peer.Tool);
+            cmd.Parameters.AddWithValue("@machine", peer.MachineId);
+            cmd.Parameters.AddWithValue("@repo", (object?)peer.RepoRoot ?? DBNull.Value);
+            cmd.Parameters.AddWithValue("@worktree", (object?)peer.WorktreeRoot ?? DBNull.Value);
+            cmd.Parameters.AddWithValue("@branch", (object?)peer.Branch ?? DBNull.Value);
+            cmd.Parameters.AddWithValue("@commit", (object?)peer.CommitSha ?? DBNull.Value);
+            cmd.Parameters.AddWithValue("@role", (object?)peer.Role ?? DBNull.Value);
+            cmd.Parameters.AddWithValue("@summary", (object?)peer.Summary ?? DBNull.Value);
+            cmd.Parameters.AddWithValue("@focus", (object?)peer.FocusPaths ?? DBNull.Value);
+            cmd.Parameters.AddWithValue("@caps", (object?)peer.Capabilities ?? DBNull.Value);
+            cmd.Parameters.AddWithValue("@parent", (object?)peer.ParentPeerId ?? DBNull.Value);
+            cmd.Parameters.AddWithValue("@lease", peer.LeaseExpiresAt.ToString("O"));
+            await cmd.ExecuteNonQueryAsync(ct);
+        }, ct);
+    }
+
     public async Task RenewLeaseAsync(string peerId, DateTime newExpiry, string? summary, string? role,
         string? branch, string? commitSha, string? focusPaths, CancellationToken ct = default)
     {
@@ -83,7 +123,10 @@ public sealed class PeerRepository(SqliteConnectionFactory db)
             using var cmd = conn.CreateCommand();
             var where = new List<string>();
             if (!includeExpired)
+            {
                 where.Add("expired_at IS NULL");
+                where.Add("datetime(lease_expires_at) >= datetime('now')");
+            }
             if (repoRoot is not null)
             {
                 where.Add("repo_root = @repo");
@@ -153,6 +196,20 @@ public sealed class PeerRepository(SqliteConnectionFactory db)
         }, ct);
     }
 
+    public async Task ExpireByIdAsync(string peerId, CancellationToken ct = default)
+    {
+        await db.WriteAsync(async conn =>
+        {
+            using var cmd = conn.CreateCommand();
+            cmd.CommandText = """
+                UPDATE peers SET expired_at = datetime('now'), updated_at = datetime('now')
+                WHERE peer_id = @id AND expired_at IS NULL
+                """;
+            cmd.Parameters.AddWithValue("@id", peerId);
+            await cmd.ExecuteNonQueryAsync(ct);
+        }, ct);
+    }
+
     public async Task<int> ExpireStaleAsync(CancellationToken ct = default)
     {
         return await db.WriteAsync(async conn =>
@@ -160,7 +217,7 @@ public sealed class PeerRepository(SqliteConnectionFactory db)
             using var cmd = conn.CreateCommand();
             cmd.CommandText = """
                 UPDATE peers SET expired_at = datetime('now'), updated_at = datetime('now')
-                WHERE expired_at IS NULL AND lease_expires_at < datetime('now')
+                WHERE expired_at IS NULL AND datetime(lease_expires_at) < datetime('now')
                 """;
             return await cmd.ExecuteNonQueryAsync(ct);
         }, ct);
