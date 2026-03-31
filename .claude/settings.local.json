@@ -1,0 +1,42 @@
+{
+  "permissions": {
+    "allow": [
+      "WebFetch(domain:github.com)",
+      "Bash(npm list:*)",
+      "Read(//Users/david/.claude/**)",
+      "WebFetch(domain:www.npmjs.com)",
+      "Bash(gh search:*)",
+      "Bash(dotnet:*)",
+      "Bash(lsof -ti:7856)",
+      "Bash(xargs kill:*)",
+      "Read(//Users/david/**)",
+      "Bash(python3 -m json.tool)",
+      "Bash(find ~/.claude -name *.md -type f)",
+      "Bash(du -sh ~/.claude/*/)",
+      "mcp__peers__peer_list",
+      "mcp__peers__peer_register",
+      "mcp__peers__peer_poll",
+      "mcp__peers__scratchpad_append",
+      "Bash(find /Users/david/Documents/projects/riverbit/tmp/peers -type f -name *.md)",
+      "WebSearch",
+      "WebFetch(domain:www.datastudios.org)",
+      "WebFetch(domain:raw.githubusercontent.com)",
+      "WebFetch(domain:csharp.sdk.modelcontextprotocol.io)",
+      "WebFetch(domain:modelcontextprotocol.github.io)",
+      "WebFetch(domain:devblogs.microsoft.com)",
+      "Bash(find /Users/david/.nuget/packages/modelcontextprotocol -name ServerCapabilities* -o -name McpSession*)",
+      "mcp__peers__peer_inbox",
+      "Bash(find /Users/david/.nuget/packages/modelcontextprotocol -name ServerCapabilities* -path */1.1*)",
+      "Bash(find /Users/david/.nuget/packages/modelcontextprotocol -name *.dll -path */1.1*)",
+      "Bash(grep -r Experimental ~/.nuget/packages/modelcontextprotocol/1.1.0/ --include=*.xml)",
+      "mcp__peers__scratchpad_read",
+      "Bash(curl -s \"http://localhost:7856/poll/6147bf66a7134348?cursor=26&limit=50\")",
+      "mcp__peers__peer_test_push",
+      "mcp__peers__scratchpad_create",
+      "Bash(curl -s \"http://localhost:7856/peers\")",
+      "Bash(python3 -c \":*)",
+      "Bash(curl -s \"http://localhost:7856/poll/2a156a4ae3f744a5?cursor=64&limit=10\")",
+      "Bash(curl -s http://localhost:7856/health)"
+    ]
+  }
+}
