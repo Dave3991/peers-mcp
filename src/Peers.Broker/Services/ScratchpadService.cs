@@ -11,7 +11,7 @@ public sealed class ScratchpadService(ScratchpadRepository pads, EventRepository
     public async Task<CreateScratchpadResponse> CreateAsync(CreateScratchpadRequest req, CancellationToken ct)
     {
         var id = Guid.NewGuid().ToString("N")[..16];
-        var recipientPeerIds = await ResolveReviewerPeerIdsAsync(req.RequestedReviewers, ct);
+        var resolved = await ResolveReviewerPeerIdsAsync(req.RequestedReviewers, ct);
         var pad = new Scratchpad
         {
             ScratchpadId = id,
@@ -33,17 +33,21 @@ public sealed class ScratchpadService(ScratchpadRepository pads, EventRepository
                 type = req.Type,
                 title = req.Title,
                 created_by_peer_id = req.CreatedByPeerId,
-                recipient_peer_ids = recipientPeerIds,
+                recipient_peer_ids = resolved.EventRecipientPeerIds(),
             }), ct: ct);
 
-        return new CreateScratchpadResponse { ScratchpadId = id };
+        return new CreateScratchpadResponse
+        {
+            ScratchpadId = id,
+            Recipients = resolved.ToStatus(),
+        };
     }
 
     public async Task<AppendEntryResponse?> AppendAsync(string scratchpadId, AppendEntryRequest req, CancellationToken ct)
     {
         var pad = await pads.GetAsync(scratchpadId, ct)
             ?? throw new InvalidOperationException($"Scratchpad '{scratchpadId}' not found.");
-        var recipientPeerIds = await ResolveConversationPeerIdsAsync(pad, req.AuthorPeerId, ct);
+        var resolved = await ResolveConversationPeerIdsAsync(pad, req.AuthorPeerId, ct);
 
         var entryId = Guid.NewGuid().ToString("N")[..16];
         var entry = new ScratchpadEntry
@@ -69,10 +73,14 @@ public sealed class ScratchpadService(ScratchpadRepository pads, EventRepository
                 author_peer_id = req.AuthorPeerId,
                 content = req.Content,
                 created_by_peer_id = pad.CreatedByPeerId,
-                recipient_peer_ids = recipientPeerIds,
+                recipient_peer_ids = resolved.EventRecipientPeerIds(),
             }), ct: ct);
 
-        return new AppendEntryResponse { EntryId = entryId };
+        return new AppendEntryResponse
+        {
+            EntryId = entryId,
+            Recipients = resolved.ToStatus(),
+        };
     }
 
     public async Task<ReadScratchpadResponse?> ReadAsync(string scratchpadId, int limit, int offset, CancellationToken ct)
@@ -96,7 +104,7 @@ public sealed class ScratchpadService(ScratchpadRepository pads, EventRepository
 
         await pads.CloseAsync(scratchpadId, req.Resolution, ct);
         var closedPad = await pads.GetAsync(scratchpadId, ct) ?? pad;
-        var recipientPeerIds = await ResolveConversationPeerIdsAsync(closedPad, authorPeerId: null, ct);
+        var resolved = await ResolveConversationPeerIdsAsync(closedPad, authorPeerId: null, ct);
 
         await events.InsertAsync(EventTypes.ScratchpadClosed,
             JsonSerializer.Serialize(new
@@ -104,14 +112,14 @@ public sealed class ScratchpadService(ScratchpadRepository pads, EventRepository
                 scratchpad_id = scratchpadId,
                 title = closedPad.Title,
                 resolution = req.Resolution,
-                recipient_peer_ids = recipientPeerIds,
+                recipient_peer_ids = resolved.EventRecipientPeerIds(),
             }), ct: ct);
     }
 
-    private async Task<string[]> ResolveReviewerPeerIdsAsync(string? requestedReviewers, CancellationToken ct)
+    private async Task<ResolvedRecipients> ResolveReviewerPeerIdsAsync(string? requestedReviewers, CancellationToken ct)
     {
         if (string.IsNullOrWhiteSpace(requestedReviewers))
-            return [];
+            return ResolvedRecipients.Empty;
 
         List<string>? targets;
         try
@@ -120,42 +128,102 @@ public sealed class ScratchpadService(ScratchpadRepository pads, EventRepository
         }
         catch (JsonException)
         {
-            return [];
+            return ResolvedRecipients.Empty;
         }
 
         if (targets is null || targets.Count == 0)
-            return [];
+            return ResolvedRecipients.Empty;
 
-        var recipientPeerIds = new HashSet<string>(StringComparer.Ordinal);
+        var online = new HashSet<string>(StringComparer.Ordinal);
+        var offline = new HashSet<string>(StringComparer.Ordinal);
+        var unresolved = new List<string>();
+
         foreach (var target in targets.Where(target => !string.IsNullOrWhiteSpace(target)))
         {
             // Try exact or prefix match on peer ID
-            var activePeer = await peers.GetByPrefixAsync(target, ct);
-            if (activePeer is not null && activePeer.ExpiredAt is null)
+            var peer = await peers.GetByPrefixAsync(target, ct);
+            if (peer is not null)
             {
-                recipientPeerIds.Add(activePeer.PeerId);
+                if (peer.ExpiredAt is null)
+                    online.Add(peer.PeerId);
+                else
+                    offline.Add(peer.PeerId);
                 continue;
             }
 
             // Fall back to repo root match
-            var repoPeers = await peers.ListAsync(repoRoot: target, includeExpired: false, ct: ct);
+            var repoPeers = await peers.ListAsync(repoRoot: target, includeExpired: true, ct: ct);
+            if (repoPeers.Count == 0)
+            {
+                unresolved.Add(target);
+                continue;
+            }
+
             foreach (var repoPeer in repoPeers)
-                recipientPeerIds.Add(repoPeer.PeerId);
+            {
+                if (repoPeer.ExpiredAt is null)
+                    online.Add(repoPeer.PeerId);
+                else
+                    offline.Add(repoPeer.PeerId);
+            }
         }
 
-        return recipientPeerIds.ToArray();
+        // A peer found online via one target shouldn't also appear offline from another
+        offline.ExceptWith(online);
+
+        return new ResolvedRecipients(
+            [.. online],
+            [.. offline],
+            [.. unresolved]);
     }
 
-    private async Task<string[]> ResolveConversationPeerIdsAsync(Scratchpad pad, string? authorPeerId, CancellationToken ct)
+    private async Task<ResolvedRecipients> ResolveConversationPeerIdsAsync(Scratchpad pad, string? authorPeerId, CancellationToken ct)
     {
-        var recipientPeerIds = new HashSet<string>(await ResolveReviewerPeerIdsAsync(pad.RequestedReviewers, ct), StringComparer.Ordinal)
+        var resolved = await ResolveReviewerPeerIdsAsync(pad.RequestedReviewers, ct);
+
+        var online = new HashSet<string>(resolved.OnlinePeerIds, StringComparer.Ordinal);
+        var offline = new HashSet<string>(resolved.OfflinePeerIds, StringComparer.Ordinal);
+
+        // Classify the scratchpad creator
+        var creator = await peers.GetAsync(pad.CreatedByPeerId, ct);
+        if (creator is not null)
         {
-            pad.CreatedByPeerId,
-        };
+            if (creator.ExpiredAt is null)
+                online.Add(creator.PeerId);
+            else
+                offline.Add(creator.PeerId);
+        }
 
+        // Remove author from all sets (don't notify yourself)
         if (!string.IsNullOrWhiteSpace(authorPeerId))
-            recipientPeerIds.Remove(authorPeerId);
+        {
+            online.Remove(authorPeerId);
+            offline.Remove(authorPeerId);
+        }
 
-        return recipientPeerIds.ToArray();
+        offline.ExceptWith(online);
+
+        return new ResolvedRecipients(
+            [.. online],
+            [.. offline],
+            resolved.UnresolvedTargets);
+    }
+
+    private sealed record ResolvedRecipients(
+        string[] OnlinePeerIds,
+        string[] OfflinePeerIds,
+        string[] UnresolvedTargets)
+    {
+        public static readonly ResolvedRecipients Empty = new([], [], []);
+
+        public string[] EventRecipientPeerIds() =>
+            [.. OnlinePeerIds.Concat(OfflinePeerIds)];
+
+        public RecipientDeliveryStatus ToStatus() => new()
+        {
+            OnlinePeerIds = OnlinePeerIds,
+            OfflinePeerIds = OfflinePeerIds,
+            UnresolvedTargets = UnresolvedTargets,
+        };
     }
 }

@@ -26,6 +26,12 @@ public sealed class BrokerClient : IDisposable
     public async Task HeartbeatAsync(string peerId, HeartbeatRequest req) =>
         await _http.PatchAsJsonAsync($"/peers/{peerId}/heartbeat", req, JsonOpts);
 
+    public async Task DeregisterAsync(string peerId)
+    {
+        try { await _http.DeleteAsync($"/peers/{peerId}"); }
+        catch { /* best-effort on shutdown */ }
+    }
+
     public async Task<List<Peer>> ListPeersAsync(string? repoRoot = null, string? branch = null, string? tool = null)
     {
         var query = BuildQuery(("repo_root", repoRoot), ("branch", branch), ("tool", tool));

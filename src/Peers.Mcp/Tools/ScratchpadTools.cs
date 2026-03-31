@@ -2,6 +2,7 @@ using System.ComponentModel;
 using System.Text.Json;
 using ModelContextProtocol.Server;
 using Peers.Shared.Contracts;
+using RecipientStatus = Peers.Shared.Contracts.RecipientDeliveryStatus;
 
 namespace Peers.Mcp.Tools;
 
@@ -27,7 +28,12 @@ public sealed class ScratchpadTools
             RequestedReviewers = requested_reviewers, ArtifactRefs = artifact_refs,
             CreatedByPeerId = state.PeerId,
         });
-        return JsonSerializer.Serialize(resp, JsonOpts);
+        return JsonSerializer.Serialize(new
+        {
+            scratchpad_id = resp.ScratchpadId,
+            recipients = resp.Recipients,
+            delivery_summary = FormatDeliverySummary(resp.Recipients),
+        }, JsonOpts);
     }
 
     [McpServerTool(Name = "scratchpad_append"), Description("Append an entry to a scratchpad. Use for review comments, discussion, or context sharing.")]
@@ -43,9 +49,15 @@ public sealed class ScratchpadTools
         {
             AuthorPeerId = state.PeerId, Content = content, IdempotencyKey = idempotency_key,
         });
-        return resp is not null
-            ? JsonSerializer.Serialize(resp, JsonOpts)
-            : """{"duplicate":true,"message":"Entry with this idempotency key already exists."}""";
+        if (resp is null)
+            return """{"duplicate":true,"message":"Entry with this idempotency key already exists."}""";
+
+        return JsonSerializer.Serialize(new
+        {
+            entry_id = resp.EntryId,
+            recipients = resp.Recipients,
+            delivery_summary = FormatDeliverySummary(resp.Recipients),
+        }, JsonOpts);
     }
 
     [McpServerTool(Name = "scratchpad_read"), Description("Read entries from a scratchpad. Supports pagination.")]
@@ -70,6 +82,19 @@ public sealed class ScratchpadTools
     {
         var pads = await client.ListScratchpadsAsync(type, repo_root, status);
         return JsonSerializer.Serialize(pads, JsonOpts);
+    }
+
+    private static string? FormatDeliverySummary(RecipientStatus? status)
+    {
+        if (status is null) return null;
+        var parts = new List<string>();
+        if (status.OnlinePeerIds.Length > 0)
+            parts.Add($"{status.OnlinePeerIds.Length} online");
+        if (status.OfflinePeerIds.Length > 0)
+            parts.Add($"{status.OfflinePeerIds.Length} offline");
+        if (status.UnresolvedTargets.Length > 0)
+            parts.Add($"{status.UnresolvedTargets.Length} unresolved ({string.Join(", ", status.UnresolvedTargets)})");
+        return parts.Count == 0 ? "No recipients resolved." : string.Join("; ", parts);
     }
 
     [McpServerTool(Name = "scratchpad_close"), Description("Close a scratchpad with an optional resolution summary.")]

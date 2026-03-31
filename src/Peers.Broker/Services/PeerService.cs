@@ -12,7 +12,8 @@ public sealed class PeerService(PeerRepository peers, EventRepository events)
 
     public async Task<RegisterPeerResponse> RegisterAsync(RegisterPeerRequest req, CancellationToken ct)
     {
-        var id = PeerId.New().Value;
+        var resumedPeer = await TryFindResumablePeerAsync(req, ct);
+        var id = resumedPeer?.PeerId ?? PeerId.New().Value;
         var peer = new Peer
         {
             PeerId = id,
@@ -28,11 +29,14 @@ public sealed class PeerService(PeerRepository peers, EventRepository events)
             Capabilities = req.Capabilities,
             ParentPeerId = req.ParentPeerId,
             LeaseExpiresAt = DateTime.UtcNow.Add(LeaseDuration),
-            CreatedAt = DateTime.UtcNow,
+            CreatedAt = resumedPeer?.CreatedAt ?? DateTime.UtcNow,
             UpdatedAt = DateTime.UtcNow,
         };
 
-        await peers.InsertAsync(peer, ct);
+        if (resumedPeer is null)
+            await peers.InsertAsync(peer, ct);
+        else
+            await peers.ReactivateAsync(peer, ct);
 
         var otherPeers = await peers.ListAsync(repoRoot: req.RepoRoot, includeExpired: false, ct: ct);
         var recipientPeerIds = otherPeers
@@ -43,7 +47,12 @@ public sealed class PeerService(PeerRepository peers, EventRepository events)
         await events.InsertAsync(EventTypes.PeerRegistered,
             JsonSerializer.Serialize(new { peer_id = id, tool = req.Tool, repo_root = req.RepoRoot, recipient_peer_ids = recipientPeerIds }), ct: ct);
 
-        return new RegisterPeerResponse { PeerId = id };
+        return new RegisterPeerResponse
+        {
+            PeerId = id,
+            LastCursor = resumedPeer?.LastPolledEventId ?? 0,
+            Resumed = resumedPeer is not null,
+        };
     }
 
     public async Task HeartbeatAsync(string peerId, HeartbeatRequest req, CancellationToken ct)
@@ -55,6 +64,21 @@ public sealed class PeerService(PeerRepository peers, EventRepository events)
     public async Task<List<Peer>> ListAsync(ListPeersRequest req, CancellationToken ct)
     {
         return await peers.ListAsync(req.RepoRoot, req.Branch, req.Tool, includeExpired: false, ct);
+    }
+
+    public async Task DeregisterAsync(string peerId, CancellationToken ct)
+    {
+        var peer = await peers.GetAsync(peerId, ct);
+        if (peer is null || peer.ExpiredAt is not null)
+            return;
+
+        await peers.ExpireByIdAsync(peerId, ct);
+
+        var activePeers = await peers.ListAsync(includeExpired: false, ct: ct);
+        var recipientPeerIds = activePeers.Select(p => p.PeerId).ToArray();
+
+        await events.InsertAsync(EventTypes.PeerExpired,
+            JsonSerializer.Serialize(new { expired_count = 1, peer_id = peerId, recipient_peer_ids = recipientPeerIds }), ct: ct);
     }
 
     public async Task<int> ExpireStaleAsync(CancellationToken ct)
@@ -70,4 +94,47 @@ public sealed class PeerService(PeerRepository peers, EventRepository events)
         }
         return count;
     }
+
+    private async Task<Peer?> TryFindResumablePeerAsync(RegisterPeerRequest req, CancellationToken ct)
+    {
+        // Explicit resume: caller specifies the exact peer ID to reactivate
+        if (!string.IsNullOrWhiteSpace(req.ResumePeerId))
+        {
+            var target = await peers.GetAsync(req.ResumePeerId, ct);
+            if (target is null)
+                return null;
+            // Allow resuming expired peers, or re-claiming an active peer on the same machine
+            if (target.ExpiredAt is not null || target.MachineId == req.MachineId)
+                return target;
+            return null;
+        }
+
+        // Implicit resume: match on stable identity fields only
+        var candidates = await peers.ListAsync(req.RepoRoot, req.Branch, req.Tool, includeExpired: true, ct);
+        var matching = candidates
+            .Where(peer => MatchesIdentity(peer, req))
+            .OrderByDescending(peer => peer.UpdatedAt)
+            .ToList();
+
+        // If an active peer matches, the session is still alive — don't resume
+        if (matching.Any(peer => peer.ExpiredAt is null))
+            return null;
+
+        var expiredMatches = matching
+            .Where(peer => peer.ExpiredAt is not null)
+            .ToList();
+
+        return expiredMatches.Count == 1 ? expiredMatches[0] : null;
+    }
+
+    /// <summary>
+    /// Only compare stable identity fields — role, summary, focusPaths, and capabilities
+    /// change between sessions and should not prevent resumption.
+    /// </summary>
+    private static bool MatchesIdentity(Peer peer, RegisterPeerRequest req) =>
+        peer.Tool == req.Tool &&
+        peer.MachineId == req.MachineId &&
+        peer.RepoRoot == req.RepoRoot &&
+        peer.WorktreeRoot == req.WorktreeRoot &&
+        peer.Branch == req.Branch;
 }

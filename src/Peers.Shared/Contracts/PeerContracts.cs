@@ -13,11 +13,14 @@ public sealed class RegisterPeerRequest
     public string? FocusPaths { get; init; }
     public string? Capabilities { get; init; }
     public string? ParentPeerId { get; init; }
+    public string? ResumePeerId { get; init; }
 }
 
 public sealed class RegisterPeerResponse
 {
     public required string PeerId { get; init; }
+    public required long LastCursor { get; init; }
+    public required bool Resumed { get; init; }
 }
 
 public sealed class HeartbeatRequest

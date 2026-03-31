@@ -62,6 +62,8 @@ try
 }
 finally
 {
+    if (sessionState.PeerId is not null)
+        await client.DeregisterAsync(sessionState.PeerId);
     await sessionState.DisposeAsync();
     client.Dispose();
 }

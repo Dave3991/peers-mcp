@@ -21,33 +21,52 @@ public sealed class PeerTools
         [Description("Role: implementing, reviewing, debugging, spec")] string? role = null,
         [Description("Brief summary of current work")] string? summary = null,
         [Description("JSON array of file paths this session focuses on")] string? focus_paths = null,
-        [Description("Parent peer ID if this is a spawned session")] string? parent_peer_id = null)
+        [Description("Parent peer ID if this is a spawned session")] string? parent_peer_id = null,
+        [Description("Explicit peer ID to resume (reactivates an expired or active session)")] string? resume_peer_id = null)
     {
-        var req = new RegisterPeerRequest
+        try
         {
-            Tool = tool,
-            MachineId = Environment.MachineName,
-            RepoRoot = repo_root,
-            Branch = branch,
-            CommitSha = commit_sha,
-            Role = role,
-            Summary = summary,
-            FocusPaths = focus_paths,
-            ParentPeerId = parent_peer_id,
-        };
-        var resp = await client.RegisterAsync(req);
+            var req = new RegisterPeerRequest
+            {
+                Tool = tool,
+                MachineId = Environment.MachineName,
+                RepoRoot = repo_root,
+                Branch = branch,
+                CommitSha = commit_sha,
+                Role = role,
+                Summary = summary,
+                FocusPaths = focus_paths,
+                ParentPeerId = parent_peer_id,
+                ResumePeerId = resume_peer_id,
+            };
+            var resp = await client.RegisterAsync(req);
 
-        await state.StopServicesAsync();
-        state.PeerId = resp.PeerId;
-        state.Tool = tool;
+            await state.StopServicesAsync();
+            state.PeerId = resp.PeerId;
+            state.Tool = tool;
+            state.LastCursor = resp.LastCursor;
 
-        state.Heartbeat = new HeartbeatService(client, resp.PeerId);
-        state.Heartbeat.Start();
+            state.Heartbeat = new HeartbeatService(client, resp.PeerId);
+            state.Heartbeat.Start();
 
-        state.ChannelNotifier = new ChannelNotifier(client, state, server);
-        state.ChannelNotifier.Start();
+            state.ChannelNotifier = new ChannelNotifier(client, state, server);
+            state.ChannelNotifier.Start();
 
-        return JsonSerializer.Serialize(new { peer_id = resp.PeerId, message = "Registered. Heartbeat and push notifications started." });
+            return JsonSerializer.Serialize(new
+            {
+                peer_id = resp.PeerId,
+                resumed = resp.Resumed,
+                last_cursor = resp.LastCursor,
+                message = resp.Resumed
+                    ? "Resumed previous peer identity. Heartbeat and push notifications started."
+                    : "Registered. Heartbeat and push notifications started.",
+            });
+        }
+        catch (Exception ex)
+        {
+            await Console.Error.WriteLineAsync($"[Peers] peer_register failed: {ex}");
+            return JsonSerializer.Serialize(new { error = ex.Message });
+        }
     }
 
     [McpServerTool(Name = "peer_heartbeat"), Description("Renew lease and optionally update status fields.")]

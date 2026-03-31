@@ -15,6 +15,7 @@ public sealed class CreateScratchpadRequest
 public sealed class CreateScratchpadResponse
 {
     public required string ScratchpadId { get; init; }
+    public RecipientDeliveryStatus? Recipients { get; init; }
 }
 
 public sealed class AppendEntryRequest
@@ -27,6 +28,7 @@ public sealed class AppendEntryRequest
 public sealed class AppendEntryResponse
 {
     public required string EntryId { get; init; }
+    public RecipientDeliveryStatus? Recipients { get; init; }
 }
 
 public sealed class ReadScratchpadResponse
@@ -38,4 +40,11 @@ public sealed class ReadScratchpadResponse
 public sealed class CloseScratchpadRequest
 {
     public string? Resolution { get; init; }
+}
+
+public sealed class RecipientDeliveryStatus
+{
+    public required string[] OnlinePeerIds { get; init; }
+    public required string[] OfflinePeerIds { get; init; }
+    public required string[] UnresolvedTargets { get; init; }
 }
