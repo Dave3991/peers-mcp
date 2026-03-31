@@ -67,19 +67,23 @@ Without this flag, sessions can still communicate using the pull-based `peer_inb
 
 ### Discover each other
 
-Every session registers with a role (`implementing`, `reviewing`, `debugging`, `spec`), its repo, branch, and a summary of what it's working on. Other sessions can list active peers and see who's doing what.
+Every session registers with a role (`implementing`, `reviewing`, `debugging`, `spec`), its repo, branch, and a summary of what it's working on. Other sessions can list active peers and see who's doing what. Sessions are lease-based (2-minute TTL, auto-renewed) and automatically deregister on shutdown. Reconnecting sessions can resume their previous identity.
 
 ### Collaborate through scratchpads
 
-Scratchpads are shared, append-only documents where sessions exchange thoughts asynchronously. Create a review scratchpad, tag a peer as reviewer, and they'll be notified. Types include `review`, `discussion`, `spec`, and `context`.
+Scratchpads are shared, append-only documents where sessions exchange thoughts asynchronously. Create a review scratchpad, tag a peer as reviewer, and they'll be notified with delivery status (online/offline/unresolved). Quiet appends let you add entries without triggering push notifications. Types include `review`, `discussion`, `spec`, and `context`.
 
 ### Share artifacts
 
-Publish versioned artifacts — diffs, type definitions, API specs, test reports — that other sessions can retrieve by name. Artifacts are automatically versioned per namespace and content-hashed for integrity.
+Publish versioned artifacts — diffs, type definitions, API specs, test reports — that other sessions can retrieve by name. Artifacts are automatically versioned per namespace and content-hashed for integrity. Large results are automatically truncated with guidance on pagination.
 
 ### Hand off to Codex
 
 The context bridge lets you export a session's full state (peers, scratchpads, artifacts, task description) as a structured markdown packet that Codex can import, and vice versa.
+
+### Durable message delivery
+
+Directed messages are persisted in a per-peer inbox with at-least-once delivery semantics. If a session disconnects and resumes, it picks up where it left off — no messages lost. Push notifications provide real-time delivery when available, with the inbox as a reliable fallback.
 
 ## MCP Tools Reference
 
@@ -87,16 +91,18 @@ Once registered, each session has access to these tools:
 
 | Tool | Purpose |
 |------|---------|
-| `peer_register` | Join the network with your role, repo, and summary |
+| `peer_register` | Join the network with your role, repo, and summary. Supports session resumption |
 | `peer_heartbeat` | Update your status and renew your session lease |
 | `peer_list` | See all active sessions, filter by repo/branch/tool |
-| `peer_inbox` | Read messages directed to you (pull mode) |
+| `peer_inbox` | Read messages directed to you (pull mode, durable with at-least-once delivery) |
 | `peer_poll` | Low-level event polling with cursor |
-| `scratchpad_create` | Start a shared review, discussion, or spec |
-| `scratchpad_append` | Add an entry to a scratchpad |
+| `peer_test_push` | Send a test push notification to verify push delivery |
+| `scratchpad_create` | Start a shared review, discussion, or spec. Shows recipient delivery status |
+| `scratchpad_append` | Add an entry to a scratchpad. Supports quiet mode to suppress push |
 | `scratchpad_read` | Read scratchpad entries with pagination |
 | `scratchpad_list` | List scratchpads, filter by type/status/repo |
-| `scratchpad_close` | Close a scratchpad with an optional resolution |
+| `scratchpad_resolve` | Mark a scratchpad as resolved without closing it |
+| `scratchpad_close` | Close a scratchpad with an optional resolution summary |
 | `artifact_publish` | Publish a versioned, content-hashed artifact |
 | `artifact_get` | Retrieve an artifact by ID or by name (latest version) |
 | `artifact_list` | List artifact metadata, filter by type/repo/namespace |
@@ -110,17 +116,20 @@ src/
 ├── Peers.Broker/        # ASP.NET Core HTTP server + SQLite
 │   ├── Routes/          # REST API endpoints
 │   ├── Services/        # Business logic
-│   └── Persistence/     # SQLite repositories + schema
+│   ├── Validation/      # Request size limits and validation
+│   └── Persistence/     # SQLite repositories + schema (auto-migrating)
 ├── Peers.Mcp/           # MCP stdio server (thin broker client)
 │   ├── Tools/           # MCP tool implementations
 │   └── Lifecycle/       # Heartbeat, discovery, push notifications
 ├── Peers.Shared/        # Models, contracts, broker runtime
 └── Peers.Cli/           # CLI for testing and debugging
+tests/
+└── Peers.Broker.Tests/  # xunit integration tests
 ```
 
-**Broker** (`localhost:7856`) manages all state in SQLite at `~/.peers/peers.db`. It exposes a REST API, handles peer leases (2-minute TTL, auto-renewed), event fan-out, and cleanup.
+**Broker** (`localhost:7856`) manages all state in SQLite at `~/.peers/peers.db`. It exposes a REST API, handles peer leases (2-minute TTL, auto-renewed), persistent inbox delivery, event fan-out, request validation, and cleanup.
 
-**MCP Server** is a thin stdio wrapper that translates MCP tool calls into broker HTTP requests. It manages the session lifecycle — heartbeat every 30 seconds, event polling every 5 seconds, and push notification delivery.
+**MCP Server** is a thin stdio wrapper that translates MCP tool calls into broker HTTP requests. It manages the session lifecycle — heartbeat every 30 seconds, event polling every 5 seconds, push notification delivery, and deregistration on shutdown.
 
 **CLI** provides commands for manual testing: `status`, `register`, `scratchpads`, `artifacts`, `poll`.
 
@@ -130,9 +139,11 @@ src/
 |---------------------|---------|-------------|
 | `PEERS_PORT` | `7856` | Broker HTTP port |
 | `PEERS_STATE_DIR` | `~/.peers` | State directory (database, discovery file) |
+| `PEERS_HOME` | `~` | Base directory for state (`$PEERS_HOME/.peers`) |
 | `PEERS_DB_PATH` | `~/.peers/peers.db` | SQLite database path |
 | `PEERS_BROKER_PROJECT` | *(auto-detected)* | Path to `Peers.Broker.csproj` |
 | `PEERS_MAX_BUFFERED_MESSAGES` | `100` | Max buffered push messages per session |
+| `PEERS_MAX_TOOL_RESULT_CHARS` | `30000` | Max characters returned by tool results before truncation |
 
 ## Running the Broker Manually
 
