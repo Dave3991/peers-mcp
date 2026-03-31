@@ -26,6 +26,7 @@ builder.Services.AddScoped<PeerRepository>();
 builder.Services.AddScoped<EventRepository>();
 builder.Services.AddScoped<ScratchpadRepository>();
 builder.Services.AddScoped<ArtifactRepository>();
+builder.Services.AddScoped<InboxRepository>();
 
 // Services
 builder.Services.AddScoped<PeerService>();

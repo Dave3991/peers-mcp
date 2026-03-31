@@ -6,12 +6,13 @@ using Peers.Shared.Models;
 
 namespace Peers.Broker.Services;
 
-public sealed class ScratchpadService(ScratchpadRepository pads, EventRepository events, PeerRepository peers)
+public sealed class ScratchpadService(ScratchpadRepository pads, EventService eventService, PeerRepository peers)
 {
     public async Task<CreateScratchpadResponse> CreateAsync(CreateScratchpadRequest req, CancellationToken ct)
     {
         var id = Guid.NewGuid().ToString("N")[..16];
-        var resolved = await ResolveReviewerPeerIdsAsync(req.RequestedReviewers, ct);
+        var callerPeer = await peers.GetAsync(req.CreatedByPeerId, ct);
+        var resolved = await ResolveReviewerPeerIdsAsync(req.RequestedReviewers, callerPeer?.Branch, ct);
         var pad = new Scratchpad
         {
             ScratchpadId = id,
@@ -26,15 +27,16 @@ public sealed class ScratchpadService(ScratchpadRepository pads, EventRepository
         };
 
         await pads.InsertAsync(pad, ct);
-        await events.InsertAsync(EventTypes.ScratchpadCreated,
+        var recipientIds = resolved.EventRecipientPeerIds();
+        await eventService.EmitAsync(EventTypes.ScratchpadCreated,
             JsonSerializer.Serialize(new
             {
                 scratchpad_id = id,
                 type = req.Type,
                 title = req.Title,
                 created_by_peer_id = req.CreatedByPeerId,
-                recipient_peer_ids = resolved.EventRecipientPeerIds(),
-            }), ct: ct);
+                recipient_peer_ids = recipientIds,
+            }), ct, recipientIds);
 
         return new CreateScratchpadResponse
         {
@@ -64,7 +66,8 @@ public sealed class ScratchpadService(ScratchpadRepository pads, EventRepository
         var result = await pads.AppendEntryAsync(entry, ct);
         if (result is null) return null; // idempotent duplicate
 
-        await events.InsertAsync(EventTypes.ScratchpadEntryAdded,
+        var recipientIds = resolved.EventRecipientPeerIds();
+        await eventService.EmitAsync(EventTypes.ScratchpadEntryAdded,
             JsonSerializer.Serialize(new
             {
                 scratchpad_id = scratchpadId,
@@ -73,8 +76,9 @@ public sealed class ScratchpadService(ScratchpadRepository pads, EventRepository
                 author_peer_id = req.AuthorPeerId,
                 content = req.Content,
                 created_by_peer_id = pad.CreatedByPeerId,
-                recipient_peer_ids = resolved.EventRecipientPeerIds(),
-            }), ct: ct);
+                recipient_peer_ids = recipientIds,
+                quiet = req.Quiet,
+            }), ct, recipientIds);
 
         return new AppendEntryResponse
         {
@@ -97,6 +101,25 @@ public sealed class ScratchpadService(ScratchpadRepository pads, EventRepository
         return await pads.ListAsync(type, repoRoot, status, ct);
     }
 
+    public async Task ResolveAsync(string scratchpadId, ResolveScratchpadRequest req, CancellationToken ct)
+    {
+        var pad = await pads.GetAsync(scratchpadId, ct)
+            ?? throw new InvalidOperationException($"Scratchpad '{scratchpadId}' not found.");
+
+        await pads.ResolveAsync(scratchpadId, req.Resolution, ct);
+        var resolved = await ResolveConversationPeerIdsAsync(pad, authorPeerId: null, ct);
+
+        var recipientIds = resolved.EventRecipientPeerIds();
+        await eventService.EmitAsync(EventTypes.ScratchpadResolved,
+            JsonSerializer.Serialize(new
+            {
+                scratchpad_id = scratchpadId,
+                title = pad.Title,
+                resolution = req.Resolution,
+                recipient_peer_ids = recipientIds,
+            }), ct, recipientIds);
+    }
+
     public async Task CloseAsync(string scratchpadId, CloseScratchpadRequest req, CancellationToken ct)
     {
         var pad = await pads.GetAsync(scratchpadId, ct)
@@ -106,17 +129,18 @@ public sealed class ScratchpadService(ScratchpadRepository pads, EventRepository
         var closedPad = await pads.GetAsync(scratchpadId, ct) ?? pad;
         var resolved = await ResolveConversationPeerIdsAsync(closedPad, authorPeerId: null, ct);
 
-        await events.InsertAsync(EventTypes.ScratchpadClosed,
+        var recipientIds = resolved.EventRecipientPeerIds();
+        await eventService.EmitAsync(EventTypes.ScratchpadClosed,
             JsonSerializer.Serialize(new
             {
                 scratchpad_id = scratchpadId,
                 title = closedPad.Title,
                 resolution = req.Resolution,
-                recipient_peer_ids = resolved.EventRecipientPeerIds(),
-            }), ct: ct);
+                recipient_peer_ids = recipientIds,
+            }), ct, recipientIds);
     }
 
-    private async Task<ResolvedRecipients> ResolveReviewerPeerIdsAsync(string? requestedReviewers, CancellationToken ct)
+    private async Task<ResolvedRecipients> ResolveReviewerPeerIdsAsync(string? requestedReviewers, string? callerBranch, CancellationToken ct)
     {
         if (string.IsNullOrWhiteSpace(requestedReviewers))
             return ResolvedRecipients.Empty;
@@ -151,7 +175,7 @@ public sealed class ScratchpadService(ScratchpadRepository pads, EventRepository
                 continue;
             }
 
-            // Fall back to repo root match
+            // Fall back to repo root match — prefer same-branch peers
             var repoPeers = await peers.ListAsync(repoRoot: target, includeExpired: true, ct: ct);
             if (repoPeers.Count == 0)
             {
@@ -159,7 +183,11 @@ public sealed class ScratchpadService(ScratchpadRepository pads, EventRepository
                 continue;
             }
 
-            foreach (var repoPeer in repoPeers)
+            // Prefer active same-branch peers; fall back to all repo peers
+            var activeSameBranch = repoPeers.Where(p => p.Branch == callerBranch && callerBranch is not null && p.ExpiredAt is null).ToList();
+            var candidates = activeSameBranch.Count > 0 ? activeSameBranch : repoPeers;
+
+            foreach (var repoPeer in candidates)
             {
                 if (repoPeer.ExpiredAt is null)
                     online.Add(repoPeer.PeerId);
@@ -179,7 +207,8 @@ public sealed class ScratchpadService(ScratchpadRepository pads, EventRepository
 
     private async Task<ResolvedRecipients> ResolveConversationPeerIdsAsync(Scratchpad pad, string? authorPeerId, CancellationToken ct)
     {
-        var resolved = await ResolveReviewerPeerIdsAsync(pad.RequestedReviewers, ct);
+        var callerPeer = authorPeerId is not null ? await peers.GetAsync(authorPeerId, ct) : null;
+        var resolved = await ResolveReviewerPeerIdsAsync(pad.RequestedReviewers, callerPeer?.Branch, ct);
 
         var online = new HashSet<string>(resolved.OnlinePeerIds, StringComparer.Ordinal);
         var offline = new HashSet<string>(resolved.OfflinePeerIds, StringComparer.Ordinal);

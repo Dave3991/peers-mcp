@@ -4,7 +4,7 @@ namespace Peers.Broker.Persistence;
 
 public static class Schema
 {
-    private const int CurrentVersion = 1;
+    private const int CurrentVersion = 2;
 
     public static void Migrate(SqliteConnection conn)
     {
@@ -13,6 +13,7 @@ public static class Schema
         var version = Convert.ToInt32(cmd.ExecuteScalar());
 
         if (version < 1) ApplyV1(conn);
+        if (version < 2) ApplyV2(conn);
 
         using var setVersion = conn.CreateCommand();
         setVersion.CommandText = $"PRAGMA user_version = {CurrentVersion};";
@@ -107,6 +108,26 @@ public static class Schema
             );
 
             CREATE INDEX IF NOT EXISTS idx_events_type ON events(type);
+            """;
+
+        using var cmd = conn.CreateCommand();
+        cmd.CommandText = sql;
+        cmd.ExecuteNonQuery();
+    }
+
+    private static void ApplyV2(SqliteConnection conn)
+    {
+        var sql = """
+            CREATE TABLE IF NOT EXISTS peer_inbox (
+                inbox_id            TEXT PRIMARY KEY,
+                peer_id             TEXT NOT NULL REFERENCES peers(peer_id) ON DELETE CASCADE,
+                event_id            INTEGER NOT NULL REFERENCES events(event_id) ON DELETE CASCADE,
+                acked_at            TEXT,
+                created_at          TEXT NOT NULL DEFAULT (datetime('now'))
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_inbox_peer ON peer_inbox(peer_id, acked_at);
+            CREATE INDEX IF NOT EXISTS idx_inbox_event ON peer_inbox(event_id);
             """;
 
         using var cmd = conn.CreateCommand();

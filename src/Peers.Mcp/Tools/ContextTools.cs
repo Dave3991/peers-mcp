@@ -23,6 +23,19 @@ public sealed partial class ContextTools
         [Description("Custom task description to include")] string? task = null,
         [Description("Custom notes to include (JSON array of strings)")] string? notes = null)
     {
+        try { return await ExportInner(client, state, include_peers, include_scratchpads, include_artifacts, task, notes); }
+        catch (BrokerApiException ex) { return JsonSerializer.Serialize(new { error = ex.Message, status_code = (int)ex.StatusCode }, JsonOpts); }
+    }
+
+    private static async Task<string> ExportInner(
+        BrokerClient client,
+        SessionState state,
+        bool include_peers,
+        bool include_scratchpads,
+        bool include_artifacts,
+        string? task,
+        string? notes)
+    {
         var sb = new StringBuilder();
         sb.AppendLine("<!-- peers-context:v1 -->");
         sb.AppendLine("```yaml");

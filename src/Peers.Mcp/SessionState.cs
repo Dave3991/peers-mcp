@@ -22,6 +22,7 @@ public sealed class SessionState : IDisposable, IAsyncDisposable
     public long LastCursor { get; set; }
     public HeartbeatService? Heartbeat { get; set; }
     public ChannelNotifier? ChannelNotifier { get; set; }
+    public string[]? PendingInboxAckIds { get; set; }
 
     public void EnqueueChannelMessage(PendingChannelMessage message)
     {

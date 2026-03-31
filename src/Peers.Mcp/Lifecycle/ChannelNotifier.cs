@@ -75,8 +75,16 @@ public sealed class ChannelNotifier : IDisposable, IAsyncDisposable
                         continue;
                     }
 
-                    await Console.Error.WriteLineAsync($"[Peers] Delivering event {evt.EventId} ({evt.Type}): {message.Content[..Math.Min(80, message.Content.Length)]}...");
+                    // Always enqueue for inbox; only push if not quiet
                     _state.EnqueueChannelMessage(message);
+
+                    if (IsQuietEvent(evt))
+                    {
+                        await Console.Error.WriteLineAsync($"[Peers] Quiet event {evt.EventId} ({evt.Type}): buffered for inbox, push suppressed");
+                        continue;
+                    }
+
+                    await Console.Error.WriteLineAsync($"[Peers] Delivering event {evt.EventId} ({evt.Type}): {message.Content[..Math.Min(80, message.Content.Length)]}...");
                     await TryPushAsync(message, ct);
                 }
             }
@@ -237,6 +245,17 @@ public sealed class ChannelNotifier : IDisposable, IAsyncDisposable
         }
     }
 
+    private static bool IsQuietEvent(PeerEvent evt)
+    {
+        try
+        {
+            using var doc = JsonDocument.Parse(evt.Payload);
+            return doc.RootElement.TryGetProperty("quiet", out var quiet)
+                && quiet.ValueKind == JsonValueKind.True;
+        }
+        catch { return false; }
+    }
+
     private bool IsOwnEvent(PeerEvent evt)
     {
         if (_state.PeerId is null)
@@ -295,6 +314,16 @@ public sealed class ChannelNotifier : IDisposable, IAsyncDisposable
                              $"(type: {root.GetProp("type") ?? "unknown"}, " +
                              $"id: {root.GetProp("scratchpad_id") ?? "unknown"}, " +
                              $"from: {root.GetProp("created_by_peer_id") ?? "unknown"})"),
+
+                EventTypes.ScratchpadResolved => BuildMessage(
+                    evt,
+                    scratchpadId: root.GetProp("scratchpad_id"),
+                    title: root.GetProp("title") ?? "Untitled",
+                    fromPeerId: null,
+                    level: LoggingLevel.Info,
+                    content: $"Peers scratchpad resolved: '{root.GetProp("title") ?? "Untitled"}' " +
+                             $"(id: {root.GetProp("scratchpad_id") ?? "unknown"}" +
+                             (root.GetProp("resolution") is { } res ? $", resolution: {res}" : "") + ")"),
 
                 EventTypes.ScratchpadClosed => BuildMessage(
                     evt,

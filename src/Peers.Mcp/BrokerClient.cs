@@ -24,7 +24,7 @@ public sealed class BrokerClient : IDisposable
         (await PostAsync<RegisterPeerResponse>("/peers", req))!;
 
     public async Task HeartbeatAsync(string peerId, HeartbeatRequest req) =>
-        await _http.PatchAsJsonAsync($"/peers/{peerId}/heartbeat", req, JsonOpts);
+        await PatchAsync($"/peers/{peerId}/heartbeat", req);
 
     public async Task DeregisterAsync(string peerId)
     {
@@ -54,8 +54,11 @@ public sealed class BrokerClient : IDisposable
         return (await GetAsync<List<Scratchpad>>($"/scratchpads{query}"))!;
     }
 
+    public async Task ResolveScratchpadAsync(string padId, ResolveScratchpadRequest req) =>
+        await PatchAsync($"/scratchpads/{padId}/resolve", req);
+
     public async Task CloseScratchpadAsync(string padId, CloseScratchpadRequest req) =>
-        await _http.PatchAsJsonAsync($"/scratchpads/{padId}/close", req, JsonOpts);
+        await PatchAsync($"/scratchpads/{padId}/close", req);
 
     // Artifacts
     public async Task<PublishArtifactResponse> PublishArtifactAsync(PublishArtifactRequest req) =>
@@ -77,6 +80,13 @@ public sealed class BrokerClient : IDisposable
     public async Task<PollResponse> PollAsync(string peerId, long cursor, int limit = 100) =>
         (await GetAsync<PollResponse>($"/poll/{peerId}?cursor={cursor}&limit={limit}"))!;
 
+    // Inbox
+    public async Task<InboxResponse?> GetInboxAsync(string peerId, int limit = 100) =>
+        await GetAsync<InboxResponse>($"/peers/{peerId}/inbox?limit={limit}");
+
+    public async Task AckInboxAsync(string peerId, string[]? inboxIds = null, bool all = false) =>
+        await PostAsync<object>($"/peers/{peerId}/inbox/ack", new { InboxIds = inboxIds, All = all });
+
     // Health
     public async Task<bool> IsHealthyAsync()
     {
@@ -91,15 +101,33 @@ public sealed class BrokerClient : IDisposable
     private async Task<T?> GetAsync<T>(string path)
     {
         var resp = await _http.GetAsync(path);
-        if (!resp.IsSuccessStatusCode) return default;
+        if (!resp.IsSuccessStatusCode)
+        {
+            var body = await resp.Content.ReadAsStringAsync();
+            throw new BrokerApiException(resp.StatusCode, body);
+        }
         return await resp.Content.ReadFromJsonAsync<T>(JsonOpts);
     }
 
     private async Task<T?> PostAsync<T>(string path, object body)
     {
         var resp = await _http.PostAsJsonAsync(path, body, JsonOpts);
-        resp.EnsureSuccessStatusCode();
+        if (!resp.IsSuccessStatusCode)
+        {
+            var errorBody = await resp.Content.ReadAsStringAsync();
+            throw new BrokerApiException(resp.StatusCode, errorBody);
+        }
         return await resp.Content.ReadFromJsonAsync<T>(JsonOpts);
+    }
+
+    private async Task PatchAsync(string path, object body)
+    {
+        var resp = await _http.PatchAsJsonAsync(path, body, JsonOpts);
+        if (!resp.IsSuccessStatusCode)
+        {
+            var errorBody = await resp.Content.ReadAsStringAsync();
+            throw new BrokerApiException(resp.StatusCode, errorBody);
+        }
     }
 
     private static string BuildQuery(params (string key, string? value)[] pairs)

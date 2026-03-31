@@ -23,6 +23,12 @@ public sealed class AppendEntryRequest
     public required string AuthorPeerId { get; init; }
     public required string Content { get; init; }
     public string? IdempotencyKey { get; init; }
+    public bool Quiet { get; init; }
+}
+
+public sealed class ResolveScratchpadRequest
+{
+    public string? Resolution { get; init; }
 }
 
 public sealed class AppendEntryResponse

@@ -80,11 +80,15 @@ public sealed class PeerTools
         [Description("Update focus paths (JSON array)")] string? focus_paths = null)
     {
         if (state.PeerId is null) return """{"error":"Not registered. Call peer_register first."}""";
-        await client.HeartbeatAsync(state.PeerId, new HeartbeatRequest
+        try
         {
-            Summary = summary, Role = role, Branch = branch, CommitSha = commit_sha, FocusPaths = focus_paths,
-        });
-        return """{"ok":true}""";
+            await client.HeartbeatAsync(state.PeerId, new HeartbeatRequest
+            {
+                Summary = summary, Role = role, Branch = branch, CommitSha = commit_sha, FocusPaths = focus_paths,
+            });
+            return """{"ok":true}""";
+        }
+        catch (BrokerApiException ex) { return BrokerError(ex); }
     }
 
     [McpServerTool(Name = "peer_list"), Description("Discover other active peer sessions. Filter by repo, branch, or tool.")]
@@ -94,7 +98,14 @@ public sealed class PeerTools
         [Description("Filter by branch")] string? branch = null,
         [Description("Filter by tool (claude-code, codex)")] string? tool = null)
     {
-        var peers = await client.ListPeersAsync(repo_root, branch, tool);
-        return JsonSerializer.Serialize(peers, new JsonSerializerOptions { PropertyNamingPolicy = JsonNamingPolicy.SnakeCaseLower });
+        try
+        {
+            var peers = await client.ListPeersAsync(repo_root, branch, tool);
+            return JsonSerializer.Serialize(peers, new JsonSerializerOptions { PropertyNamingPolicy = JsonNamingPolicy.SnakeCaseLower });
+        }
+        catch (BrokerApiException ex) { return BrokerError(ex); }
     }
+
+    private static string BrokerError(BrokerApiException ex) =>
+        JsonSerializer.Serialize(new { error = ex.Message, status_code = (int)ex.StatusCode });
 }

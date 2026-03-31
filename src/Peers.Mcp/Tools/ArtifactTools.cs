@@ -25,13 +25,17 @@ public sealed class ArtifactTools
         [Description("JSON array of tags")] string? tags = null)
     {
         if (state.PeerId is null) return """{"error":"Not registered. Call peer_register first."}""";
-        var resp = await client.PublishArtifactAsync(new PublishArtifactRequest
+        try
         {
-            Namespace = @namespace, Name = name, Type = type, Content = content,
-            RepoRoot = repo_root, Branch = branch, CommitSha = commit_sha,
-            ContentType = content_type, Tags = tags, PublishedByPeerId = state.PeerId,
-        });
-        return JsonSerializer.Serialize(resp, JsonOpts);
+            var resp = await client.PublishArtifactAsync(new PublishArtifactRequest
+            {
+                Namespace = @namespace, Name = name, Type = type, Content = content,
+                RepoRoot = repo_root, Branch = branch, CommitSha = commit_sha,
+                ContentType = content_type, Tags = tags, PublishedByPeerId = state.PeerId,
+            });
+            return JsonSerializer.Serialize(resp, JsonOpts);
+        }
+        catch (BrokerApiException ex) { return BrokerError(ex); }
     }
 
     [McpServerTool(Name = "artifact_get"), Description("Get an artifact by ID or by namespace+name (returns latest version).")]
@@ -41,15 +45,38 @@ public sealed class ArtifactTools
         [Description("Artifact namespace")] string? @namespace = null,
         [Description("Artifact name")] string? name = null)
     {
-        var result = artifact_id is not null
-            ? await client.GetArtifactByIdAsync(artifact_id)
-            : (@namespace is not null && name is not null)
-                ? await client.GetArtifactByNameAsync(@namespace, name)
-                : null;
+        try
+        {
+            var result = artifact_id is not null
+                ? await client.GetArtifactByIdAsync(artifact_id)
+                : (@namespace is not null && name is not null)
+                    ? await client.GetArtifactByNameAsync(@namespace, name)
+                    : null;
 
-        return result is not null
-            ? JsonSerializer.Serialize(result, JsonOpts)
-            : """{"error":"Artifact not found. Provide artifact_id or both namespace and name."}""";
+            if (result is null)
+                return """{"error":"Artifact not found. Provide artifact_id or both namespace and name."}""";
+
+            var serialized = JsonSerializer.Serialize(result, JsonOpts);
+            if (serialized.Length > Limits.MaxToolResultChars)
+            {
+                var truncated = new
+                {
+                    artifact_id = result.ArtifactId,
+                    @namespace = result.Namespace,
+                    name = result.Name,
+                    version = result.Version,
+                    type = result.Type,
+                    content_hash = result.ContentHash,
+                    content_bytes = result.ContentBytes,
+                    content_preview = result.Content[..Math.Min(Limits.MaxToolResultChars / 2, result.Content.Length)],
+                    truncated = true,
+                    message = $"Content preview: first {Math.Min(Limits.MaxToolResultChars / 2, result.Content.Length)} of {result.Content.Length} chars. Use artifact_get with the artifact_id to fetch specific sections.",
+                };
+                return JsonSerializer.Serialize(truncated, JsonOpts);
+            }
+            return serialized;
+        }
+        catch (BrokerApiException ex) { return BrokerError(ex); }
     }
 
     [McpServerTool(Name = "artifact_list"), Description("List artifacts. Returns metadata only (no content). Filter by type, repo, or namespace.")]
@@ -59,7 +86,14 @@ public sealed class ArtifactTools
         [Description("Filter by repo root")] string? repo_root = null,
         [Description("Filter by namespace")] string? @namespace = null)
     {
-        var list = await client.ListArtifactsAsync(type, repo_root, @namespace);
-        return JsonSerializer.Serialize(list, JsonOpts);
+        try
+        {
+            var list = await client.ListArtifactsAsync(type, repo_root, @namespace);
+            return JsonSerializer.Serialize(list, JsonOpts);
+        }
+        catch (BrokerApiException ex) { return BrokerError(ex); }
     }
+
+    private static string BrokerError(BrokerApiException ex) =>
+        JsonSerializer.Serialize(new { error = ex.Message, status_code = (int)ex.StatusCode }, JsonOpts);
 }

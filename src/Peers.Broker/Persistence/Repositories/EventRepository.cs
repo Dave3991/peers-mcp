@@ -5,6 +5,7 @@ namespace Peers.Broker.Persistence.Repositories;
 
 public sealed class EventRepository(SqliteConnectionFactory db)
 {
+    public SqliteConnectionFactory Database => db;
     public async Task<long> InsertAsync(string type, string payload, SqliteConnection? existingConn = null, CancellationToken ct = default)
     {
         async Task<long> DoInsert(SqliteConnection conn)

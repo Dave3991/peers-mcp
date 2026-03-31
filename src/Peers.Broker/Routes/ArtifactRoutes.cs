@@ -1,4 +1,5 @@
 using Peers.Broker.Services;
+using Peers.Broker.Validation;
 using Peers.Shared.Contracts;
 
 namespace Peers.Broker.Routes;
@@ -8,7 +9,11 @@ public static class ArtifactRoutes
     public static void MapArtifactRoutes(this WebApplication app)
     {
         app.MapPost("/artifacts", async (PublishArtifactRequest req, ArtifactService svc, CancellationToken ct) =>
-            Results.Ok(await svc.PublishAsync(req, ct)));
+        {
+            var err = RequestLimits.ValidatePublishArtifact(req);
+            if (err is not null) return err;
+            return Results.Ok(await svc.PublishAsync(req, ct));
+        });
 
         app.MapGet("/artifacts/{id}", async (string id, ArtifactService svc, CancellationToken ct) =>
         {

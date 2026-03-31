@@ -6,7 +6,7 @@ using Peers.Shared.Models;
 
 namespace Peers.Broker.Services;
 
-public sealed class PeerService(PeerRepository peers, EventRepository events)
+public sealed class PeerService(PeerRepository peers, EventService eventService)
 {
     private static readonly TimeSpan LeaseDuration = TimeSpan.FromMinutes(2);
 
@@ -39,13 +39,14 @@ public sealed class PeerService(PeerRepository peers, EventRepository events)
             await peers.ReactivateAsync(peer, ct);
 
         var otherPeers = await peers.ListAsync(repoRoot: req.RepoRoot, includeExpired: false, ct: ct);
-        var recipientPeerIds = otherPeers
-            .Where(p => p.PeerId != id)
-            .Select(p => p.PeerId)
-            .ToArray();
+        // Prefer same-branch peers, fall back to all repo peers
+        var sameBranch = otherPeers.Where(p => p.PeerId != id && p.Branch == req.Branch && req.Branch is not null).ToList();
+        var recipients = sameBranch.Count > 0 ? sameBranch : otherPeers.Where(p => p.PeerId != id).ToList();
+        var recipientPeerIds = recipients.Select(p => p.PeerId).ToArray();
 
-        await events.InsertAsync(EventTypes.PeerRegistered,
-            JsonSerializer.Serialize(new { peer_id = id, tool = req.Tool, repo_root = req.RepoRoot, recipient_peer_ids = recipientPeerIds }), ct: ct);
+        await eventService.EmitAsync(EventTypes.PeerRegistered,
+            JsonSerializer.Serialize(new { peer_id = id, tool = req.Tool, repo_root = req.RepoRoot, recipient_peer_ids = recipientPeerIds }),
+            ct, recipientPeerIds);
 
         return new RegisterPeerResponse
         {
@@ -77,8 +78,9 @@ public sealed class PeerService(PeerRepository peers, EventRepository events)
         var activePeers = await peers.ListAsync(includeExpired: false, ct: ct);
         var recipientPeerIds = activePeers.Select(p => p.PeerId).ToArray();
 
-        await events.InsertAsync(EventTypes.PeerExpired,
-            JsonSerializer.Serialize(new { expired_count = 1, peer_id = peerId, recipient_peer_ids = recipientPeerIds }), ct: ct);
+        await eventService.EmitAsync(EventTypes.PeerExpired,
+            JsonSerializer.Serialize(new { expired_count = 1, peer_id = peerId, recipient_peer_ids = recipientPeerIds }),
+            ct, recipientPeerIds);
     }
 
     public async Task<int> ExpireStaleAsync(CancellationToken ct)
@@ -89,8 +91,9 @@ public sealed class PeerService(PeerRepository peers, EventRepository events)
             var activePeers = await peers.ListAsync(includeExpired: false, ct: ct);
             var recipientPeerIds = activePeers.Select(p => p.PeerId).ToArray();
 
-            await events.InsertAsync(EventTypes.PeerExpired,
-                JsonSerializer.Serialize(new { expired_count = count, recipient_peer_ids = recipientPeerIds }), ct: ct);
+            await eventService.EmitAsync(EventTypes.PeerExpired,
+                JsonSerializer.Serialize(new { expired_count = count, recipient_peer_ids = recipientPeerIds }),
+                ct, recipientPeerIds);
         }
         return count;
     }

@@ -15,6 +15,7 @@ public static class EventTypes
     public const string PeerExpired = "peer.expired";
     public const string ScratchpadCreated = "scratchpad.created";
     public const string ScratchpadEntryAdded = "scratchpad.entry_added";
+    public const string ScratchpadResolved = "scratchpad.resolved";
     public const string ScratchpadClosed = "scratchpad.closed";
     public const string ArtifactPublished = "artifact.published";
 }

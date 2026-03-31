@@ -3,7 +3,7 @@ using Peers.Shared.Contracts;
 
 namespace Peers.Broker.Services;
 
-public sealed class EventService(EventRepository events, PeerRepository peers)
+public sealed class EventService(EventRepository events, PeerRepository peers, InboxRepository inbox)
 {
     private static readonly TimeSpan RetentionTtl = TimeSpan.FromHours(72);
 
@@ -16,6 +16,23 @@ public sealed class EventService(EventRepository events, PeerRepository peers)
             await peers.UpdateLastPolledEventIdAsync(peerId, newCursor, ct);
 
         return new PollResponse { Events = result, Cursor = newCursor };
+    }
+
+    public async Task<long> EmitAsync(string type, string payload, CancellationToken ct, string[]? recipientPeerIds = null)
+    {
+        if (recipientPeerIds is not { Length: > 0 })
+            return await events.InsertAsync(type, payload, ct: ct);
+
+        // Atomic: event + inbox rows in one transaction
+        return await events.Database.WriteAsync(async conn =>
+        {
+            using var txn = conn.BeginTransaction();
+            var eventId = await events.InsertAsync(type, payload, conn, ct);
+            foreach (var peerId in recipientPeerIds)
+                await inbox.InsertAsync(peerId, eventId, conn, ct);
+            txn.Commit();
+            return eventId;
+        }, ct);
     }
 
     public async Task PruneAsync(CancellationToken ct)

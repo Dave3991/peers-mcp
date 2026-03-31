@@ -1,4 +1,5 @@
 using Peers.Broker.Services;
+using Peers.Broker.Validation;
 using Peers.Shared.Contracts;
 
 namespace Peers.Broker.Routes;
@@ -8,7 +9,11 @@ public static class PeerRoutes
     public static void MapPeerRoutes(this WebApplication app)
     {
         app.MapPost("/peers", async (RegisterPeerRequest req, PeerService svc, CancellationToken ct) =>
-            Results.Ok(await svc.RegisterAsync(req, ct)));
+        {
+            var err = RequestLimits.ValidateRegisterPeer(req);
+            if (err is not null) return err;
+            return Results.Ok(await svc.RegisterAsync(req, ct));
+        });
 
         app.MapPatch("/peers/{peerId}/heartbeat", async (string peerId, HeartbeatRequest req, PeerService svc, CancellationToken ct) =>
         {

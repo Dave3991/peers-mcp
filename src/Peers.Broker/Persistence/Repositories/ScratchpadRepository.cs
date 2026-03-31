@@ -125,6 +125,21 @@ public sealed class ScratchpadRepository(SqliteConnectionFactory db)
         }, ct);
     }
 
+    public async Task ResolveAsync(string scratchpadId, string? resolution, CancellationToken ct = default)
+    {
+        await db.WriteAsync(async conn =>
+        {
+            using var cmd = conn.CreateCommand();
+            cmd.CommandText = """
+                UPDATE scratchpads SET status = 'resolved', resolution = @res
+                WHERE scratchpad_id = @id
+                """;
+            cmd.Parameters.AddWithValue("@id", scratchpadId);
+            cmd.Parameters.AddWithValue("@res", (object?)resolution ?? DBNull.Value);
+            await cmd.ExecuteNonQueryAsync(ct);
+        }, ct);
+    }
+
     public async Task CloseAsync(string scratchpadId, string? resolution, CancellationToken ct = default)
     {
         await db.WriteAsync(async conn =>
