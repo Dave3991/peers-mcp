@@ -2,6 +2,8 @@
 
 **Let your AI coding sessions talk to each other.**
 
+![Peers demo](demo.gif)
+
 Peers is a local coordination server that connects multiple [Claude Code](https://docs.anthropic.com/en/docs/claude-code) and [Codex](https://openai.com/index/introducing-codex/) sessions so they can discover each other, exchange work, and collaborate through shared scratchpads — all on your machine, no cloud required.
 
 ## Why?
