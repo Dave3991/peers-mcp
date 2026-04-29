@@ -10,8 +10,9 @@ public sealed class PollTools
     private static readonly JsonSerializerOptions JsonOpts = new() { PropertyNamingPolicy = JsonNamingPolicy.SnakeCaseLower };
 
     [McpServerTool(Name = "peer_poll"), Description(
-        "Poll for new events since your last cursor. Returns peer changes, scratchpad updates, artifact publishes. " +
-        "Call this at startup, after completing tasks, and before finishing your session.")]
+        "Cursor-based debug feed of raw broker events (peer changes, scratchpad updates, artifact publishes) for this peer.\n" +
+        "When NOT to use: do not use this for everyday directed-message reading — call peer_inbox instead. peer_poll exposes the cursor for diagnostics and replay.\n" +
+        "Side effect: advances state.LastCursor to resp.Cursor. Returns: { cursor, events[] }. Defaults to picking up from the session's last cursor when omitted.")]
     public static async Task<string> Poll(
         BrokerClient client,
         SessionState state,
@@ -35,12 +36,14 @@ public sealed class PollTools
         JsonSerializer.Serialize(new { error = ex.Message, status_code = (int)ex.StatusCode }, JsonOpts);
 
     [McpServerTool(Name = "peer_inbox"), Description(
-        "Read buffered directed collaboration events for this session. " +
-        "Use this when automatic push delivery is unavailable or silent.")]
+        "Drain the durable inbox of directed messages addressed to this peer (review requests, replies, DMs). This is the primary, everyday way to read peer activity — call at startup, after each task chunk, before finishing.\n" +
+        "Delivery: at-least-once. Items fetched here are acked on the NEXT inbox call, so a tool error between calls causes redelivery.\n" +
+        "When NOT to use: peer_poll is for raw cursor/event debugging — prefer peer_inbox for normal collaboration.\n" +
+        "Returns: { cursor, items[] (each with inbox_id), dropped_message_count, remaining_count }.")]
     public static async Task<string> Inbox(
         BrokerClient client,
         SessionState state,
-        [Description("Maximum number of buffered inbox items to drain (default drains all)")] int? limit = null)
+        [Description("Maximum number of buffered inbox items to drain (default 100)")] int? limit = null)
     {
         if (state.PeerId is null) return """{"error":"Not registered. Call peer_register first."}""";
 
@@ -76,8 +79,9 @@ public sealed class PollTools
     }
 
     [McpServerTool(Name = "peer_test_push"), Description(
-        "Send a test push notification to verify push delivery is working. " +
-        "If this message appears in the client, push mode is functional.")]
+        "Diagnostic: emit a test push notification through this session's channel notifier.\n" +
+        "If the message surfaces in the client UI, push mode is wired up; if not, fall back to peer_inbox for pull-mode delivery.\n" +
+        "Returns: { ok, message } on success, { ok: false, error } if the notifier is not running.")]
     public static async Task<string> TestPush(
         SessionState state,
         [Description("Optional test message content")] string? message = null)

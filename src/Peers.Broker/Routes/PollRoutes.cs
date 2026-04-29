@@ -8,8 +8,8 @@ public static class PollRoutes
 {
     public static void MapPollRoutes(this WebApplication app)
     {
-        app.MapGet("/poll/{peerId}", async (string peerId, long? cursor, int? limit, EventService svc, CancellationToken ct) =>
-            Results.Ok(await svc.PollAsync(peerId, cursor ?? 0, limit ?? 100, ct)));
+        app.MapGet("/poll/{peerId}", async (string peerId, long? cursor, int? limit, bool? peek, EventService svc, CancellationToken ct) =>
+            Results.Ok(await svc.PollAsync(peerId, cursor ?? 0, limit ?? 100, ct, peek: peek ?? false)));
 
         app.MapGet("/peers/{peerId}/inbox", async (string peerId, int? limit, InboxRepository inbox, CancellationToken ct) =>
         {

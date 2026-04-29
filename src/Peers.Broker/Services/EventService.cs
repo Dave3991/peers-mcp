@@ -7,12 +7,12 @@ public sealed class EventService(EventRepository events, PeerRepository peers, I
 {
     private static readonly TimeSpan RetentionTtl = TimeSpan.FromHours(72);
 
-    public async Task<PollResponse> PollAsync(string peerId, long cursor, int limit, CancellationToken ct)
+    public async Task<PollResponse> PollAsync(string peerId, long cursor, int limit, CancellationToken ct, bool peek = false)
     {
         var result = await events.GetSinceAsync(cursor, limit, ct);
         var newCursor = result.Count > 0 ? result[^1].EventId : cursor;
 
-        if (result.Count > 0)
+        if (result.Count > 0 && !peek)
             await peers.UpdateLastPolledEventIdAsync(peerId, newCursor, ct);
 
         return new PollResponse { Events = result, Cursor = newCursor };

@@ -1,3 +1,5 @@
+using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Logging.Abstractions;
 using Peers.Shared.Contracts;
 
 namespace Peers.Mcp.Lifecycle;
@@ -6,14 +8,16 @@ public sealed class HeartbeatService : IDisposable, IAsyncDisposable
 {
     private readonly BrokerClient _client;
     private readonly string _peerId;
+    private readonly ILogger<HeartbeatService> _logger;
     private readonly CancellationTokenSource _cts = new();
     private Task? _task;
     private int _disposeStarted;
 
-    public HeartbeatService(BrokerClient client, string peerId)
+    public HeartbeatService(BrokerClient client, string peerId, ILogger<HeartbeatService>? logger = null)
     {
         _client = client;
         _peerId = peerId;
+        _logger = logger ?? NullLogger<HeartbeatService>.Instance;
     }
 
     public void Start()
@@ -36,7 +40,10 @@ public sealed class HeartbeatService : IDisposable, IAsyncDisposable
                 await _client.HeartbeatAsync(_peerId, new HeartbeatRequest());
             }
             catch (OperationCanceledException) { break; }
-            catch { /* log and continue */ }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "Heartbeat failed for peer {PeerId}", _peerId);
+            }
         }
     }
 

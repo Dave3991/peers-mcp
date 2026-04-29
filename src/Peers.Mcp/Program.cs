@@ -1,6 +1,7 @@
 using System.Reflection;
 using System.Text.Json;
 using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Logging;
 using ModelContextProtocol.Protocol;
 using ModelContextProtocol.Server;
 using Peers.Mcp;
@@ -11,6 +12,11 @@ var client = await BrokerDiscovery.EnsureBrokerAsync();
 var sessionState = new SessionState();
 
 var services = new ServiceCollection();
+services.AddLogging(builder =>
+{
+    builder.AddConsole(o => o.LogToStandardErrorThreshold = LogLevel.Trace);
+    builder.SetMinimumLevel(LogLevel.Information);
+});
 services.AddSingleton(client);
 services.AddSingleton(sessionState);
 

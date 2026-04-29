@@ -4,7 +4,8 @@ namespace Peers.Broker.Hosting;
 
 public sealed class CleanupBackgroundService(
     IServiceProvider services,
-    ILogger<CleanupBackgroundService> logger) : BackgroundService
+    ILogger<CleanupBackgroundService> logger,
+    BrokerStatus brokerStatus) : BackgroundService
 {
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
@@ -21,6 +22,8 @@ public sealed class CleanupBackgroundService(
                     logger.LogInformation("Expired {Count} stale peers", expired);
 
                 await eventService.PruneAsync(stoppingToken);
+
+                brokerStatus.MarkCleanupCompleted(DateTimeOffset.UtcNow);
             }
             catch (Exception ex) when (ex is not OperationCanceledException)
             {
