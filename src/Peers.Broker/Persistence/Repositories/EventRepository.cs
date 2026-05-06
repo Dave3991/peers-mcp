@@ -57,7 +57,12 @@ public sealed class EventRepository(SqliteConnectionFactory db)
         return await db.WriteAsync(async conn =>
         {
             using var cmd = conn.CreateCommand();
-            cmd.CommandText = "DELETE FROM events WHERE event_id < @eid";
+            // Keep events still referenced by un-acked inbox rows so peer_inbox can JOIN.
+            cmd.CommandText = """
+                DELETE FROM events
+                WHERE event_id < @eid
+                  AND event_id NOT IN (SELECT event_id FROM peer_inbox WHERE acked_at IS NULL)
+                """;
             cmd.Parameters.AddWithValue("@eid", eventId);
             return await cmd.ExecuteNonQueryAsync(ct);
         }, ct);
@@ -68,7 +73,11 @@ public sealed class EventRepository(SqliteConnectionFactory db)
         return await db.WriteAsync(async conn =>
         {
             using var cmd = conn.CreateCommand();
-            cmd.CommandText = "DELETE FROM events WHERE created_at < datetime('now', @age)";
+            cmd.CommandText = """
+                DELETE FROM events
+                WHERE created_at < datetime('now', @age)
+                  AND event_id NOT IN (SELECT event_id FROM peer_inbox WHERE acked_at IS NULL)
+                """;
             cmd.Parameters.AddWithValue("@age", $"-{(int)age.TotalSeconds} seconds");
             return await cmd.ExecuteNonQueryAsync(ct);
         }, ct);

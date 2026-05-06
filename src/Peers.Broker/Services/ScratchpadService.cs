@@ -1,5 +1,7 @@
 using System.Text;
 using System.Text.Json;
+using FluentResults;
+using Peers.Broker.Errors;
 using Peers.Broker.Persistence.Repositories;
 using Peers.Shared.Contracts;
 using Peers.Shared.Models;
@@ -8,11 +10,13 @@ namespace Peers.Broker.Services;
 
 public sealed class ScratchpadService(ScratchpadRepository pads, EventService eventService, PeerRepository peers)
 {
-    public async Task<CreateScratchpadResponse> CreateAsync(CreateScratchpadRequest req, CancellationToken ct)
+    public async Task<Result<CreateScratchpadResponse>> CreateAsync(CreateScratchpadRequest req, CancellationToken ct)
     {
         var id = Guid.NewGuid().ToString("N")[..16];
         var callerPeer = await peers.GetAsync(req.CreatedByPeerId, ct);
-        var resolved = await ResolveReviewerPeerIdsAsync(req.RequestedReviewers, callerPeer?.Branch, ct);
+        var resolveResult = await TryResolveReviewerPeerIdsAsync(req.RequestedReviewers, callerPeer?.Branch, ct);
+        if (resolveResult.IsFailed) return resolveResult.ToResult<CreateScratchpadResponse>();
+        var resolved = resolveResult.Value;
         var pad = new Scratchpad
         {
             ScratchpadId = id,
@@ -38,18 +42,24 @@ public sealed class ScratchpadService(ScratchpadRepository pads, EventService ev
                 recipient_peer_ids = recipientIds,
             }), ct, recipientIds);
 
-        return new CreateScratchpadResponse
+        return Result.Ok(new CreateScratchpadResponse
         {
             ScratchpadId = id,
             Recipients = resolved.ToStatus(),
-        };
+        });
     }
 
-    public async Task<AppendEntryResponse?> AppendAsync(string scratchpadId, AppendEntryRequest req, CancellationToken ct)
+    public async Task<Result<AppendEntryResponse?>> AppendAsync(string scratchpadId, AppendEntryRequest req, CancellationToken ct)
     {
-        var pad = await pads.GetAsync(scratchpadId, ct)
-            ?? throw new InvalidOperationException($"Scratchpad '{scratchpadId}' not found.");
-        var resolved = await ResolveConversationPeerIdsAsync(pad, req.AuthorPeerId, ct);
+        var pad = await pads.GetAsync(scratchpadId, ct);
+        if (pad is null)
+            return Result.Fail(new NotFoundError($"Scratchpad '{scratchpadId}' not found."));
+        if (pad.Status == "closed")
+            return Result.Fail(new ConflictError($"Scratchpad '{scratchpadId}' is closed and cannot accept new entries."));
+
+        var conversationResult = await TryResolveConversationPeerIdsAsync(pad, req.AuthorPeerId, ct);
+        if (conversationResult.IsFailed) return conversationResult.ToResult<AppendEntryResponse?>();
+        var resolved = conversationResult.Value;
 
         var entryId = Guid.NewGuid().ToString("N")[..16];
         var entry = new ScratchpadEntry
@@ -64,7 +74,7 @@ public sealed class ScratchpadService(ScratchpadRepository pads, EventService ev
         };
 
         var result = await pads.AppendEntryAsync(entry, ct);
-        if (result is null) return null; // idempotent duplicate
+        if (result is null) return Result.Ok<AppendEntryResponse?>(null); // idempotent duplicate
 
         var recipientIds = resolved.EventRecipientPeerIds();
         await eventService.EmitAsync(EventTypes.ScratchpadEntryAdded,
@@ -80,11 +90,11 @@ public sealed class ScratchpadService(ScratchpadRepository pads, EventService ev
                 quiet = req.Quiet,
             }), ct, recipientIds);
 
-        return new AppendEntryResponse
+        return Result.Ok<AppendEntryResponse?>(new AppendEntryResponse
         {
             EntryId = entryId,
             Recipients = resolved.ToStatus(),
-        };
+        });
     }
 
     public async Task<ReadScratchpadResponse?> ReadAsync(string scratchpadId, int limit, int offset, CancellationToken ct)
@@ -101,13 +111,18 @@ public sealed class ScratchpadService(ScratchpadRepository pads, EventService ev
         return await pads.ListAsync(type, repoRoot, status, ct);
     }
 
-    public async Task ResolveAsync(string scratchpadId, ResolveScratchpadRequest req, CancellationToken ct)
+    public async Task<Result> ResolveAsync(string scratchpadId, ResolveScratchpadRequest req, CancellationToken ct)
     {
-        var pad = await pads.GetAsync(scratchpadId, ct)
-            ?? throw new InvalidOperationException($"Scratchpad '{scratchpadId}' not found.");
+        var pad = await pads.GetAsync(scratchpadId, ct);
+        if (pad is null)
+            return Result.Fail(new NotFoundError($"Scratchpad '{scratchpadId}' not found."));
+        if (pad.Status == "closed")
+            return Result.Fail(new ConflictError($"Scratchpad '{scratchpadId}' is closed; cannot resolve."));
 
         await pads.ResolveAsync(scratchpadId, req.Resolution, ct);
-        var resolved = await ResolveConversationPeerIdsAsync(pad, authorPeerId: null, ct);
+        var conversationResult = await TryResolveConversationPeerIdsAsync(pad, authorPeerId: null, ct);
+        if (conversationResult.IsFailed) return conversationResult.ToResult();
+        var resolved = conversationResult.Value;
 
         var recipientIds = resolved.EventRecipientPeerIds();
         await eventService.EmitAsync(EventTypes.ScratchpadResolved,
@@ -118,16 +133,20 @@ public sealed class ScratchpadService(ScratchpadRepository pads, EventService ev
                 resolution = req.Resolution,
                 recipient_peer_ids = recipientIds,
             }), ct, recipientIds);
+        return Result.Ok();
     }
 
-    public async Task CloseAsync(string scratchpadId, CloseScratchpadRequest req, CancellationToken ct)
+    public async Task<Result> CloseAsync(string scratchpadId, CloseScratchpadRequest req, CancellationToken ct)
     {
-        var pad = await pads.GetAsync(scratchpadId, ct)
-            ?? throw new InvalidOperationException($"Scratchpad '{scratchpadId}' not found.");
+        var pad = await pads.GetAsync(scratchpadId, ct);
+        if (pad is null)
+            return Result.Fail(new NotFoundError($"Scratchpad '{scratchpadId}' not found."));
 
         await pads.CloseAsync(scratchpadId, req.Resolution, ct);
         var closedPad = await pads.GetAsync(scratchpadId, ct) ?? pad;
-        var resolved = await ResolveConversationPeerIdsAsync(closedPad, authorPeerId: null, ct);
+        var conversationResult = await TryResolveConversationPeerIdsAsync(closedPad, authorPeerId: null, ct);
+        if (conversationResult.IsFailed) return conversationResult.ToResult();
+        var resolved = conversationResult.Value;
 
         var recipientIds = resolved.EventRecipientPeerIds();
         await eventService.EmitAsync(EventTypes.ScratchpadClosed,
@@ -138,25 +157,26 @@ public sealed class ScratchpadService(ScratchpadRepository pads, EventService ev
                 resolution = req.Resolution,
                 recipient_peer_ids = recipientIds,
             }), ct, recipientIds);
+        return Result.Ok();
     }
 
-    private async Task<ResolvedRecipients> ResolveReviewerPeerIdsAsync(string? requestedReviewers, string? callerBranch, CancellationToken ct)
+    private async Task<Result<ResolvedRecipients>> TryResolveReviewerPeerIdsAsync(string? requestedReviewers, string? callerBranch, CancellationToken ct)
     {
         if (string.IsNullOrWhiteSpace(requestedReviewers))
-            return ResolvedRecipients.Empty;
+            return Result.Ok(ResolvedRecipients.Empty);
 
         List<string>? targets;
         try
         {
             targets = JsonSerializer.Deserialize<List<string>>(requestedReviewers);
         }
-        catch (JsonException)
+        catch (JsonException ex)
         {
-            return ResolvedRecipients.Empty;
+            return Result.Fail(new BadRequestError($"requested_reviewers is not valid JSON array of strings: {ex.Message}"));
         }
 
         if (targets is null || targets.Count == 0)
-            return ResolvedRecipients.Empty;
+            return Result.Ok(ResolvedRecipients.Empty);
 
         var online = new HashSet<string>(StringComparer.Ordinal);
         var offline = new HashSet<string>(StringComparer.Ordinal);
@@ -199,16 +219,18 @@ public sealed class ScratchpadService(ScratchpadRepository pads, EventService ev
         // A peer found online via one target shouldn't also appear offline from another
         offline.ExceptWith(online);
 
-        return new ResolvedRecipients(
+        return Result.Ok(new ResolvedRecipients(
             [.. online],
             [.. offline],
-            [.. unresolved]);
+            [.. unresolved]));
     }
 
-    private async Task<ResolvedRecipients> ResolveConversationPeerIdsAsync(Scratchpad pad, string? authorPeerId, CancellationToken ct)
+    private async Task<Result<ResolvedRecipients>> TryResolveConversationPeerIdsAsync(Scratchpad pad, string? authorPeerId, CancellationToken ct)
     {
         var callerPeer = authorPeerId is not null ? await peers.GetAsync(authorPeerId, ct) : null;
-        var resolved = await ResolveReviewerPeerIdsAsync(pad.RequestedReviewers, callerPeer?.Branch, ct);
+        var reviewerResult = await TryResolveReviewerPeerIdsAsync(pad.RequestedReviewers, callerPeer?.Branch, ct);
+        if (reviewerResult.IsFailed) return reviewerResult;
+        var resolved = reviewerResult.Value;
 
         var online = new HashSet<string>(resolved.OnlinePeerIds, StringComparer.Ordinal);
         var offline = new HashSet<string>(resolved.OfflinePeerIds, StringComparer.Ordinal);
@@ -232,10 +254,10 @@ public sealed class ScratchpadService(ScratchpadRepository pads, EventService ev
 
         offline.ExceptWith(online);
 
-        return new ResolvedRecipients(
+        return Result.Ok(new ResolvedRecipients(
             [.. online],
             [.. offline],
-            resolved.UnresolvedTargets);
+            resolved.UnresolvedTargets));
     }
 
     private sealed record ResolvedRecipients(

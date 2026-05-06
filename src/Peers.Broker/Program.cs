@@ -1,3 +1,4 @@
+using Peers.Broker.Errors;
 using Peers.Broker.Hosting;
 using Peers.Broker.Persistence;
 using Peers.Broker.Persistence.Repositories;
@@ -39,6 +40,8 @@ builder.Services.AddSingleton<Peers.Broker.Hosting.BrokerStatus>();
 builder.Services.AddHostedService<CleanupBackgroundService>();
 
 var app = builder.Build();
+
+app.UseMiddleware<BrokerExceptionMiddleware>();
 
 app.MapPeerRoutes();
 app.MapScratchpadRoutes();

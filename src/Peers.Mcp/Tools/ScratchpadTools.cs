@@ -14,8 +14,9 @@ public sealed class ScratchpadTools
     [McpServerTool(Name = "scratchpad_create"), Description(
         "Create a new shared scratchpad (a thread) for async collaboration: review, discussion, spec, or context.\n" +
         "When to use: starting a fresh topic or review request. To add to an existing pad, call scratchpad_append instead.\n" +
+        "Pass `content` to post the opening body as the first entry in the same call (recommended for review/spec pads).\n" +
         "Side effect: emits an event and pushes notifications to resolved recipients (peer IDs or repo paths in requested_reviewers).\n" +
-        "Returns: { scratchpad_id, recipients (online/offline/unresolved), delivery_summary }.")]
+        "Returns: { scratchpad_id, entry_id?, recipients (online/offline/unresolved), delivery_summary }.")]
     public static async Task<string> Create(
         BrokerClient client,
         SessionState state,
@@ -23,7 +24,8 @@ public sealed class ScratchpadTools
         [Description("Title for the scratchpad")] string title,
         [Description("Repository root this scratchpad relates to")] string? repo_root = null,
         [Description("Peer IDs or repo paths to request review from")] string[]? requested_reviewers = null,
-        [Description("Artifact IDs to reference")] string[]? artifact_refs = null)
+        [Description("Artifact IDs to reference")] string[]? artifact_refs = null,
+        [Description("Optional opening markdown body — posted as the first entry on the new pad")] string? content = null)
     {
         if (state.PeerId is null) return """{"error":"Not registered. Call peer_register first."}""";
         try
@@ -35,9 +37,32 @@ public sealed class ScratchpadTools
                 ArtifactRefs = artifact_refs is null ? null : JsonSerializer.Serialize(artifact_refs),
                 CreatedByPeerId = state.PeerId,
             });
+
+            string? entryId = null;
+            string? contentError = null;
+            if (!string.IsNullOrEmpty(content))
+            {
+                try
+                {
+                    var append = await client.AppendEntryAsync(resp.ScratchpadId, new AppendEntryRequest
+                    {
+                        AuthorPeerId = state.PeerId,
+                        Content = content,
+                        Quiet = true, // create event already notified recipients
+                    });
+                    entryId = append?.EntryId;
+                }
+                catch (BrokerApiException ex)
+                {
+                    contentError = $"Scratchpad created but initial content append failed ({(int)ex.StatusCode}): {ex.ErrorBody ?? ex.Message}. Retry with scratchpad_append.";
+                }
+            }
+
             return JsonSerializer.Serialize(new
             {
                 scratchpad_id = resp.ScratchpadId,
+                entry_id = entryId,
+                content_error = contentError,
                 recipients = resp.Recipients,
                 delivery_summary = FormatDeliverySummary(resp.Recipients),
             }, JsonOpts);
