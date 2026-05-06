@@ -21,10 +21,12 @@ public static class ArtifactRoutes
             return result is not null ? Results.Ok(result) : Results.NotFound();
         });
 
-        app.MapGet("/artifacts/by-name/{ns}/{name}", async (string ns, string name, ArtifactService svc, CancellationToken ct) =>
+        app.MapGet("/artifacts/by-name", async (string ns, string name, ArtifactService svc, CancellationToken ct) =>
         {
             var result = await svc.GetAsync(null, ns, name, ct);
-            return result is not null ? Results.Ok(result) : Results.NotFound();
+            return result is not null
+                ? Results.Ok(result)
+                : Results.NotFound(new { error = $"Artifact '{ns}/{name}' not found." });
         });
 
         app.MapGet("/artifacts", async (string? type, string? repo_root, string? ns, ArtifactService svc, CancellationToken ct) =>

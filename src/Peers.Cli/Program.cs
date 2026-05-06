@@ -129,6 +129,29 @@ try
             break;
         }
 
+        case "events":
+        {
+            if (!HasFlag(args, "--follow"))
+            {
+                Console.Error.WriteLine("Usage: events --follow --peer <peerId> [--interval <seconds>]");
+                return 1;
+            }
+
+            var peerId = GetArg(args, "--peer");
+            if (string.IsNullOrEmpty(peerId))
+            {
+                Console.Error.WriteLine("--peer <peerId> is required");
+                return 1;
+            }
+
+            var brokerStatus = await RequireHealthyBrokerAsync();
+            if (brokerStatus is null)
+                return 1;
+
+            var intervalSeconds = int.TryParse(GetArg(args, "--interval"), out var i) && i > 0 ? i : 2;
+            return await FollowEventsAsync(brokerStatus.Port, peerId!, intervalSeconds, jsonOpts);
+        }
+
         default:
             Console.Error.WriteLine($"Unknown command: {args[0]}");
             PrintUsage();
@@ -198,6 +221,80 @@ static string? GetArg(string[] args, string name)
     return idx >= 0 && idx + 1 < args.Length ? args[idx + 1] : null;
 }
 
+static bool HasFlag(string[] args, string name) =>
+    Array.IndexOf(args, name) >= 0;
+
+static async Task<int> FollowEventsAsync(int port, string peerId, int intervalSeconds, JsonSerializerOptions jsonOpts)
+{
+    using var cts = new CancellationTokenSource();
+    Console.CancelKeyPress += (_, e) =>
+    {
+        e.Cancel = true;
+        cts.Cancel();
+    };
+
+    using var http = CreateHttpClient(port);
+    long cursor = 0;
+    Console.Error.WriteLine($"Following events for {peerId} every {intervalSeconds}s. Press Ctrl+C to stop.");
+
+    var ct = cts.Token;
+    while (!ct.IsCancellationRequested)
+    {
+        try
+        {
+            var resp = await http.GetFromJsonAsync<PollResponse>(
+                $"/poll/{peerId}?cursor={cursor}&limit=50&peek=true", jsonOpts, ct);
+
+            if (resp is not null)
+            {
+                foreach (var ev in resp.Events)
+                    Console.WriteLine($"{ev.CreatedAt:O} {ev.Type} {SummarizePayload(ev.Payload)}");
+                cursor = resp.Cursor;
+            }
+        }
+        catch (OperationCanceledException) { break; }
+        catch (HttpRequestException ex)
+        {
+            Console.Error.WriteLine($"Poll failed: {ex.Message}");
+        }
+
+        try
+        {
+            await Task.Delay(TimeSpan.FromSeconds(intervalSeconds), ct);
+        }
+        catch (OperationCanceledException) { break; }
+    }
+
+    return 0;
+}
+
+static string SummarizePayload(string payload)
+{
+    if (string.IsNullOrEmpty(payload))
+        return "";
+
+    var parts = new List<string>();
+    try
+    {
+        using var doc = JsonDocument.Parse(payload);
+        if (doc.RootElement.ValueKind == JsonValueKind.Object)
+        {
+            foreach (var keyName in new[] { "peer_id", "scratchpad_id", "artifact_id", "title", "type" })
+            {
+                if (doc.RootElement.TryGetProperty(keyName, out var v) && v.ValueKind == JsonValueKind.String)
+                    parts.Add($"{keyName}={v.GetString()}");
+            }
+        }
+    }
+    catch (JsonException)
+    {
+        // Fall through to raw trim
+    }
+
+    var summary = parts.Count > 0 ? string.Join(" ", parts) : payload.Replace('\n', ' ').Replace('\r', ' ');
+    return summary.Length > 80 ? summary[..80] + "..." : summary;
+}
+
 static void PrintBrokerStatus(BrokerStatus status)
 {
     Console.WriteLine($"Broker health: {(status.IsHealthy ? "ok" : "unreachable")}");
@@ -239,5 +336,6 @@ static void PrintUsage()
           scratchpads             List all scratchpads
           artifacts               List all artifacts
           poll <peer-id>          Poll events (--cursor N)
+          events --follow         Stream events for a peer (--peer <id> [--interval N])
         """);
 }

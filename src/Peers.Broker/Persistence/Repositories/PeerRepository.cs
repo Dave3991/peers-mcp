@@ -74,10 +74,10 @@ public sealed class PeerRepository(SqliteConnectionFactory db)
         }, ct);
     }
 
-    public async Task RenewLeaseAsync(string peerId, DateTime newExpiry, string? summary, string? role,
+    public async Task<int> RenewLeaseAsync(string peerId, DateTime newExpiry, string? summary, string? role,
         string? branch, string? commitSha, string? focusPaths, CancellationToken ct = default)
     {
-        await db.WriteAsync(async conn =>
+        return await db.WriteAsync(async conn =>
         {
             using var cmd = conn.CreateCommand();
             cmd.CommandText = """
@@ -99,7 +99,7 @@ public sealed class PeerRepository(SqliteConnectionFactory db)
             cmd.Parameters.AddWithValue("@branch", (object?)branch ?? DBNull.Value);
             cmd.Parameters.AddWithValue("@commit", (object?)commitSha ?? DBNull.Value);
             cmd.Parameters.AddWithValue("@focus", (object?)focusPaths ?? DBNull.Value);
-            await cmd.ExecuteNonQueryAsync(ct);
+            return await cmd.ExecuteNonQueryAsync(ct);
         }, ct);
     }
 

@@ -7,18 +7,38 @@ namespace Peers.Broker.Persistence.Repositories;
 
 public sealed class ArtifactRepository(SqliteConnectionFactory db)
 {
-    public async Task<(Artifact artifact, int version)> PublishAsync(Artifact artifact, CancellationToken ct = default)
+    public async Task<(Artifact artifact, int version, bool isNew)> PublishAsync(Artifact artifact, CancellationToken ct = default)
     {
         return await db.WriteAsync(async conn =>
         {
-            using var verCmd = conn.CreateCommand();
-            verCmd.CommandText = "SELECT COALESCE(MAX(version), 0) FROM artifacts WHERE namespace = @ns AND name = @name";
-            verCmd.Parameters.AddWithValue("@ns", artifact.Namespace);
-            verCmd.Parameters.AddWithValue("@name", artifact.Name);
-            var nextVersion = Convert.ToInt32(await verCmd.ExecuteScalarAsync(ct)) + 1;
-
             var hash = Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(artifact.Content))).ToLowerInvariant();
             var bytes = Encoding.UTF8.GetByteCount(artifact.Content);
+
+            using var latestCmd = conn.CreateCommand();
+            latestCmd.CommandText = """
+                SELECT artifact_id, version, content_hash
+                FROM artifacts
+                WHERE namespace = @ns AND name = @name
+                ORDER BY version DESC LIMIT 1
+                """;
+            latestCmd.Parameters.AddWithValue("@ns", artifact.Namespace);
+            latestCmd.Parameters.AddWithValue("@name", artifact.Name);
+            int latestVersion = 0;
+            await using (var latestReader = await latestCmd.ExecuteReaderAsync(ct))
+            {
+                if (await latestReader.ReadAsync(ct))
+                {
+                    latestVersion = latestReader.GetInt32(latestReader.GetOrdinal("version"));
+                    var latestHash = latestReader.GetString(latestReader.GetOrdinal("content_hash"));
+                    if (latestHash == hash)
+                    {
+                        var existingId = latestReader.GetString(latestReader.GetOrdinal("artifact_id"));
+                        return (artifact with { ArtifactId = existingId, Version = latestVersion, ContentHash = hash, ContentBytes = bytes }, latestVersion, false);
+                    }
+                }
+            }
+
+            var nextVersion = latestVersion + 1;
 
             using var cmd = conn.CreateCommand();
             cmd.CommandText = """
@@ -43,7 +63,7 @@ public sealed class ArtifactRepository(SqliteConnectionFactory db)
             cmd.Parameters.AddWithValue("@peer", artifact.PublishedByPeerId);
             await cmd.ExecuteNonQueryAsync(ct);
 
-            return (artifact with { Version = nextVersion, ContentHash = hash, ContentBytes = bytes }, nextVersion);
+            return (artifact with { Version = nextVersion, ContentHash = hash, ContentBytes = bytes }, nextVersion, true);
         }, ct);
     }
 

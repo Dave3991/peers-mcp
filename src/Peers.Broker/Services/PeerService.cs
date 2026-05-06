@@ -1,4 +1,6 @@
 using System.Text.Json;
+using FluentResults;
+using Peers.Broker.Errors;
 using Peers.Broker.Persistence.Repositories;
 using Peers.Shared.Contracts;
 using Peers.Shared.Ids;
@@ -56,10 +58,13 @@ public sealed class PeerService(PeerRepository peers, EventService eventService)
         };
     }
 
-    public async Task HeartbeatAsync(string peerId, HeartbeatRequest req, CancellationToken ct)
+    public async Task<Result> HeartbeatAsync(string peerId, HeartbeatRequest req, CancellationToken ct)
     {
-        await peers.RenewLeaseAsync(peerId, DateTime.UtcNow.Add(LeaseDuration),
+        var rows = await peers.RenewLeaseAsync(peerId, DateTime.UtcNow.Add(LeaseDuration),
             req.Summary, req.Role, req.Branch, req.CommitSha, req.FocusPaths, ct);
+        return rows == 0
+            ? Result.Fail(new NotFoundError($"Peer '{peerId}' not found. Re-register before sending heartbeats."))
+            : Result.Ok();
     }
 
     public async Task<List<Peer>> ListAsync(ListPeersRequest req, CancellationToken ct)
@@ -100,16 +105,14 @@ public sealed class PeerService(PeerRepository peers, EventService eventService)
 
     private async Task<Peer?> TryFindResumablePeerAsync(RegisterPeerRequest req, CancellationToken ct)
     {
-        // Explicit resume: caller specifies the exact peer ID to reactivate
+        // Explicit resume: caller specifies the exact peer ID to reactivate.
+        // Always require MachineId match — resuming another machine's session
+        // would let any process steal a peer ID.
         if (!string.IsNullOrWhiteSpace(req.ResumePeerId))
         {
             var target = await peers.GetAsync(req.ResumePeerId, ct);
-            if (target is null)
-                return null;
-            // Allow resuming expired peers, or re-claiming an active peer on the same machine
-            if (target.ExpiredAt is not null || target.MachineId == req.MachineId)
-                return target;
-            return null;
+            if (target is null) return null;
+            return target.MachineId == req.MachineId ? target : null;
         }
 
         // Implicit resume: match on stable identity fields only

@@ -1,3 +1,4 @@
+using Peers.Broker.Errors;
 using Peers.Broker.Services;
 using Peers.Broker.Validation;
 using Peers.Shared.Contracts;
@@ -16,10 +17,7 @@ public static class PeerRoutes
         });
 
         app.MapPatch("/peers/{peerId}/heartbeat", async (string peerId, HeartbeatRequest req, PeerService svc, CancellationToken ct) =>
-        {
-            await svc.HeartbeatAsync(peerId, req, ct);
-            return Results.Ok(new { ok = true });
-        });
+            (await svc.HeartbeatAsync(peerId, req, ct)).ToHttp(Results.Ok(new { ok = true })));
 
         app.MapGet("/peers", async (string? repo_root, string? branch, string? tool, PeerService svc, CancellationToken ct) =>
             Results.Ok(await svc.ListAsync(new ListPeersRequest { RepoRoot = repo_root, Branch = branch, Tool = tool }, ct)));

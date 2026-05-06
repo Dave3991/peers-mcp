@@ -1,3 +1,4 @@
+using Peers.Broker.Errors;
 using Peers.Broker.Hosting;
 using Peers.Broker.Persistence;
 using Peers.Broker.Persistence.Repositories;
@@ -35,14 +36,18 @@ builder.Services.AddScoped<ArtifactService>();
 builder.Services.AddScoped<EventService>();
 
 // Background
+builder.Services.AddSingleton<Peers.Broker.Hosting.BrokerStatus>();
 builder.Services.AddHostedService<CleanupBackgroundService>();
 
 var app = builder.Build();
+
+app.UseMiddleware<BrokerExceptionMiddleware>();
 
 app.MapPeerRoutes();
 app.MapScratchpadRoutes();
 app.MapArtifactRoutes();
 app.MapPollRoutes();
+app.MapStatusRoutes();
 
 var discoveryDir = PeersPaths.GetStateDirectory();
 var discoveryFile = PeersPaths.GetDiscoveryFile();
@@ -66,7 +71,14 @@ try
 }
 finally
 {
-    try { File.Delete(discoveryFile); } catch { }
+    try
+    {
+        File.Delete(discoveryFile);
+    }
+    catch (Exception ex)
+    {
+        app.Logger.LogWarning("Failed to delete discovery file {DiscoveryFile}: {Error}", discoveryFile, ex.Message);
+    }
     await app.DisposeAsync();
 }
 
