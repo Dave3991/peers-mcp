@@ -11,15 +11,21 @@ public sealed class ScratchpadTools
 {
     private static readonly JsonSerializerOptions JsonOpts = new() { PropertyNamingPolicy = JsonNamingPolicy.SnakeCaseLower };
 
-    [McpServerTool(Name = "scratchpad_create"), Description("Create a shared scratchpad for async collaboration (review, discussion, spec, context).")]
+    [McpServerTool(Name = "scratchpad_create"), Description(
+        "Create a new shared scratchpad (a thread) for async collaboration: review, discussion, spec, or context.\n" +
+        "When to use: starting a fresh topic or review request. To add to an existing pad, call scratchpad_append instead.\n" +
+        "Pass `content` to post the opening body as the first entry in the same call (recommended for review/spec pads).\n" +
+        "Side effect: emits an event and pushes notifications to resolved recipients (peer IDs or repo paths in requested_reviewers).\n" +
+        "Returns: { scratchpad_id, entry_id?, recipients (online/offline/unresolved), delivery_summary }.")]
     public static async Task<string> Create(
         BrokerClient client,
         SessionState state,
         [Description("Scratchpad type: review, discussion, spec, context")] string type,
         [Description("Title for the scratchpad")] string title,
         [Description("Repository root this scratchpad relates to")] string? repo_root = null,
-        [Description("JSON array of peer IDs or repo paths to request review from")] string? requested_reviewers = null,
-        [Description("JSON array of artifact IDs to reference")] string? artifact_refs = null)
+        [Description("Peer IDs or repo paths to request review from")] string[]? requested_reviewers = null,
+        [Description("Artifact IDs to reference")] string[]? artifact_refs = null,
+        [Description("Optional opening markdown body — posted as the first entry on the new pad")] string? content = null)
     {
         if (state.PeerId is null) return """{"error":"Not registered. Call peer_register first."}""";
         try
@@ -27,12 +33,36 @@ public sealed class ScratchpadTools
             var resp = await client.CreateScratchpadAsync(new CreateScratchpadRequest
             {
                 Type = type, Title = title, RepoRoot = repo_root,
-                RequestedReviewers = requested_reviewers, ArtifactRefs = artifact_refs,
+                RequestedReviewers = requested_reviewers is null ? null : JsonSerializer.Serialize(requested_reviewers),
+                ArtifactRefs = artifact_refs is null ? null : JsonSerializer.Serialize(artifact_refs),
                 CreatedByPeerId = state.PeerId,
             });
+
+            string? entryId = null;
+            string? contentError = null;
+            if (!string.IsNullOrEmpty(content))
+            {
+                try
+                {
+                    var append = await client.AppendEntryAsync(resp.ScratchpadId, new AppendEntryRequest
+                    {
+                        AuthorPeerId = state.PeerId,
+                        Content = content,
+                        Quiet = true, // create event already notified recipients
+                    });
+                    entryId = append?.EntryId;
+                }
+                catch (BrokerApiException ex)
+                {
+                    contentError = $"Scratchpad created but initial content append failed ({(int)ex.StatusCode}): {ex.ErrorBody ?? ex.Message}. Retry with scratchpad_append.";
+                }
+            }
+
             return JsonSerializer.Serialize(new
             {
                 scratchpad_id = resp.ScratchpadId,
+                entry_id = entryId,
+                content_error = contentError,
                 recipients = resp.Recipients,
                 delivery_summary = FormatDeliverySummary(resp.Recipients),
             }, JsonOpts);
@@ -40,7 +70,11 @@ public sealed class ScratchpadTools
         catch (BrokerApiException ex) { return BrokerError(ex); }
     }
 
-    [McpServerTool(Name = "scratchpad_append"), Description("Append an entry to a scratchpad. Use for review comments, discussion, or context sharing.")]
+    [McpServerTool(Name = "scratchpad_append"), Description(
+        "Append a markdown entry to an existing scratchpad. Use for review comments, follow-ups, and ongoing discussion.\n" +
+        "Limit: 100 KB per entry; for large blobs publish an artifact and reference it instead.\n" +
+        "Idempotency: passing idempotency_key dedups per-pad — a duplicate returns {\"duplicate\":true,...} with no new entry.\n" +
+        "Side effect: emits an event and pushes to recipients unless quiet=true. Returns: { entry_id, recipients, delivery_summary } on first write.")]
     public static async Task<string> Append(
         BrokerClient client,
         SessionState state,
@@ -70,7 +104,10 @@ public sealed class ScratchpadTools
         catch (BrokerApiException ex) { return BrokerError(ex); }
     }
 
-    [McpServerTool(Name = "scratchpad_read"), Description("Read entries from a scratchpad. Supports pagination.")]
+    [McpServerTool(Name = "scratchpad_read"), Description(
+        "Read a scratchpad's metadata and entries. Paginated via limit (default 200) and offset.\n" +
+        "If the serialized response would exceed the 30 KB tool-result cap (PEERS_MAX_TOOL_RESULT_CHARS), entries are dropped and a truncated metadata object with { truncated: true, entry_count, total_bytes, message } is returned — page through with limit/offset.\n" +
+        "Returns: { scratchpad, entries[] } when within size, or the truncated summary above.")]
     public static async Task<string> Read(
         BrokerClient client,
         [Description("Scratchpad ID to read")] string scratchpad_id,
@@ -101,7 +138,10 @@ public sealed class ScratchpadTools
         catch (BrokerApiException ex) { return BrokerError(ex); }
     }
 
-    [McpServerTool(Name = "scratchpad_list"), Description("List scratchpads. Filter by type, repo, or status.")]
+    [McpServerTool(Name = "scratchpad_list"), Description(
+        "List scratchpad summaries (no entry bodies). Filter by type, repo_root, or status.\n" +
+        "Use to discover open reviews/discussions before calling scratchpad_read for full content.\n" +
+        "Returns: array of { scratchpad_id, type, title, status, created_by_peer_id, ... }.")]
     public static async Task<string> List(
         BrokerClient client,
         [Description("Filter by type: review, discussion, spec, context")] string? type = null,
@@ -129,7 +169,10 @@ public sealed class ScratchpadTools
         return parts.Count == 0 ? "No recipients resolved." : string.Join("; ", parts);
     }
 
-    [McpServerTool(Name = "scratchpad_resolve"), Description("Mark a scratchpad as resolved (reviewed/approved) without closing it.")]
+    [McpServerTool(Name = "scratchpad_resolve"), Description(
+        "Mark a scratchpad as resolved (e.g. review approved) while keeping it open for further entries.\n" +
+        "When NOT to use: if the thread is finished entirely, call scratchpad_close instead.\n" +
+        "Returns: {\"ok\":true}.")]
     public static async Task<string> Resolve(
         BrokerClient client,
         [Description("Scratchpad ID to resolve")] string scratchpad_id,
@@ -143,7 +186,10 @@ public sealed class ScratchpadTools
         catch (BrokerApiException ex) { return BrokerError(ex); }
     }
 
-    [McpServerTool(Name = "scratchpad_close"), Description("Close a scratchpad with an optional resolution summary.")]
+    [McpServerTool(Name = "scratchpad_close"), Description(
+        "Close a scratchpad permanently with an optional resolution summary; further appends are rejected.\n" +
+        "When NOT to use: if the thread may still receive replies, call scratchpad_resolve to mark complete but stay open.\n" +
+        "Returns: {\"ok\":true}.")]
     public static async Task<string> Close(
         BrokerClient client,
         [Description("Scratchpad ID to close")] string scratchpad_id,

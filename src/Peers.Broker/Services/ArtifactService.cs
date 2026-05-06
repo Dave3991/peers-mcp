@@ -9,10 +9,9 @@ public sealed class ArtifactService(ArtifactRepository artifacts, EventService e
 {
     public async Task<PublishArtifactResponse> PublishAsync(PublishArtifactRequest req, CancellationToken ct)
     {
-        var id = Guid.NewGuid().ToString("N")[..16];
         var artifact = new Artifact
         {
-            ArtifactId = id,
+            ArtifactId = Guid.NewGuid().ToString("N")[..16],
             Namespace = req.Namespace,
             Name = req.Name,
             Version = 0, // set by repo
@@ -29,19 +28,22 @@ public sealed class ArtifactService(ArtifactRepository artifacts, EventService e
             CreatedAt = DateTime.UtcNow,
         };
 
-        var (saved, version) = await artifacts.PublishAsync(artifact, ct);
+        var (saved, version, isNew) = await artifacts.PublishAsync(artifact, ct);
 
-        var activePeers = await peers.ListAsync(repoRoot: req.RepoRoot, includeExpired: false, ct: ct);
-        var recipientPeerIds = activePeers
-            .Where(p => p.PeerId != req.PublishedByPeerId)
-            .Select(p => p.PeerId)
-            .ToArray();
+        if (isNew)
+        {
+            var activePeers = await peers.ListAsync(repoRoot: req.RepoRoot, includeExpired: false, ct: ct);
+            var recipientPeerIds = activePeers
+                .Where(p => p.PeerId != req.PublishedByPeerId)
+                .Select(p => p.PeerId)
+                .ToArray();
 
-        await eventService.EmitAsync(EventTypes.ArtifactPublished,
-            JsonSerializer.Serialize(new { artifact_id = id, ns = req.Namespace, name = req.Name, version, published_by_peer_id = req.PublishedByPeerId, recipient_peer_ids = recipientPeerIds }),
-            ct, recipientPeerIds);
+            await eventService.EmitAsync(EventTypes.ArtifactPublished,
+                JsonSerializer.Serialize(new { artifact_id = saved.ArtifactId, ns = req.Namespace, name = req.Name, version, published_by_peer_id = req.PublishedByPeerId, recipient_peer_ids = recipientPeerIds }),
+                ct, recipientPeerIds);
+        }
 
-        return new PublishArtifactResponse { ArtifactId = id, Version = version };
+        return new PublishArtifactResponse { ArtifactId = saved.ArtifactId, Version = version, Deduplicated = !isNew };
     }
 
     public async Task<Artifact?> GetAsync(string? artifactId, string? ns, string? name, CancellationToken ct)

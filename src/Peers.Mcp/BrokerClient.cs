@@ -65,10 +65,10 @@ public sealed class BrokerClient : IDisposable
         (await PostAsync<PublishArtifactResponse>("/artifacts", req))!;
 
     public async Task<Artifact?> GetArtifactByIdAsync(string id) =>
-        await GetAsync<Artifact>($"/artifacts/{id}");
+        await GetAsync<Artifact>($"/artifacts/{Uri.EscapeDataString(id)}");
 
     public async Task<Artifact?> GetArtifactByNameAsync(string ns, string name) =>
-        await GetAsync<Artifact>($"/artifacts/by-name/{ns}/{name}");
+        await GetAsync<Artifact>($"/artifacts/by-name?ns={Uri.EscapeDataString(ns)}&name={Uri.EscapeDataString(name)}");
 
     public async Task<List<ArtifactMetadata>> ListArtifactsAsync(string? type = null, string? repoRoot = null, string? ns = null)
     {
@@ -100,34 +100,46 @@ public sealed class BrokerClient : IDisposable
 
     private async Task<T?> GetAsync<T>(string path)
     {
-        var resp = await _http.GetAsync(path);
-        if (!resp.IsSuccessStatusCode)
+        try
         {
-            var body = await resp.Content.ReadAsStringAsync();
-            throw new BrokerApiException(resp.StatusCode, body);
+            var resp = await _http.GetAsync(path);
+            if (!resp.IsSuccessStatusCode)
+            {
+                var body = await resp.Content.ReadAsStringAsync();
+                throw new BrokerApiException(resp.StatusCode, body);
+            }
+            return await resp.Content.ReadFromJsonAsync<T>(JsonOpts);
         }
-        return await resp.Content.ReadFromJsonAsync<T>(JsonOpts);
+        catch (HttpRequestException ex) { throw BrokerApiException.FromTransport(ex); }
     }
 
     private async Task<T?> PostAsync<T>(string path, object body)
     {
-        var resp = await _http.PostAsJsonAsync(path, body, JsonOpts);
-        if (!resp.IsSuccessStatusCode)
+        try
         {
-            var errorBody = await resp.Content.ReadAsStringAsync();
-            throw new BrokerApiException(resp.StatusCode, errorBody);
+            var resp = await _http.PostAsJsonAsync(path, body, JsonOpts);
+            if (!resp.IsSuccessStatusCode)
+            {
+                var errorBody = await resp.Content.ReadAsStringAsync();
+                throw new BrokerApiException(resp.StatusCode, errorBody);
+            }
+            return await resp.Content.ReadFromJsonAsync<T>(JsonOpts);
         }
-        return await resp.Content.ReadFromJsonAsync<T>(JsonOpts);
+        catch (HttpRequestException ex) { throw BrokerApiException.FromTransport(ex); }
     }
 
     private async Task PatchAsync(string path, object body)
     {
-        var resp = await _http.PatchAsJsonAsync(path, body, JsonOpts);
-        if (!resp.IsSuccessStatusCode)
+        try
         {
-            var errorBody = await resp.Content.ReadAsStringAsync();
-            throw new BrokerApiException(resp.StatusCode, errorBody);
+            var resp = await _http.PatchAsJsonAsync(path, body, JsonOpts);
+            if (!resp.IsSuccessStatusCode)
+            {
+                var errorBody = await resp.Content.ReadAsStringAsync();
+                throw new BrokerApiException(resp.StatusCode, errorBody);
+            }
         }
+        catch (HttpRequestException ex) { throw BrokerApiException.FromTransport(ex); }
     }
 
     private static string BuildQuery(params (string key, string? value)[] pairs)

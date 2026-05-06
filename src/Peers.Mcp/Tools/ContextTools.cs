@@ -12,8 +12,9 @@ public sealed partial class ContextTools
     private static readonly JsonSerializerOptions JsonOpts = new() { PropertyNamingPolicy = JsonNamingPolicy.SnakeCaseLower };
 
     [McpServerTool(Name = "context_export"), Description(
-        "Export current session context as structured markdown for pasting into Codex or another AI tool. " +
-        "Includes peers, scratchpads, artifacts, and custom sections.")]
+        "Export the current session's context as a peers-context:v1 markdown packet, suitable for pasting into Codex or another tool during a handoff.\n" +
+        "Includes (toggleable): active peers, open scratchpads, artifact list, optional task description, and free-form notes.\n" +
+        "Returns: a markdown string starting with '<!-- peers-context:v1 -->' and a single ```yaml block. Recommended Claude<->Codex handoff format.")]
     public static async Task<string> Export(
         BrokerClient client,
         SessionState state,
@@ -42,7 +43,7 @@ public sealed partial class ContextTools
         sb.AppendLine("task:");
         sb.AppendLine($"  title: \"{task ?? "No task specified"}\"");
         sb.AppendLine("session:");
-        sb.AppendLine($"  tool: {(state.PeerId is not null ? "claude-code" : "unknown")}");
+        sb.AppendLine($"  tool: {state.Tool ?? "unknown"}");
         sb.AppendLine($"  peer_id: {state.PeerId ?? "not-registered"}");
 
         if (include_peers)
@@ -104,8 +105,9 @@ public sealed partial class ContextTools
     }
 
     [McpServerTool(Name = "context_import"), Description(
-        "Parse a structured context packet (from Codex or another AI tool) into typed sections. " +
-        "Accepts the peers-context:v1 markdown format.")]
+        "Parse a peers-context:v1 markdown packet (typically produced by context_export on a peer) into a typed JSON object: task, session, peers, scratchpads, artifacts, notes, changes.\n" +
+        "If no peers-context:v1 YAML block is found, returns { raw, warning } with the original markdown unparsed.\n" +
+        "Returns: a JSON object keyed by section name.")]
     public static Task<string> Import(
         [Description("Structured markdown context packet")] string markdown)
     {

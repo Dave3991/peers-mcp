@@ -18,4 +18,5 @@ public sealed class PublishArtifactResponse
 {
     public required string ArtifactId { get; init; }
     public required int Version { get; init; }
+    public bool Deduplicated { get; init; }
 }
