@@ -1,4 +1,6 @@
 using System.Text.Json;
+using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Logging.Abstractions;
 using ModelContextProtocol.Protocol;
 using ModelContextProtocol.Server;
 using Peers.Shared.Models;
@@ -10,6 +12,7 @@ public sealed class ChannelNotifier : IDisposable, IAsyncDisposable
     private readonly BrokerClient _client;
     private readonly SessionState _state;
     private readonly McpServer _server;
+    private readonly ILogger<ChannelNotifier> _logger;
     private readonly CancellationTokenSource _cts = new();
     private long _channelCursor;
     private Task? _task;
@@ -18,11 +21,12 @@ public sealed class ChannelNotifier : IDisposable, IAsyncDisposable
     private static readonly TimeSpan PollInterval = TimeSpan.FromSeconds(5);
     private const string LoggerName = "peers.channel";
 
-    public ChannelNotifier(BrokerClient client, SessionState state, McpServer server)
+    public ChannelNotifier(BrokerClient client, SessionState state, McpServer server, ILogger<ChannelNotifier>? logger = null)
     {
         _client = client;
         _state = state;
         _server = server;
+        _logger = logger ?? NullLogger<ChannelNotifier>.Instance;
     }
 
     public void Start()
@@ -38,8 +42,8 @@ public sealed class ChannelNotifier : IDisposable, IAsyncDisposable
 
     private async Task RunAsync(CancellationToken ct)
     {
-        await Console.Error.WriteLineAsync(
-            $"[Peers] ChannelNotifier started for peer {_state.PeerId}, cursor={_channelCursor}, delivery={DescribeDeliveryMode()}");
+        _logger.LogDebug("ChannelNotifier started for peer {PeerId}, cursor={Cursor}, delivery={DeliveryMode}",
+            _state.PeerId, _channelCursor, DescribeDeliveryMode());
 
         while (!ct.IsCancellationRequested)
         {
@@ -54,7 +58,8 @@ public sealed class ChannelNotifier : IDisposable, IAsyncDisposable
                 if (resp.Events.Count == 0)
                     continue;
 
-                await Console.Error.WriteLineAsync($"[Peers] Poll returned {resp.Events.Count} events (cursor {_channelCursor} → {resp.Cursor})");
+                _logger.LogDebug("Poll returned {Count} events ({FromCursor} -> {ToCursor})",
+                    resp.Events.Count, _channelCursor, resp.Cursor);
                 _channelCursor = resp.Cursor;
                 _state.LastCursor = Math.Max(_state.LastCursor, _channelCursor);
 
@@ -64,31 +69,36 @@ public sealed class ChannelNotifier : IDisposable, IAsyncDisposable
                     var isOwn = IsOwnEvent(evt);
                     if (!shouldDeliver || isOwn)
                     {
-                        await Console.Error.WriteLineAsync($"[Peers] Skipping event {evt.EventId} ({evt.Type}): shouldDeliver={shouldDeliver}, isOwn={isOwn}");
+                        _logger.LogTrace("Skipping event {EventId} ({EventType}) shouldDeliver={ShouldDeliver} isOwn={IsOwn}",
+                            evt.EventId, evt.Type, shouldDeliver, isOwn);
                         continue;
                     }
 
                     var message = FormatEvent(evt);
                     if (message is null)
                     {
-                        await Console.Error.WriteLineAsync($"[Peers] FormatEvent returned null for event {evt.EventId} ({evt.Type})");
+                        _logger.LogDebug("FormatEvent returned null for event {EventId} ({EventType})",
+                            evt.EventId, evt.Type);
                         continue;
                     }
 
                     if (IsQuietEvent(evt))
                     {
-                        await Console.Error.WriteLineAsync($"[Peers] Quiet event {evt.EventId} ({evt.Type}): quiet event; push suppressed (durable inbox covers it)");
+                        _logger.LogTrace("Quiet event {EventId} ({EventType}); push suppressed (durable inbox covers it)",
+                            evt.EventId, evt.Type);
                         continue;
                     }
 
-                    await Console.Error.WriteLineAsync($"[Peers] Delivering event {evt.EventId} ({evt.Type}): {message.Content[..Math.Min(80, message.Content.Length)]}...");
+                    var preview = message.Content[..Math.Min(80, message.Content.Length)];
+                    _logger.LogDebug("Delivering event {EventId} ({EventType}): {Preview}",
+                        evt.EventId, evt.Type, preview);
                     await TryPushAsync(message, ct);
                 }
             }
             catch (OperationCanceledException) { break; }
             catch (Exception ex)
             {
-                await Console.Error.WriteLineAsync($"[Peers] ChannelNotifier poll error: {ex.Message}");
+                _logger.LogWarning(ex, "ChannelNotifier poll loop error");
             }
         }
     }
@@ -96,7 +106,7 @@ public sealed class ChannelNotifier : IDisposable, IAsyncDisposable
     public async Task SendTestNotificationAsync(string content, CancellationToken ct = default)
     {
         var msgId = $"peers_test_{DateTimeOffset.UtcNow.ToUnixTimeMilliseconds()}";
-        await Console.Error.WriteLineAsync($"[Peers] Sending test notification: {msgId}");
+        _logger.LogDebug("Sending test notification {MessageId}", msgId);
 
         var message = new PendingChannelMessage
         {
@@ -113,7 +123,7 @@ public sealed class ChannelNotifier : IDisposable, IAsyncDisposable
 
         await TryPushAsync(message, ct, throwOnFailure: true);
 
-        await Console.Error.WriteLineAsync($"[Peers] Test notification sent successfully: {msgId}");
+        _logger.LogDebug("Test notification sent {MessageId}", msgId);
     }
 
     private async Task TryPushAsync(PendingChannelMessage message, CancellationToken ct, bool throwOnFailure = false)
@@ -138,8 +148,7 @@ public sealed class ChannelNotifier : IDisposable, IAsyncDisposable
             catch (Exception ex)
             {
                 lastFailure = ex;
-                await Console.Error.WriteLineAsync(
-                    $"[Peers] {method} push FAILED: {message.MessageId}: {ex.GetType().Name}: {ex.Message}");
+                _logger.LogWarning(ex, "Push failed for message {MessageId}", message.MessageId);
             }
         }
 
@@ -149,7 +158,7 @@ public sealed class ChannelNotifier : IDisposable, IAsyncDisposable
 
     private async Task TryPushViaLoggingMessageAsync(PendingChannelMessage message, CancellationToken ct)
     {
-        await Console.Error.WriteLineAsync($"[Peers] Pushing logging notification: {message.MessageId}");
+        _logger.LogDebug("Pushing logging notification {MessageId}", message.MessageId);
 
         await _server.SendNotificationAsync(
             NotificationMethods.LoggingMessageNotification,
@@ -161,12 +170,12 @@ public sealed class ChannelNotifier : IDisposable, IAsyncDisposable
             },
             cancellationToken: ct);
 
-        await Console.Error.WriteLineAsync($"[Peers] Logging push succeeded: {message.MessageId}");
+        _logger.LogDebug("Logging push succeeded {MessageId}", message.MessageId);
     }
 
     private async Task TryPushViaClaudeChannelAsync(PendingChannelMessage message, CancellationToken ct)
     {
-        await Console.Error.WriteLineAsync($"[Peers] Pushing channel notification: {message.MessageId}");
+        _logger.LogDebug("Pushing channel notification {MessageId}", message.MessageId);
 
         await _server.SendNotificationAsync(
             "notifications/claude/channel",
@@ -185,7 +194,7 @@ public sealed class ChannelNotifier : IDisposable, IAsyncDisposable
             },
             cancellationToken: ct);
 
-        await Console.Error.WriteLineAsync($"[Peers] Channel push succeeded: {message.MessageId}");
+        _logger.LogDebug("Channel push succeeded {MessageId}", message.MessageId);
     }
 
     private PushMethod[] GetPushMethods()

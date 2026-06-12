@@ -60,7 +60,7 @@ public sealed class PeerTools
             state.Heartbeat = new HeartbeatService(client, state, loggerFactory.CreateLogger<HeartbeatService>());
             state.Heartbeat.Start();
 
-            state.ChannelNotifier = new ChannelNotifier(client, state, server);
+            state.ChannelNotifier = new ChannelNotifier(client, state, server, loggerFactory.CreateLogger<ChannelNotifier>());
             state.ChannelNotifier.Start();
 
             return JsonSerializer.Serialize(new
@@ -75,7 +75,7 @@ public sealed class PeerTools
         }
         catch (Exception ex)
         {
-            await Console.Error.WriteLineAsync($"[Peers] peer_register failed: {ex}");
+            loggerFactory.CreateLogger<PeerTools>().LogError(ex, "peer_register failed");
             return JsonSerializer.Serialize(new { error = ex.Message });
         }
     }
