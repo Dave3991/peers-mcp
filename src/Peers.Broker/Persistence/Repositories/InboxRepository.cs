@@ -1,4 +1,5 @@
 using Microsoft.Data.Sqlite;
+using Peers.Broker.Persistence;
 using Peers.Shared.Models;
 
 namespace Peers.Broker.Persistence.Repositories;
@@ -81,9 +82,9 @@ public sealed class InboxRepository(SqliteConnectionFactory db)
                         EventId = r.GetInt64(r.GetOrdinal("event_id")),
                         Type = r.GetString(r.GetOrdinal("type")),
                         Payload = r.GetString(r.GetOrdinal("payload")),
-                        CreatedAt = DateTime.Parse(r.GetString(r.GetOrdinal("event_created_at"))),
+                        CreatedAt = r.GetUtc("event_created_at"),
                     },
-                    CreatedAt = DateTime.Parse(r.GetString(r.GetOrdinal("created_at"))),
+                    CreatedAt = r.GetUtc("created_at"),
                 });
             }
             return items;
@@ -115,6 +116,40 @@ public sealed class InboxRepository(SqliteConnectionFactory db)
             using var cmd = conn.CreateCommand();
             cmd.CommandText = "UPDATE peer_inbox SET acked_at = datetime('now') WHERE peer_id = @peer AND acked_at IS NULL";
             cmd.Parameters.AddWithValue("@peer", peerId);
+            return await cmd.ExecuteNonQueryAsync(ct);
+        }, ct);
+    }
+
+    public async Task<int> PurgeAckedBeforeAsync(TimeSpan age, CancellationToken ct = default)
+    {
+        return await db.WriteAsync(async conn =>
+        {
+            using var cmd = conn.CreateCommand();
+            cmd.CommandText = """
+                DELETE FROM peer_inbox WHERE acked_at IS NOT NULL AND datetime(acked_at) < datetime('now', @age)
+                """;
+            cmd.Parameters.AddWithValue("@age", $"-{(int)age.TotalSeconds} seconds");
+            return await cmd.ExecuteNonQueryAsync(ct);
+        }, ct);
+    }
+
+    // Acks (does not delete) the OLDEST (lowest event_id) unacked rows beyond the cap for any peer;
+    // keeps the audit row, drops only the event-pin. For a review backlog the oldest is the original
+    // request — accepted ring-buffer default.
+    public async Task<int> EnforceUnackedCapAsync(int cap, CancellationToken ct = default)
+    {
+        return await db.WriteAsync(async conn =>
+        {
+            using var cmd = conn.CreateCommand();
+            cmd.CommandText = """
+                UPDATE peer_inbox SET acked_at = datetime('now')
+                WHERE acked_at IS NULL AND inbox_id IN (
+                  SELECT inbox_id FROM (
+                    SELECT inbox_id, ROW_NUMBER() OVER (PARTITION BY peer_id ORDER BY event_id DESC) AS rn
+                    FROM peer_inbox WHERE acked_at IS NULL
+                  ) WHERE rn > @cap)
+                """;
+            cmd.Parameters.AddWithValue("@cap", cap);
             return await cmd.ExecuteNonQueryAsync(ct);
         }, ct);
     }

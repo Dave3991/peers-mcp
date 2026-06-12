@@ -1,6 +1,7 @@
 using System.Security.Cryptography;
 using System.Text;
 using Microsoft.Data.Sqlite;
+using Peers.Broker.Persistence;
 using Peers.Shared.Models;
 
 namespace Peers.Broker.Persistence.Repositories;
@@ -125,7 +126,7 @@ public sealed class ArtifactRepository(SqliteConnectionFactory db)
                     Tags = r.IsDBNull(r.GetOrdinal("tags")) ? null : r.GetString(r.GetOrdinal("tags")),
                     PublishedByPeerId = r.GetString(r.GetOrdinal("published_by_peer_id")),
                     ContentBytes = r.GetInt32(r.GetOrdinal("content_bytes")),
-                    CreatedAt = DateTime.Parse(r.GetString(r.GetOrdinal("created_at"))),
+                    CreatedAt = r.GetUtc("created_at"),
                 });
             }
             return list;
@@ -148,6 +149,6 @@ public sealed class ArtifactRepository(SqliteConnectionFactory db)
         ContentBytes = r.GetInt32(r.GetOrdinal("content_bytes")),
         Tags = r.IsDBNull(r.GetOrdinal("tags")) ? null : r.GetString(r.GetOrdinal("tags")),
         PublishedByPeerId = r.GetString(r.GetOrdinal("published_by_peer_id")),
-        CreatedAt = DateTime.Parse(r.GetString(r.GetOrdinal("created_at"))),
+        CreatedAt = r.GetUtc("created_at"),
     };
 }

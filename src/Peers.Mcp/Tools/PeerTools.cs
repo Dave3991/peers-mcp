@@ -13,7 +13,8 @@ public sealed class PeerTools
     [McpServerTool(Name = "peer_register"), Description(
         "Register this session as a peer in the local broker. Call once at startup before any other peer tool.\n" +
         "Side effects: starts a 30s heartbeat loop and a 5s channel-poll loop; lease expires after 2 min without heartbeat.\n" +
-        "Returns: { peer_id, resumed, last_cursor, message }. Pass resume_peer_id to reclaim a previous identity (only succeeds if MachineId matches).")]
+        "Returns: { peer_id, resumed, last_cursor, message }. Pass resume_peer_id to reclaim a previous identity (only succeeds if MachineId matches).\n" +
+        "Pass worktree_root when working in a linked git worktree — it participates in identity/resume so two worktrees of the same repo+branch are distinct resumable peers.")]
     public static async Task<string> PeerRegister(
         BrokerClient client,
         SessionState state,
@@ -26,6 +27,8 @@ public sealed class PeerTools
         [Description("Role: implementing, reviewing, debugging, spec")] string? role = null,
         [Description("Brief summary of current work")] string? summary = null,
         [Description("File paths this session focuses on")] string[]? focus_paths = null,
+        [Description("Git worktree root (e.g. output of `git rev-parse --show-toplevel`). Pass this when working in a linked git worktree so two worktrees of the same repo+branch register as DISTINCT resumable identities (worktree_root is part of the resume key).")] string? worktree_root = null,
+        [Description("Capability tags this session advertises, e.g. [\"build\",\"test\",\"review\"]")] string[]? capabilities = null,
         [Description("Parent peer ID if this is a spawned session")] string? parent_peer_id = null,
         [Description("Explicit peer ID to resume (reactivates an expired or active session)")] string? resume_peer_id = null)
     {
@@ -36,11 +39,13 @@ public sealed class PeerTools
                 Tool = tool,
                 MachineId = Environment.MachineName,
                 RepoRoot = repo_root,
+                WorktreeRoot = worktree_root,
                 Branch = branch,
                 CommitSha = commit_sha,
                 Role = role,
                 Summary = summary,
                 FocusPaths = focus_paths is null ? null : JsonSerializer.Serialize(focus_paths),
+                Capabilities = capabilities is null ? null : JsonSerializer.Serialize(capabilities),
                 ParentPeerId = parent_peer_id,
                 ResumePeerId = resume_peer_id,
             };
@@ -50,8 +55,9 @@ public sealed class PeerTools
             state.PeerId = resp.PeerId;
             state.Tool = tool;
             state.LastCursor = resp.LastCursor;
+            state.LastRegisterRequest = req;
 
-            state.Heartbeat = new HeartbeatService(client, resp.PeerId, loggerFactory.CreateLogger<HeartbeatService>());
+            state.Heartbeat = new HeartbeatService(client, state, loggerFactory.CreateLogger<HeartbeatService>());
             state.Heartbeat.Start();
 
             state.ChannelNotifier = new ChannelNotifier(client, state, server);
@@ -85,7 +91,8 @@ public sealed class PeerTools
         [Description("Update role")] string? role = null,
         [Description("Update branch")] string? branch = null,
         [Description("Update commit SHA")] string? commit_sha = null,
-        [Description("Update focus paths")] string[]? focus_paths = null)
+        [Description("Update focus paths")] string[]? focus_paths = null,
+        [Description("Update capability tags")] string[]? capabilities = null)
     {
         if (state.PeerId is null) return """{"error":"Not registered. Call peer_register first."}""";
         try
@@ -94,6 +101,7 @@ public sealed class PeerTools
             {
                 Summary = summary, Role = role, Branch = branch, CommitSha = commit_sha,
                 FocusPaths = focus_paths is null ? null : JsonSerializer.Serialize(focus_paths),
+                Capabilities = capabilities is null ? null : JsonSerializer.Serialize(capabilities),
             });
             return """{"ok":true}""";
         }

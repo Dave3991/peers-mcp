@@ -16,19 +16,33 @@ public sealed class SqliteConnectionFactory : IDisposable
         {
             DataSource = dbPath,
             Mode = SqliteOpenMode.ReadWriteCreate,
-            Cache = SqliteCacheMode.Shared,
         }.ToString();
 
         using var conn = CreateConnection();
         conn.Open();
         using var cmd = conn.CreateCommand();
-        cmd.CommandText = "PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000; PRAGMA synchronous=NORMAL;";
+        cmd.CommandText = "PRAGMA journal_mode=WAL;";
         cmd.ExecuteNonQuery();
     }
 
     public SqliteConnection CreateConnection()
     {
         return new SqliteConnection(_connectionString);
+    }
+
+    private static async Task ApplyConnectionPragmasAsync(SqliteConnection conn, CancellationToken ct)
+    {
+        await using var cmd = conn.CreateCommand();
+        cmd.CommandText = "PRAGMA busy_timeout=5000; PRAGMA synchronous=NORMAL; PRAGMA foreign_keys=ON;";
+        await cmd.ExecuteNonQueryAsync(ct);
+    }
+
+    private async Task<SqliteConnection> OpenAsync(CancellationToken ct)
+    {
+        var conn = CreateConnection();
+        await conn.OpenAsync(ct);
+        await ApplyConnectionPragmasAsync(conn, ct);
+        return conn;
     }
 
     public SemaphoreSlim WriteLock => _writeLock;
@@ -38,8 +52,7 @@ public sealed class SqliteConnectionFactory : IDisposable
         await _writeLock.WaitAsync(ct);
         try
         {
-            await using var conn = CreateConnection();
-            await conn.OpenAsync(ct);
+            await using var conn = await OpenAsync(ct);
             return await action(conn);
         }
         finally
@@ -53,8 +66,7 @@ public sealed class SqliteConnectionFactory : IDisposable
         await _writeLock.WaitAsync(ct);
         try
         {
-            await using var conn = CreateConnection();
-            await conn.OpenAsync(ct);
+            await using var conn = await OpenAsync(ct);
             await action(conn);
         }
         finally
@@ -65,8 +77,7 @@ public sealed class SqliteConnectionFactory : IDisposable
 
     public async Task<T> ReadAsync<T>(Func<SqliteConnection, Task<T>> action, CancellationToken ct = default)
     {
-        await using var conn = CreateConnection();
-        await conn.OpenAsync(ct);
+        await using var conn = await OpenAsync(ct);
         return await action(conn);
     }
 

@@ -6,6 +6,8 @@ namespace Peers.Broker.Services;
 public sealed class EventService(EventRepository events, PeerRepository peers, InboxRepository inbox)
 {
     private static readonly TimeSpan RetentionTtl = TimeSpan.FromHours(72);
+    private static readonly TimeSpan AckedInboxRetention = TimeSpan.FromHours(24);
+    private const int MaxUnackedPerPeer = 500;
 
     public async Task<PollResponse> PollAsync(string peerId, long cursor, int limit, CancellationToken ct, bool peek = false)
     {
@@ -43,5 +45,11 @@ public sealed class EventService(EventRepository events, PeerRepository peers, I
 
         // Fallback: always prune events older than TTL
         await events.PruneOlderThanAsync(RetentionTtl, ct);
+    }
+
+    public async Task<int> PruneInboxAsync(CancellationToken ct)
+    {
+        await inbox.PurgeAckedBeforeAsync(AckedInboxRetention, ct);
+        return await inbox.EnforceUnackedCapAsync(MaxUnackedPerPeer, ct);  // return cap-acked count for Warning logging
     }
 }

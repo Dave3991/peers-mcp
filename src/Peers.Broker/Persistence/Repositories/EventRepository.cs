@@ -1,4 +1,5 @@
 using Microsoft.Data.Sqlite;
+using Peers.Broker.Persistence;
 using Peers.Shared.Models;
 
 namespace Peers.Broker.Persistence.Repositories;
@@ -45,7 +46,7 @@ public sealed class EventRepository(SqliteConnectionFactory db)
                     EventId = reader.GetInt64(reader.GetOrdinal("event_id")),
                     Type = reader.GetString(reader.GetOrdinal("type")),
                     Payload = reader.GetString(reader.GetOrdinal("payload")),
-                    CreatedAt = DateTime.Parse(reader.GetString(reader.GetOrdinal("created_at"))),
+                    CreatedAt = reader.GetUtc("created_at"),
                 });
             }
             return events;

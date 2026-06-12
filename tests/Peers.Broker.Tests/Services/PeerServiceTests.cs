@@ -1,3 +1,4 @@
+using System.Text.Json;
 using Peers.Broker.Persistence.Repositories;
 using Peers.Broker.Services;
 using Peers.Broker.Tests.Helpers;
@@ -9,6 +10,16 @@ namespace Peers.Broker.Tests.Services;
 public sealed class PeerServiceTests : IDisposable
 {
     private readonly TestDb _db = new();
+
+    private (PeerRepository peerRepo, PeerService svc) CreateServiceWithRepo()
+    {
+        var eventRepo = new EventRepository(_db.Factory);
+        var peerRepo = new PeerRepository(_db.Factory);
+        var inboxRepo = new InboxRepository(_db.Factory);
+        var eventService = new EventService(eventRepo, peerRepo, inboxRepo);
+        return (peerRepo, new PeerService(peerRepo, eventService));
+    }
+
     private PeerService CreateService()
     {
         var eventRepo = new EventRepository(_db.Factory);
@@ -91,6 +102,89 @@ public sealed class PeerServiceTests : IDisposable
 
         var after = await svc.ListAsync(new ListPeersRequest { RepoRoot = "/repo" }, CancellationToken.None);
         Assert.Empty(after);
+    }
+
+    // T4 — worktree_root & capabilities
+
+    [Fact]
+    public async Task Register_TwoWorktrees_CreateDistinctIdentities()
+    {
+        var svc = CreateService();
+
+        var respA = await svc.RegisterAsync(new RegisterPeerRequest
+        {
+            Tool = "claude-code", MachineId = "m", RepoRoot = "/r", Branch = "b", WorktreeRoot = "/wt/a",
+        }, CancellationToken.None);
+        var respB = await svc.RegisterAsync(new RegisterPeerRequest
+        {
+            Tool = "claude-code", MachineId = "m", RepoRoot = "/r", Branch = "b", WorktreeRoot = "/wt/b",
+        }, CancellationToken.None);
+
+        Assert.NotEqual(respA.PeerId, respB.PeerId);
+        Assert.False(respA.Resumed);
+        Assert.False(respB.Resumed);
+    }
+
+    [Fact]
+    public async Task Register_WorktreeDisambiguatesResume()
+    {
+        var (peerRepo, svc) = CreateServiceWithRepo();
+
+        // Register both worktrees — creates two distinct active peers
+        var respA = await svc.RegisterAsync(new RegisterPeerRequest
+        {
+            Tool = "claude-code", MachineId = "m", RepoRoot = "/r", Branch = "b", WorktreeRoot = "/wt/a",
+        }, CancellationToken.None);
+        var respB = await svc.RegisterAsync(new RegisterPeerRequest
+        {
+            Tool = "claude-code", MachineId = "m", RepoRoot = "/r", Branch = "b", WorktreeRoot = "/wt/b",
+        }, CancellationToken.None);
+
+        // Expire only peer A so that the /wt/a identity has exactly one expired match (peer A)
+        // and no active match (required for implicit resume to trigger)
+        await peerRepo.ExpireByIdAsync(respA.PeerId, CancellationToken.None);
+
+        // Re-register with A's worktree identity (no ResumePeerId) — should resume A, not B
+        var resumed = await svc.RegisterAsync(new RegisterPeerRequest
+        {
+            Tool = "claude-code", MachineId = "m", RepoRoot = "/r", Branch = "b", WorktreeRoot = "/wt/a",
+        }, CancellationToken.None);
+
+        Assert.True(resumed.Resumed);
+        Assert.Equal(respA.PeerId, resumed.PeerId);
+        Assert.NotEqual(respB.PeerId, resumed.PeerId);
+    }
+
+    [Fact]
+    public async Task Heartbeat_CapabilitiesRoundTrip_AndCoalesceOnNull()
+    {
+        var (peerRepo, svc) = CreateServiceWithRepo();
+
+        var resp = await svc.RegisterAsync(new RegisterPeerRequest
+        {
+            Tool = "claude-code", MachineId = "m", RepoRoot = "/r",
+            Capabilities = JsonSerializer.Serialize(new[] { "x" }),
+        }, CancellationToken.None);
+        var peerId = resp.PeerId;
+
+        // Update capabilities via heartbeat
+        var hbResult = await svc.HeartbeatAsync(peerId, new HeartbeatRequest
+        {
+            Capabilities = JsonSerializer.Serialize(new[] { "y" }),
+        }, CancellationToken.None);
+        Assert.True(hbResult.IsSuccess);
+
+        var peer = await peerRepo.GetAsync(peerId, CancellationToken.None);
+        Assert.NotNull(peer);
+        Assert.Equal(JsonSerializer.Serialize(new[] { "y" }), peer!.Capabilities);
+
+        // Heartbeat with null capabilities — COALESCE should leave existing value intact
+        var hbResult2 = await svc.HeartbeatAsync(peerId, new HeartbeatRequest(), CancellationToken.None);
+        Assert.True(hbResult2.IsSuccess);
+
+        var peer2 = await peerRepo.GetAsync(peerId, CancellationToken.None);
+        Assert.NotNull(peer2);
+        Assert.Equal(JsonSerializer.Serialize(new[] { "y" }), peer2!.Capabilities);
     }
 
     public void Dispose() => _db.Dispose();

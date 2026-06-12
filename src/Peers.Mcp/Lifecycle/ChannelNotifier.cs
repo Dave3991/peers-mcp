@@ -75,12 +75,9 @@ public sealed class ChannelNotifier : IDisposable, IAsyncDisposable
                         continue;
                     }
 
-                    // Always enqueue for inbox; only push if not quiet
-                    _state.EnqueueChannelMessage(message);
-
                     if (IsQuietEvent(evt))
                     {
-                        await Console.Error.WriteLineAsync($"[Peers] Quiet event {evt.EventId} ({evt.Type}): buffered for inbox, push suppressed");
+                        await Console.Error.WriteLineAsync($"[Peers] Quiet event {evt.EventId} ({evt.Type}): quiet event; push suppressed (durable inbox covers it)");
                         continue;
                     }
 

@@ -19,6 +19,11 @@ public sealed class BrokerClient : IDisposable
         _http = new HttpClient { BaseAddress = new Uri(baseUrl) };
     }
 
+    internal BrokerClient(HttpClient http)
+    {
+        _http = http;
+    }
+
     // Peers
     public async Task<RegisterPeerResponse> RegisterAsync(RegisterPeerRequest req) =>
         (await PostAsync<RegisterPeerResponse>("/peers", req))!;

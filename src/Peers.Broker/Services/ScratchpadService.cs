@@ -189,9 +189,22 @@ public sealed class ScratchpadService(ScratchpadRepository pads, EventService ev
             if (peer is not null)
             {
                 if (peer.ExpiredAt is null)
+                {
                     online.Add(peer.PeerId);
+                }
                 else
-                    offline.Add(peer.PeerId);
+                {
+                    // The reviewer's session expired. requested_reviewers binds to an
+                    // ephemeral per-session peer ID, so a restarted reviewer that
+                    // re-registered under a fresh ID would silently stop receiving
+                    // pushes/inbox delivery. Re-route to their current live session on
+                    // the same machine if one exists; otherwise report it offline.
+                    var replacement = await peers.FindActiveReplacementAsync(peer, ct);
+                    if (replacement is not null)
+                        online.Add(replacement.PeerId);
+                    else
+                        offline.Add(peer.PeerId);
+                }
                 continue;
             }
 

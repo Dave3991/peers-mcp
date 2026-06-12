@@ -30,6 +30,7 @@ public sealed class HeartbeatRequest
     public string? Branch { get; init; }
     public string? CommitSha { get; init; }
     public string? FocusPaths { get; init; }
+    public string? Capabilities { get; init; }
 }
 
 public sealed class ListPeersRequest

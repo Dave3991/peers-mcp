@@ -5,8 +5,6 @@ namespace Peers.Broker.Tests.Helpers;
 
 public sealed class TestDb : IDisposable
 {
-    private readonly SqliteConnection _keepAlive;
-
     public SqliteConnectionFactory Factory { get; }
 
     public TestDb()
@@ -17,15 +15,10 @@ public sealed class TestDb : IDisposable
         using var conn = Factory.CreateConnection();
         conn.Open();
         Schema.Migrate(conn);
-
-        // Keep a connection open so in-memory shared cache stays alive
-        _keepAlive = Factory.CreateConnection();
-        _keepAlive.Open();
     }
 
     public void Dispose()
     {
-        _keepAlive.Dispose();
         Factory.Dispose();
     }
 }

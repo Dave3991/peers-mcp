@@ -1,4 +1,5 @@
 using Microsoft.Data.Sqlite;
+using Peers.Broker.Persistence;
 using Peers.Shared.Models;
 
 namespace Peers.Broker.Persistence.Repositories;
@@ -75,7 +76,7 @@ public sealed class PeerRepository(SqliteConnectionFactory db)
     }
 
     public async Task<int> RenewLeaseAsync(string peerId, DateTime newExpiry, string? summary, string? role,
-        string? branch, string? commitSha, string? focusPaths, CancellationToken ct = default)
+        string? branch, string? commitSha, string? focusPaths, string? capabilities, CancellationToken ct = default)
     {
         return await db.WriteAsync(async conn =>
         {
@@ -89,6 +90,7 @@ public sealed class PeerRepository(SqliteConnectionFactory db)
                     branch = COALESCE(@branch, branch),
                     commit_sha = COALESCE(@commit, commit_sha),
                     focus_paths = COALESCE(@focus, focus_paths),
+                    capabilities = COALESCE(@caps, capabilities),
                     updated_at = datetime('now')
                 WHERE peer_id = @id
                 """;
@@ -99,6 +101,7 @@ public sealed class PeerRepository(SqliteConnectionFactory db)
             cmd.Parameters.AddWithValue("@branch", (object?)branch ?? DBNull.Value);
             cmd.Parameters.AddWithValue("@commit", (object?)commitSha ?? DBNull.Value);
             cmd.Parameters.AddWithValue("@focus", (object?)focusPaths ?? DBNull.Value);
+            cmd.Parameters.AddWithValue("@caps", (object?)capabilities ?? DBNull.Value);
             return await cmd.ExecuteNonQueryAsync(ct);
         }, ct);
     }
@@ -196,6 +199,44 @@ public sealed class PeerRepository(SqliteConnectionFactory db)
         }, ct);
     }
 
+    /// <summary>
+    /// Find a live peer that represents the same logical session as an expired peer.
+    /// Peer IDs are minted fresh per session, so when a reviewer's session restarts it
+    /// re-registers under a new ID while a scratchpad's requested_reviewers still points
+    /// at the old, now-expired ID. Matching on the stable identity (machine + tool + repo
+    /// + worktree + branch) lets us re-route notifications to the reviewer's current
+    /// session. Returns the most recently updated match, or null if none is live.
+    /// </summary>
+    public async Task<Peer?> FindActiveReplacementAsync(Peer expired, CancellationToken ct = default)
+    {
+        return await db.ReadAsync(async conn =>
+        {
+            using var cmd = conn.CreateCommand();
+            // `IS` is SQLite's null-safe comparison, so NULL repo/worktree/branch match correctly.
+            cmd.CommandText = """
+                SELECT * FROM peers
+                WHERE peer_id != @id
+                  AND machine_id = @machine
+                  AND tool = @tool
+                  AND repo_root IS @repo
+                  AND worktree_root IS @worktree
+                  AND branch IS @branch
+                  AND expired_at IS NULL
+                  AND datetime(lease_expires_at) >= datetime('now')
+                ORDER BY datetime(updated_at) DESC
+                LIMIT 1
+                """;
+            cmd.Parameters.AddWithValue("@id", expired.PeerId);
+            cmd.Parameters.AddWithValue("@machine", expired.MachineId);
+            cmd.Parameters.AddWithValue("@tool", expired.Tool);
+            cmd.Parameters.AddWithValue("@repo", (object?)expired.RepoRoot ?? DBNull.Value);
+            cmd.Parameters.AddWithValue("@worktree", (object?)expired.WorktreeRoot ?? DBNull.Value);
+            cmd.Parameters.AddWithValue("@branch", (object?)expired.Branch ?? DBNull.Value);
+            await using var reader = await cmd.ExecuteReaderAsync(ct);
+            return await reader.ReadAsync(ct) ? ReadPeer(reader) : null;
+        }, ct);
+    }
+
     public async Task ExpireByIdAsync(string peerId, CancellationToken ct = default)
     {
         await db.WriteAsync(async conn =>
@@ -220,6 +261,32 @@ public sealed class PeerRepository(SqliteConnectionFactory db)
                 WHERE expired_at IS NULL AND datetime(lease_expires_at) < datetime('now')
                 """;
             return await cmd.ExecuteNonQueryAsync(ct);
+        }, ct);
+    }
+
+    public async Task<int> PurgeExpiredBeforeAsync(DateTime cutoff, CancellationToken ct = default)
+    {
+        return await db.WriteAsync(async conn =>
+        {
+            using var txn = conn.BeginTransaction();
+
+            using var inboxCmd = conn.CreateCommand();
+            inboxCmd.CommandText = """
+                DELETE FROM peer_inbox WHERE peer_id IN
+                  (SELECT peer_id FROM peers WHERE expired_at IS NOT NULL AND datetime(expired_at) < datetime(@cutoff))
+                """;
+            inboxCmd.Parameters.AddWithValue("@cutoff", cutoff.ToString("O"));
+            await inboxCmd.ExecuteNonQueryAsync(ct);
+
+            using var peerCmd = conn.CreateCommand();
+            peerCmd.CommandText = """
+                DELETE FROM peers WHERE expired_at IS NOT NULL AND datetime(expired_at) < datetime(@cutoff)
+                """;
+            peerCmd.Parameters.AddWithValue("@cutoff", cutoff.ToString("O"));
+            var deleted = await peerCmd.ExecuteNonQueryAsync(ct);
+
+            txn.Commit();
+            return deleted;
         }, ct);
     }
 
@@ -249,9 +316,9 @@ public sealed class PeerRepository(SqliteConnectionFactory db)
         Capabilities = r.IsDBNull(r.GetOrdinal("capabilities")) ? null : r.GetString(r.GetOrdinal("capabilities")),
         ParentPeerId = r.IsDBNull(r.GetOrdinal("parent_peer_id")) ? null : r.GetString(r.GetOrdinal("parent_peer_id")),
         LastPolledEventId = r.IsDBNull(r.GetOrdinal("last_polled_event_id")) ? null : r.GetInt64(r.GetOrdinal("last_polled_event_id")),
-        LeaseExpiresAt = DateTime.Parse(r.GetString(r.GetOrdinal("lease_expires_at"))),
-        ExpiredAt = r.IsDBNull(r.GetOrdinal("expired_at")) ? null : DateTime.Parse(r.GetString(r.GetOrdinal("expired_at"))),
-        CreatedAt = DateTime.Parse(r.GetString(r.GetOrdinal("created_at"))),
-        UpdatedAt = DateTime.Parse(r.GetString(r.GetOrdinal("updated_at"))),
+        LeaseExpiresAt = r.GetUtc("lease_expires_at"),
+        ExpiredAt = r.GetUtcOrNull("expired_at"),
+        CreatedAt = r.GetUtc("created_at"),
+        UpdatedAt = r.GetUtc("updated_at"),
     };
 }

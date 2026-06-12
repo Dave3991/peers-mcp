@@ -93,8 +93,8 @@ Once registered, each session has access to these tools:
 
 | Tool | Purpose |
 |------|---------|
-| `peer_register` | Join the network with your role, repo, and summary. Supports session resumption |
-| `peer_heartbeat` | Update your status and renew your session lease |
+| `peer_register` | Join the network with your role, repo, and summary. Supports session resumption; accepts `worktree_root` (linked-worktree identity key) and `capabilities` tags |
+| `peer_heartbeat` | Update your status and renew your session lease; `capabilities` is updatable |
 | `peer_list` | See all active sessions, filter by repo/branch/tool |
 | `peer_inbox` | Read messages directed to you (pull mode, durable with at-least-once delivery) |
 | `peer_poll` | Low-level event polling with cursor |
@@ -144,7 +144,6 @@ tests/
 | `PEERS_HOME` | `~` | Base directory for state (`$PEERS_HOME/.peers`) |
 | `PEERS_DB_PATH` | `~/.peers/peers.db` | SQLite database path |
 | `PEERS_BROKER_PROJECT` | *(auto-detected)* | Path to `Peers.Broker.csproj` |
-| `PEERS_MAX_BUFFERED_MESSAGES` | `100` | Max buffered push messages per session |
 | `PEERS_MAX_TOOL_RESULT_CHARS` | `30000` | Max characters returned by tool results before truncation |
 
 ## Running the Broker Manually

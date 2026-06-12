@@ -1,4 +1,5 @@
 using Microsoft.Data.Sqlite;
+using Peers.Broker.Persistence;
 using Peers.Shared.Models;
 
 namespace Peers.Broker.Persistence.Repositories;
@@ -97,7 +98,7 @@ public sealed class ScratchpadRepository(SqliteConnectionFactory db)
                     Content = r.GetString(r.GetOrdinal("content")),
                     IdempotencyKey = r.IsDBNull(r.GetOrdinal("idempotency_key")) ? null : r.GetString(r.GetOrdinal("idempotency_key")),
                     ContentBytes = r.GetInt32(r.GetOrdinal("content_bytes")),
-                    CreatedAt = DateTime.Parse(r.GetString(r.GetOrdinal("created_at"))),
+                    CreatedAt = r.GetUtc("created_at"),
                 });
             }
             return entries;
@@ -165,8 +166,8 @@ public sealed class ScratchpadRepository(SqliteConnectionFactory db)
         RequestedReviewers = r.IsDBNull(r.GetOrdinal("requested_reviewers")) ? null : r.GetString(r.GetOrdinal("requested_reviewers")),
         ArtifactRefs = r.IsDBNull(r.GetOrdinal("artifact_refs")) ? null : r.GetString(r.GetOrdinal("artifact_refs")),
         CreatedByPeerId = r.GetString(r.GetOrdinal("created_by_peer_id")),
-        CreatedAt = DateTime.Parse(r.GetString(r.GetOrdinal("created_at"))),
-        ClosedAt = r.IsDBNull(r.GetOrdinal("closed_at")) ? null : DateTime.Parse(r.GetString(r.GetOrdinal("closed_at"))),
+        CreatedAt = r.GetUtc("created_at"),
+        ClosedAt = r.GetUtcOrNull("closed_at"),
         Resolution = r.IsDBNull(r.GetOrdinal("resolution")) ? null : r.GetString(r.GetOrdinal("resolution")),
     };
 }

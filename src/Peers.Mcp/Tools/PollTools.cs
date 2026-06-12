@@ -1,6 +1,8 @@
+using System.Collections.Generic;
 using System.ComponentModel;
 using System.Text.Json;
 using ModelContextProtocol.Server;
+using Peers.Shared.Contracts;
 
 namespace Peers.Mcp.Tools;
 
@@ -12,7 +14,9 @@ public sealed class PollTools
     [McpServerTool(Name = "peer_poll"), Description(
         "Cursor-based debug feed of raw broker events (peer changes, scratchpad updates, artifact publishes) for this peer.\n" +
         "When NOT to use: do not use this for everyday directed-message reading — call peer_inbox instead. peer_poll exposes the cursor for diagnostics and replay.\n" +
-        "Side effect: advances state.LastCursor to resp.Cursor. Returns: { cursor, events[] }. Defaults to picking up from the session's last cursor when omitted.")]
+        "Side effect: advances state.LastCursor to the effective cursor (last included event when truncated, broker cursor otherwise).\n" +
+        "Returns: { cursor, events[], truncated, returned_count, remaining_hint }. Large payloads are truncated (content_truncated per event) and the result is size-capped; the cursor advances only past returned events (truncated=true means call again). Defaults to picking up from the session's last cursor when omitted.\n" +
+        "Note: this is a best-effort debug feed — the background channel notifier may advance the cursor independently, so peer_poll is not a delivery guarantee; use peer_inbox for reliable directed-message delivery.")]
     public static async Task<string> Poll(
         BrokerClient client,
         SessionState state,
@@ -25,9 +29,11 @@ public sealed class PollTools
         {
             var effectiveCursor = cursor ?? state.LastCursor;
             var resp = await client.PollAsync(state.PeerId, effectiveCursor, limit ?? 100);
-            state.LastCursor = resp.Cursor;
 
-            return JsonSerializer.Serialize(resp, JsonOpts);
+            var shape = InboxResultShaper.ShapePoll(resp.Events, resp.Cursor, Limits.MaxToolResultChars, JsonOpts);
+            state.LastCursor = shape.EffectiveCursor;
+
+            return shape.Json;
         }
         catch (BrokerApiException ex) { return BrokerError(ex); }
     }
@@ -39,11 +45,11 @@ public sealed class PollTools
         "Drain the durable inbox of directed messages addressed to this peer (review requests, replies, DMs). This is the primary, everyday way to read peer activity — call at startup, after each task chunk, before finishing.\n" +
         "Delivery: at-least-once. Items fetched here are acked on the NEXT inbox call, so a tool error between calls causes redelivery.\n" +
         "When NOT to use: peer_poll is for raw cursor/event debugging — prefer peer_inbox for normal collaboration.\n" +
-        "Returns: { cursor, items[] (each with inbox_id), dropped_message_count, remaining_count }.")]
+        "Returns: { cursor, items[] (each with inbox_id; large entry bodies are truncated to a ~2000-char preview with content_truncated:true plus scratchpad_id/entry_id — call scratchpad_read for the full text), truncated, returned_count, remaining_hint }. If truncated, call peer_inbox again to drain the rest.")]
     public static async Task<string> Inbox(
         BrokerClient client,
         SessionState state,
-        [Description("Maximum number of buffered inbox items to drain (default 100)")] int? limit = null)
+        [Description("Maximum number of durable inbox items to drain (default 100)")] int? limit = null)
     {
         if (state.PeerId is null) return """{"error":"Not registered. Call peer_register first."}""";
 
@@ -60,20 +66,11 @@ public sealed class PollTools
             // Fetch new unacked items from durable broker inbox
             var resp = await client.GetInboxAsync(state.PeerId, limit ?? 100);
 
-            // Store IDs for deferred ack on next call (at-least-once delivery)
-            if (resp is not null && resp.Items.Count > 0)
-                state.PendingInboxAckIds = resp.Items.Select(i => i.InboxId).ToArray();
+            // Shape the result: truncate large payloads and cap total size; only ack included items
+            var shape = InboxResultShaper.ShapeInbox(resp?.Items ?? new List<InboxItemDto>(), state.LastCursor, Limits.MaxToolResultChars, JsonOpts);
+            state.PendingInboxAckIds = shape.IncludedInboxIds.Length > 0 ? shape.IncludedInboxIds : null;
 
-            // Also drain any in-memory buffer
-            var drained = state.DrainChannelMessages(limit);
-
-            return JsonSerializer.Serialize(new
-            {
-                cursor = state.LastCursor,
-                dropped_message_count = drained.DroppedMessageCount,
-                remaining_count = drained.RemainingCount,
-                items = resp?.Items ?? [],
-            }, JsonOpts);
+            return shape.Json;
         }
         catch (BrokerApiException ex) { return BrokerError(ex); }
     }

@@ -30,7 +30,7 @@ If you start Claude normally, directed peer messages are still available through
 
 When participating in a multi-session workflow with this MCP server:
 
-1. **On startup**: Call `peer_register` with your repo, branch, role, and summary
+1. **On startup**: Call `peer_register` with your repo, branch, role, and summary, and worktree_root if working in a linked git worktree
 2. **Check inbox regularly**: Call `peer_inbox` at startup, after completing a task chunk, before starting new work, and before finishing. Use `peer_poll` only when you need raw event payloads or cursor debugging.
 3. **Review requests**: If a review scratchpad targets your repo, prioritize reading and responding
 4. **Share artifacts**: Publish meaningful outputs (types, specs, diffs) as artifacts instead of pasting large blobs into scratchpads

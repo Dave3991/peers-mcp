@@ -11,6 +11,8 @@ namespace Peers.Broker.Services;
 public sealed class PeerService(PeerRepository peers, EventService eventService)
 {
     private static readonly TimeSpan LeaseDuration = TimeSpan.FromMinutes(2);
+    // 7d (not 24h) so ScratchpadService.FindActiveReplacementAsync can still reroute a restarted reviewer to their live session across multi-day review pads.
+    private static readonly TimeSpan ExpiredPeerRetention = TimeSpan.FromDays(7);
 
     public async Task<RegisterPeerResponse> RegisterAsync(RegisterPeerRequest req, CancellationToken ct)
     {
@@ -61,7 +63,7 @@ public sealed class PeerService(PeerRepository peers, EventService eventService)
     public async Task<Result> HeartbeatAsync(string peerId, HeartbeatRequest req, CancellationToken ct)
     {
         var rows = await peers.RenewLeaseAsync(peerId, DateTime.UtcNow.Add(LeaseDuration),
-            req.Summary, req.Role, req.Branch, req.CommitSha, req.FocusPaths, ct);
+            req.Summary, req.Role, req.Branch, req.CommitSha, req.FocusPaths, req.Capabilities, ct);
         return rows == 0
             ? Result.Fail(new NotFoundError($"Peer '{peerId}' not found. Re-register before sending heartbeats."))
             : Result.Ok();
@@ -87,6 +89,9 @@ public sealed class PeerService(PeerRepository peers, EventService eventService)
             JsonSerializer.Serialize(new { expired_count = 1, peer_id = peerId, recipient_peer_ids = recipientPeerIds }),
             ct, recipientPeerIds);
     }
+
+    public async Task<int> PurgeExpiredAsync(CancellationToken ct)
+        => await peers.PurgeExpiredBeforeAsync(DateTime.UtcNow - ExpiredPeerRetention, ct);
 
     public async Task<int> ExpireStaleAsync(CancellationToken ct)
     {

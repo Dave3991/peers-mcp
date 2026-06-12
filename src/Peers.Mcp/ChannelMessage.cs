@@ -14,10 +14,3 @@ public sealed record PendingChannelMessage
     public string? Title { get; init; }
     public string? FromPeerId { get; init; }
 };
-
-public sealed record DrainChannelMessagesResult
-{
-    public required IReadOnlyList<PendingChannelMessage> Messages { get; init; }
-    public required int DroppedMessageCount { get; init; }
-    public required int RemainingCount { get; init; }
-}
