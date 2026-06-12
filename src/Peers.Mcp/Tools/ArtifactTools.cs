@@ -1,6 +1,7 @@
 using System.ComponentModel;
 using System.Text.Json;
 using ModelContextProtocol.Server;
+using Peers.Mcp;
 using Peers.Shared.Contracts;
 
 namespace Peers.Mcp.Tools;
@@ -45,14 +46,18 @@ public sealed class ArtifactTools
     }
 
     [McpServerTool(Name = "artifact_get"), Description(
-        "Fetch an artifact's full content. Look up by artifact_id (specific version) OR by namespace+name (latest version).\n" +
-        "Auto-truncates: if the response exceeds the 30 KB tool-result cap (PEERS_MAX_TOOL_RESULT_CHARS), only the metadata plus a content_preview (first ~15 KB) is returned with { truncated: true }.\n" +
-        "Returns: full artifact { artifact_id, namespace, name, version, type, content, content_hash, content_bytes } or the truncated form above.")]
+        "Fetch an artifact's content. Look up by artifact_id (specific version) OR by namespace+name (latest version).\n" +
+        "Supports ranged access: supply offset (start char, default 0) and max_chars (default fits the 30 KB cap).\n" +
+        "Returns: full artifact { artifact_id, namespace, name, version, type, content, content_hash, content_bytes } when content fits.\n" +
+        "On overflow or range request: { artifact_id, namespace, name, version, type, content_hash, content_bytes, total_chars, offset, next_offset, truncated, content, message }.\n" +
+        "To page through large artifacts: call again with offset=next_offset until next_offset is null.")]
     public static async Task<string> Get(
         BrokerClient client,
         [Description("Artifact ID for a specific version (mutually exclusive with namespace+name)")] string? artifact_id = null,
         [Description("Artifact namespace (must be paired with name; returns latest version)")] string? @namespace = null,
-        [Description("Artifact name (must be paired with namespace; returns latest version)")] string? name = null)
+        [Description("Artifact name (must be paired with namespace; returns latest version)")] string? name = null,
+        [Description("Start char offset into content (default 0)")] int? offset = null,
+        [Description("Max chars of content to return (default fits the 30 KB cap)")] int? max_chars = null)
     {
         if (artifact_id is null && (@namespace is null || name is null))
             return """{"error":"Missing parameters. Provide either artifact_id, or both namespace and name."}""";
@@ -68,25 +73,7 @@ public sealed class ArtifactTools
             if (result is null)
                 return """{"error":"Artifact not found."}""";
 
-            var serialized = JsonSerializer.Serialize(result, JsonOpts);
-            if (serialized.Length > Limits.MaxToolResultChars)
-            {
-                var truncated = new
-                {
-                    artifact_id = result.ArtifactId,
-                    @namespace = result.Namespace,
-                    name = result.Name,
-                    version = result.Version,
-                    type = result.Type,
-                    content_hash = result.ContentHash,
-                    content_bytes = result.ContentBytes,
-                    content_preview = result.Content[..Math.Min(Limits.MaxToolResultChars / 2, result.Content.Length)],
-                    truncated = true,
-                    message = $"Content preview: first {Math.Min(Limits.MaxToolResultChars / 2, result.Content.Length)} of {result.Content.Length} chars. Use artifact_get with the artifact_id to fetch specific sections.",
-                };
-                return JsonSerializer.Serialize(truncated, JsonOpts);
-            }
-            return serialized;
+            return OutputShaper.ShapeArtifactGet(result, offset, max_chars, Limits.MaxToolResultChars, JsonOpts);
         }
         catch (BrokerApiException ex) { return BrokerError(ex); }
     }

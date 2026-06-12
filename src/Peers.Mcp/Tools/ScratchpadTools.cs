@@ -1,6 +1,7 @@
 using System.ComponentModel;
 using System.Text.Json;
 using ModelContextProtocol.Server;
+using Peers.Mcp;
 using Peers.Shared.Contracts;
 using RecipientStatus = Peers.Shared.Contracts.RecipientDeliveryStatus;
 
@@ -106,8 +107,9 @@ public sealed class ScratchpadTools
 
     [McpServerTool(Name = "scratchpad_read"), Description(
         "Read a scratchpad's metadata and entries. Paginated via limit (default 200) and offset.\n" +
-        "If the serialized response would exceed the 30 KB tool-result cap (PEERS_MAX_TOOL_RESULT_CHARS), entries are dropped and a truncated metadata object with { truncated: true, entry_count, total_bytes, message } is returned — page through with limit/offset.\n" +
-        "Returns: { scratchpad, entries[] } when within size, or the truncated summary above.")]
+        "Returns: { scratchpad, entries[] } when the full page fits within the 30 KB cap (PEERS_MAX_TOOL_RESULT_CHARS).\n" +
+        "On overflow: returns a greedy partial page as { scratchpad, entries[], truncated: true, included_count, page_entry_count, next_offset }.\n" +
+        "To page: call again with offset=next_offset (do NOT compare included_count to page_entry_count to decide whether to page — use next_offset as the signal).")]
     public static async Task<string> Read(
         BrokerClient client,
         [Description("Scratchpad ID to read")] string scratchpad_id,
@@ -120,20 +122,7 @@ public sealed class ScratchpadTools
             if (resp is null)
                 return """{"error":"Scratchpad not found."}""";
 
-            var result = JsonSerializer.Serialize(resp, JsonOpts);
-            if (result.Length > Limits.MaxToolResultChars)
-            {
-                var meta = new
-                {
-                    scratchpad = resp.Scratchpad,
-                    entry_count = resp.Entries.Count,
-                    total_bytes = resp.Entries.Sum(e => e.ContentBytes),
-                    truncated = true,
-                    message = $"Response too large ({result.Length} chars). Use limit/offset to page through entries.",
-                };
-                return JsonSerializer.Serialize(meta, JsonOpts);
-            }
-            return result;
+            return OutputShaper.ShapeScratchpadRead(resp, offset ?? 0, Limits.MaxToolResultChars, JsonOpts);
         }
         catch (BrokerApiException ex) { return BrokerError(ex); }
     }
