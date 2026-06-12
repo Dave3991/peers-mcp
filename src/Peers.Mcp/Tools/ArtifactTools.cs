@@ -80,16 +80,19 @@ public sealed class ArtifactTools
 
     [McpServerTool(Name = "artifact_list"), Description(
         "List artifact metadata (no content) matching the given filters. Use to discover what's published before fetching with artifact_get.\n" +
+        "Results are newest-first (default 50 per page). Paginate via offset (e.g. offset=50 for the second page).\n" +
         "Filter by type, repo_root, or namespace. Returns: array of { artifact_id, namespace, name, version, type, content_bytes, content_hash, ... }.")]
     public static async Task<string> List(
         BrokerClient client,
         [Description("Filter by type")] string? type = null,
         [Description("Filter by repo root")] string? repo_root = null,
-        [Description("Filter by namespace")] string? @namespace = null)
+        [Description("Filter by namespace")] string? @namespace = null,
+        [Description("Max artifacts to return (default 50, newest first)")] int? limit = null,
+        [Description("Offset for pagination")] int? offset = null)
     {
         try
         {
-            var list = await client.ListArtifactsAsync(type, repo_root, @namespace);
+            var list = await client.ListArtifactsAsync(type, repo_root, @namespace, limit ?? 50, offset ?? 0);
             return JsonSerializer.Serialize(list, JsonOpts);
         }
         catch (BrokerApiException ex) { return BrokerError(ex); }

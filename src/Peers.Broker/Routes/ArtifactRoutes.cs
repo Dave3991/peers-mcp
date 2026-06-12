@@ -29,7 +29,7 @@ public static class ArtifactRoutes
                 : Results.NotFound(new { error = $"Artifact '{ns}/{name}' not found." });
         });
 
-        app.MapGet("/artifacts", async (string? type, string? repo_root, string? ns, ArtifactService svc, CancellationToken ct) =>
-            Results.Ok(await svc.ListAsync(type, repo_root, ns, ct)));
+        app.MapGet("/artifacts", async (string? type, string? repo_root, string? ns, int? limit, int? offset, ArtifactService svc, CancellationToken ct) =>
+            Results.Ok(await svc.ListAsync(type, repo_root, ns, limit ?? 50, offset ?? 0, ct)));
     }
 }

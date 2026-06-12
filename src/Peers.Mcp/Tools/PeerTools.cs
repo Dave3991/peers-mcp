@@ -109,19 +109,31 @@ public sealed class PeerTools
     }
 
     [McpServerTool(Name = "peer_list"), Description(
-        "Discover other peer sessions. Use to find collaborators, see what repos/branches are active, or pick targets for review requests.\n" +
-        "Excludes peers whose 2-minute lease has expired (no includeExpired flag exposed here).\n" +
-        "Returns: array of peer summaries (peer_id, tool, repo_root, branch, role, summary, focus_paths).")]
+        "Discover peer sessions. Use to find collaborators, see what repos/branches are active, or pick targets for review requests.\n" +
+        "By default returns only active peers; pass include_expired=true to also see recently-expired peers still within the retention window.\n" +
+        "Each item has self=true if it is this session, and is_expired=true if the peer's lease has lapsed.\n" +
+        "Returns: array of peer summaries (peer_id, tool, repo_root, branch, role, summary, focus_paths, self, is_expired).")]
     public static async Task<string> PeerList(
         BrokerClient client,
+        SessionState state,
         [Description("Filter by repo root path")] string? repo_root = null,
         [Description("Filter by branch")] string? branch = null,
-        [Description("Filter by tool (claude-code, codex)")] string? tool = null)
+        [Description("Filter by tool (claude-code, codex)")] string? tool = null,
+        [Description("Include recently-expired peers still within the retention window")] bool? include_expired = null)
     {
         try
         {
-            var peers = await client.ListPeersAsync(repo_root, branch, tool);
-            return JsonSerializer.Serialize(peers, new JsonSerializerOptions { PropertyNamingPolicy = JsonNamingPolicy.SnakeCaseLower });
+            var peers = await client.ListPeersAsync(repo_root, branch, tool, include_expired ?? false);
+            var opts = new JsonSerializerOptions { PropertyNamingPolicy = JsonNamingPolicy.SnakeCaseLower };
+            var arr = new System.Text.Json.Nodes.JsonArray();
+            foreach (var p in peers)
+            {
+                var node = (System.Text.Json.Nodes.JsonObject)JsonSerializer.SerializeToNode(p, opts)!;
+                node["self"] = p.PeerId == state.PeerId;
+                node["is_expired"] = p.ExpiredAt != null;
+                arr.Add(node);
+            }
+            return arr.ToJsonString();
         }
         catch (BrokerApiException ex) { return BrokerError(ex); }
     }

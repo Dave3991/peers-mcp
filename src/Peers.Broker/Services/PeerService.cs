@@ -71,7 +71,7 @@ public sealed class PeerService(PeerRepository peers, EventService eventService)
 
     public async Task<List<Peer>> ListAsync(ListPeersRequest req, CancellationToken ct)
     {
-        return await peers.ListAsync(req.RepoRoot, req.Branch, req.Tool, includeExpired: false, ct);
+        return await peers.ListAsync(req.RepoRoot, req.Branch, req.Tool, includeExpired: req.IncludeExpired, ct);
     }
 
     public async Task DeregisterAsync(string peerId, CancellationToken ct)

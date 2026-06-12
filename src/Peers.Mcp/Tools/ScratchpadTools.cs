@@ -128,18 +128,21 @@ public sealed class ScratchpadTools
     }
 
     [McpServerTool(Name = "scratchpad_list"), Description(
-        "List scratchpad summaries (no entry bodies). Filter by type, repo_root, or status.\n" +
+        "List scratchpad summaries (no entry bodies). Filter by type, repo_root, or status. Results are newest-first (default 50 per page).\n" +
         "Use to discover open reviews/discussions before calling scratchpad_read for full content.\n" +
+        "Paginate via offset (e.g. offset=50 for the second page).\n" +
         "Returns: array of { scratchpad_id, type, title, status, created_by_peer_id, ... }.")]
     public static async Task<string> List(
         BrokerClient client,
         [Description("Filter by type: review, discussion, spec, context")] string? type = null,
         [Description("Filter by repo root")] string? repo_root = null,
-        [Description("Filter by status: open, resolved, closed")] string? status = null)
+        [Description("Filter by status: open, resolved, closed")] string? status = null,
+        [Description("Max pads to return (default 50, newest first)")] int? limit = null,
+        [Description("Offset for pagination")] int? offset = null)
     {
         try
         {
-            var pads = await client.ListScratchpadsAsync(type, repo_root, status);
+            var pads = await client.ListScratchpadsAsync(type, repo_root, status, limit ?? 50, offset ?? 0);
             return JsonSerializer.Serialize(pads, JsonOpts);
         }
         catch (BrokerApiException ex) { return BrokerError(ex); }

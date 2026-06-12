@@ -106,9 +106,9 @@ public sealed class ScratchpadService(ScratchpadRepository pads, EventService ev
         return new ReadScratchpadResponse { Scratchpad = pad, Entries = entries };
     }
 
-    public async Task<List<Scratchpad>> ListAsync(string? type, string? repoRoot, string? status, CancellationToken ct)
+    public async Task<List<Scratchpad>> ListAsync(string? type, string? repoRoot, string? status, int limit, int offset, CancellationToken ct)
     {
-        return await pads.ListAsync(type, repoRoot, status, ct);
+        return await pads.ListAsync(type, repoRoot, status, limit, offset, ct);
     }
 
     public async Task<Result> ResolveAsync(string scratchpadId, ResolveScratchpadRequest req, CancellationToken ct)

@@ -30,8 +30,8 @@ public static class ScratchpadRoutes
             return result is not null ? Results.Ok(result) : Results.NotFound(new { error = $"Scratchpad '{id}' not found." });
         });
 
-        app.MapGet("/scratchpads", async (string? type, string? repo_root, string? status, ScratchpadService svc, CancellationToken ct) =>
-            Results.Ok(await svc.ListAsync(type, repo_root, status, ct)));
+        app.MapGet("/scratchpads", async (string? type, string? repo_root, string? status, int? limit, int? offset, ScratchpadService svc, CancellationToken ct) =>
+            Results.Ok(await svc.ListAsync(type, repo_root, status, limit ?? 50, offset ?? 0, ct)));
 
         app.MapPatch("/scratchpads/{id}/resolve", async (string id, ResolveScratchpadRequest req, ScratchpadService svc, CancellationToken ct) =>
             (await svc.ResolveAsync(id, req, ct)).ToHttp(Results.Ok(new { ok = true })));

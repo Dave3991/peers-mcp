@@ -106,7 +106,7 @@ public sealed class ScratchpadRepository(SqliteConnectionFactory db)
     }
 
     public async Task<List<Scratchpad>> ListAsync(string? type = null, string? repoRoot = null,
-        string? status = null, CancellationToken ct = default)
+        string? status = null, int limit = 50, int offset = 0, CancellationToken ct = default)
     {
         return await db.ReadAsync(async conn =>
         {
@@ -117,7 +117,9 @@ public sealed class ScratchpadRepository(SqliteConnectionFactory db)
             if (status is not null) { where.Add("status = @status"); cmd.Parameters.AddWithValue("@status", status); }
 
             var whereClause = where.Count > 0 ? "WHERE " + string.Join(" AND ", where) : "";
-            cmd.CommandText = $"SELECT * FROM scratchpads {whereClause} ORDER BY created_at DESC";
+            cmd.CommandText = $"SELECT * FROM scratchpads {whereClause} ORDER BY created_at DESC, rowid DESC LIMIT @limit OFFSET @offset";
+            cmd.Parameters.AddWithValue("@limit", limit);
+            cmd.Parameters.AddWithValue("@offset", offset);
 
             var pads = new List<Scratchpad>();
             await using var r = await cmd.ExecuteReaderAsync(ct);

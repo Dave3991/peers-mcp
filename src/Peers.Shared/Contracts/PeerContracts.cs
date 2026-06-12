@@ -39,4 +39,5 @@ public sealed class ListPeersRequest
     public string? RepoRoot { get; init; }
     public string? Branch { get; init; }
     public string? Tool { get; init; }
+    public bool IncludeExpired { get; init; }
 }

@@ -94,7 +94,7 @@ public sealed class ArtifactRepository(SqliteConnectionFactory db)
     }
 
     public async Task<List<ArtifactMetadata>> ListAsync(string? type = null, string? repoRoot = null,
-        string? ns = null, CancellationToken ct = default)
+        string? ns = null, int limit = 50, int offset = 0, CancellationToken ct = default)
     {
         return await db.ReadAsync(async conn =>
         {
@@ -108,8 +108,10 @@ public sealed class ArtifactRepository(SqliteConnectionFactory db)
             cmd.CommandText = $"""
                 SELECT artifact_id, namespace, name, version, type, repo_root, tags,
                     published_by_peer_id, content_bytes, created_at
-                FROM artifacts {whereClause} ORDER BY created_at DESC
+                FROM artifacts {whereClause} ORDER BY created_at DESC, rowid DESC LIMIT @limit OFFSET @offset
                 """;
+            cmd.Parameters.AddWithValue("@limit", limit);
+            cmd.Parameters.AddWithValue("@offset", offset);
 
             var list = new List<ArtifactMetadata>();
             await using var r = await cmd.ExecuteReaderAsync(ct);

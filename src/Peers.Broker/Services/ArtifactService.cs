@@ -55,8 +55,8 @@ public sealed class ArtifactService(ArtifactRepository artifacts, EventService e
         return null;
     }
 
-    public async Task<List<ArtifactMetadata>> ListAsync(string? type, string? repoRoot, string? ns, CancellationToken ct)
+    public async Task<List<ArtifactMetadata>> ListAsync(string? type, string? repoRoot, string? ns, int limit, int offset, CancellationToken ct)
     {
-        return await artifacts.ListAsync(type, repoRoot, ns, ct);
+        return await artifacts.ListAsync(type, repoRoot, ns, limit, offset, ct);
     }
 }

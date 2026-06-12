@@ -37,9 +37,9 @@ public sealed class BrokerClient : IDisposable
         catch { /* best-effort on shutdown */ }
     }
 
-    public async Task<List<Peer>> ListPeersAsync(string? repoRoot = null, string? branch = null, string? tool = null)
+    public async Task<List<Peer>> ListPeersAsync(string? repoRoot = null, string? branch = null, string? tool = null, bool includeExpired = false)
     {
-        var query = BuildQuery(("repo_root", repoRoot), ("branch", branch), ("tool", tool));
+        var query = BuildQuery(("repo_root", repoRoot), ("branch", branch), ("tool", tool), ("include_expired", includeExpired ? "true" : null));
         return (await GetAsync<List<Peer>>($"/peers{query}"))!;
     }
 
@@ -53,9 +53,9 @@ public sealed class BrokerClient : IDisposable
     public async Task<ReadScratchpadResponse?> ReadScratchpadAsync(string padId, int limit = 200, int offset = 0) =>
         await GetAsync<ReadScratchpadResponse>($"/scratchpads/{padId}?limit={limit}&offset={offset}");
 
-    public async Task<List<Scratchpad>> ListScratchpadsAsync(string? type = null, string? repoRoot = null, string? status = null)
+    public async Task<List<Scratchpad>> ListScratchpadsAsync(string? type = null, string? repoRoot = null, string? status = null, int limit = 50, int offset = 0)
     {
-        var query = BuildQuery(("type", type), ("repo_root", repoRoot), ("status", status));
+        var query = BuildQuery(("type", type), ("repo_root", repoRoot), ("status", status), ("limit", limit.ToString()), ("offset", offset.ToString()));
         return (await GetAsync<List<Scratchpad>>($"/scratchpads{query}"))!;
     }
 
@@ -75,9 +75,9 @@ public sealed class BrokerClient : IDisposable
     public async Task<Artifact?> GetArtifactByNameAsync(string ns, string name) =>
         await GetAsync<Artifact>($"/artifacts/by-name?ns={Uri.EscapeDataString(ns)}&name={Uri.EscapeDataString(name)}");
 
-    public async Task<List<ArtifactMetadata>> ListArtifactsAsync(string? type = null, string? repoRoot = null, string? ns = null)
+    public async Task<List<ArtifactMetadata>> ListArtifactsAsync(string? type = null, string? repoRoot = null, string? ns = null, int limit = 50, int offset = 0)
     {
-        var query = BuildQuery(("type", type), ("repo_root", repoRoot), ("ns", ns));
+        var query = BuildQuery(("type", type), ("repo_root", repoRoot), ("ns", ns), ("limit", limit.ToString()), ("offset", offset.ToString()));
         return (await GetAsync<List<ArtifactMetadata>>($"/artifacts{query}"))!;
     }
 
