@@ -73,7 +73,7 @@ public sealed class PeerTools
                     : "Registered. Heartbeat and push notifications started.",
             });
         }
-        catch (Exception ex)
+        catch (BrokerApiException ex)
         {
             loggerFactory.CreateLogger<PeerTools>().LogError(ex, "peer_register failed");
             return JsonSerializer.Serialize(new { error = ex.Message });

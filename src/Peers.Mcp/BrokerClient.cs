@@ -169,7 +169,7 @@ public sealed class BrokerClient : IDisposable
         catch (HttpRequestException ex) { throw BrokerApiException.FromTransport(ex); }
     }
 
-    private static string BuildQuery(params (string key, string? value)[] pairs)
+    internal static string BuildQuery(params (string key, string? value)[] pairs)
     {
         var parts = pairs.Where(p => p.value is not null).Select(p => $"{p.key}={Uri.EscapeDataString(p.value!)}");
         var q = string.Join("&", parts);

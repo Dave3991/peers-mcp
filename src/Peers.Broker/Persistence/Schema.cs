@@ -4,7 +4,7 @@ namespace Peers.Broker.Persistence;
 
 public static class Schema
 {
-    private const int CurrentVersion = 2;
+    public const int CurrentVersion = 2;
 
     public static void Migrate(SqliteConnection conn)
     {

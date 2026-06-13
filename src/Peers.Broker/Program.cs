@@ -92,7 +92,7 @@ static async Task WriteDiscoveryFileAsync(string discoveryFile, int port)
         port,
         pid = Environment.ProcessId,
         started_at = DateTime.UtcNow.ToString("O"),
-        schema_version = 1,
+        schema_version = Schema.CurrentVersion,
     });
 
     var tempFile = $"{discoveryFile}.{Environment.ProcessId}.tmp";

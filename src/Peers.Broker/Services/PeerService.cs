@@ -127,7 +127,10 @@ public sealed class PeerService(PeerRepository peers, EventService eventService)
             .OrderByDescending(peer => peer.UpdatedAt)
             .ToList();
 
-        // If an active peer matches, the session is still alive — don't resume
+        // If an active peer matches, the session is still alive — don't resume.
+        // (Multiple active peers per identity is INTENTIONAL: concurrent sessions in the same
+        // repo/branch/worktree get distinct ephemeral peer_ids; resume only reclaims EXPIRED
+        // identities. Concurrent same-identity registers yielding two rows is by design, not a race.)
         if (matching.Any(peer => peer.ExpiredAt is null))
             return null;
 

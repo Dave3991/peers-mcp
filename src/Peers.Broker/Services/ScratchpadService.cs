@@ -141,6 +141,8 @@ public sealed class ScratchpadService(ScratchpadRepository pads, EventService ev
         var pad = await pads.GetAsync(scratchpadId, ct);
         if (pad is null)
             return Result.Fail(new NotFoundError($"Scratchpad '{scratchpadId}' not found."));
+        if (pad.Status == "closed")
+            return Result.Fail(new ConflictError($"Scratchpad '{scratchpadId}' is already closed."));
 
         await pads.CloseAsync(scratchpadId, req.Resolution, ct);
         var closedPad = await pads.GetAsync(scratchpadId, ct) ?? pad;

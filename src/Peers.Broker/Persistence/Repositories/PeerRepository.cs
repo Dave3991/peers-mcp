@@ -295,7 +295,7 @@ public sealed class PeerRepository(SqliteConnectionFactory db)
         return await db.ReadAsync(async conn =>
         {
             using var cmd = conn.CreateCommand();
-            cmd.CommandText = "SELECT MIN(last_polled_event_id) FROM peers WHERE expired_at IS NULL AND last_polled_event_id IS NOT NULL";
+            cmd.CommandText = "SELECT MIN(COALESCE(last_polled_event_id, 0)) FROM peers WHERE expired_at IS NULL";
             var result = await cmd.ExecuteScalarAsync(ct);
             return result is DBNull or null ? null : (long?)Convert.ToInt64(result);
         }, ct);

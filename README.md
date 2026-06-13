@@ -97,6 +97,7 @@ Once registered, each session has access to these tools:
 | `peer_heartbeat` | Update your status and renew your session lease; `capabilities` is updatable |
 | `peer_list` | See all active sessions, filter by repo/branch/tool |
 | `peer_inbox` | Read messages directed to you (pull mode, durable with at-least-once delivery) |
+| `peer_wait` | Long-poll for directed messages — blocks until a message arrives or the timeout expires |
 | `peer_poll` | Low-level event polling with cursor |
 | `peer_test_push` | Send a test push notification to verify push delivery |
 | `peer_message` | Send a lightweight directed message to peers without a scratchpad |

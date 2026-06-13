@@ -1,4 +1,5 @@
 using System.Text.Json;
+using Peers.Broker.Errors;
 using Peers.Broker.Persistence.Repositories;
 using Peers.Broker.Services;
 using Peers.Broker.Tests.Helpers;
@@ -13,6 +14,7 @@ public sealed class ScratchpadServiceTests : IDisposable
     private readonly TestDb _db = new();
     private readonly PeerRepository _peers;
     private readonly InboxRepository _inbox;
+    private readonly EventRepository _events;
     private readonly PeerService _peerService;
     private readonly ScratchpadService _pads;
 
@@ -20,8 +22,8 @@ public sealed class ScratchpadServiceTests : IDisposable
     {
         _peers = new PeerRepository(_db.Factory);
         _inbox = new InboxRepository(_db.Factory);
-        var events = new EventRepository(_db.Factory);
-        var eventService = new EventService(events, _peers, _inbox);
+        _events = new EventRepository(_db.Factory);
+        var eventService = new EventService(_events, _peers, _inbox);
         _peerService = new PeerService(_peers, eventService);
         _pads = new ScratchpadService(new ScratchpadRepository(_db.Factory), eventService, _peers, new RecipientResolver(_peers));
     }
@@ -104,6 +106,56 @@ public sealed class ScratchpadServiceTests : IDisposable
             Tool = "claude-code", MachineId = machineId, RepoRoot = "/repo", Branch = "main",
         }, CancellationToken.None);
         return (await _peers.GetAsync(resp.PeerId, CancellationToken.None))!;
+    }
+
+    [Fact]
+    public async Task Close_ReturnsConflict_WhenAlreadyClosed()
+    {
+        var peer = await Register("machine-close");
+        var createResult = await _pads.CreateAsync(new CreateScratchpadRequest
+        {
+            Type = "review",
+            Title = "double-close test",
+            RepoRoot = "/repo",
+            CreatedByPeerId = peer.PeerId,
+        }, CancellationToken.None);
+        Assert.True(createResult.IsSuccess);
+        var padId = createResult.Value.ScratchpadId;
+        var req = new CloseScratchpadRequest { Resolution = "done" };
+
+        // First close — must succeed
+        var first = await _pads.CloseAsync(padId, req, CancellationToken.None);
+        Assert.True(first.IsSuccess);
+
+        // Second close — must fail with ConflictError
+        var second = await _pads.CloseAsync(padId, req, CancellationToken.None);
+        Assert.True(second.IsFailed);
+        Assert.Contains(second.Errors, e => e is ConflictError);
+    }
+
+    [Fact]
+    public async Task Close_EmitsExactlyOneClosedEvent_WhenCalledTwice()
+    {
+        var peer = await Register("machine-close2");
+        var createResult = await _pads.CreateAsync(new CreateScratchpadRequest
+        {
+            Type = "review",
+            Title = "single-event test",
+            RepoRoot = "/repo",
+            CreatedByPeerId = peer.PeerId,
+        }, CancellationToken.None);
+        Assert.True(createResult.IsSuccess);
+        var padId = createResult.Value.ScratchpadId;
+        var req = new CloseScratchpadRequest { Resolution = "done" };
+
+        await _pads.CloseAsync(padId, req, CancellationToken.None);
+        await _pads.CloseAsync(padId, req, CancellationToken.None); // second call is a no-op (returns Fail)
+
+        // Exactly one scratchpad.closed event should exist for this pad
+        var allEvents = await _events.GetSinceAsync(0, 1000, CancellationToken.None);
+        var closedEvents = allEvents.Count(e => e.Type == EventTypes.ScratchpadClosed
+                                                && e.Payload.Contains(padId));
+        Assert.Equal(1, closedEvents);
     }
 
     private async Task<Peer> InsertLivePeer(string peerId, string machineId) =>
