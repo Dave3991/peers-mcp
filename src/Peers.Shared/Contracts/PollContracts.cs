@@ -12,6 +12,7 @@ public sealed class InboxResponse
 {
     public required List<InboxItemDto> Items { get; init; }
     public required int Count { get; init; }
+    public bool TimedOut { get; init; }
 }
 
 public sealed class InboxItemDto

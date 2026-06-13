@@ -16,7 +16,7 @@ public sealed class BrokerClient : IDisposable
 
     public BrokerClient(string baseUrl)
     {
-        _http = new HttpClient { BaseAddress = new Uri(baseUrl) };
+        _http = new HttpClient { BaseAddress = new Uri(baseUrl), Timeout = TimeSpan.FromSeconds(130) };
     }
 
     internal BrokerClient(HttpClient http)
@@ -88,6 +88,24 @@ public sealed class BrokerClient : IDisposable
     // Inbox
     public async Task<InboxResponse?> GetInboxAsync(string peerId, int limit = 100) =>
         await GetAsync<InboxResponse>($"/peers/{peerId}/inbox?limit={limit}");
+
+    public async Task<InboxResponse?> WaitInboxAsync(string peerId, int timeoutSeconds, int limit = 100)
+    {
+        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(timeoutSeconds + 10));
+        using var req = new HttpRequestMessage(HttpMethod.Get, $"/peers/{peerId}/inbox/wait?timeout_seconds={timeoutSeconds}&limit={limit}");
+        try
+        {
+            var resp = await _http.SendAsync(req, cts.Token);
+            if (!resp.IsSuccessStatusCode)
+            {
+                var body = await resp.Content.ReadAsStringAsync();
+                throw new BrokerApiException(resp.StatusCode, body);
+            }
+            return await resp.Content.ReadFromJsonAsync<InboxResponse>(JsonOpts);
+        }
+        catch (OperationCanceledException) { throw new BrokerApiException(System.Net.HttpStatusCode.GatewayTimeout, "Broker did not respond within the wait window."); }
+        catch (HttpRequestException ex) { throw BrokerApiException.FromTransport(ex); }
+    }
 
     public async Task AckInboxAsync(string peerId, string[]? inboxIds = null, bool all = false) =>
         await PostAsync<object>($"/peers/{peerId}/inbox/ack", new { InboxIds = inboxIds, All = all });

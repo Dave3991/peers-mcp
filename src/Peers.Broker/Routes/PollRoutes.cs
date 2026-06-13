@@ -38,6 +38,21 @@ public static class PollRoutes
             });
         });
 
+        app.MapGet("/peers/{peerId}/inbox/wait", async (string peerId, int? timeout_seconds, int? limit,
+            PeerRepository peerRepo, InboxRepository inbox, CancellationToken ct) =>
+        {
+            var guard = await GuardAsync(peerRepo, peerId, limit, ct);
+            if (guard.IsFailed) return guard.ToHttp();
+            var timeout = TimeSpan.FromSeconds(Math.Clamp(timeout_seconds ?? 60, 1, 120));
+            var items = await inbox.WaitForUnackedAsync(peerId, timeout, limit ?? 100, TimeSpan.FromSeconds(1), ct);
+            return Results.Ok(new InboxResponse
+            {
+                Items = items.Select(i => new InboxItemDto { InboxId = i.InboxId, PeerId = i.PeerId, Event = i.Event, CreatedAt = i.CreatedAt }).ToList(),
+                Count = items.Count,
+                TimedOut = items.Count == 0,
+            });
+        });
+
         app.MapPost("/peers/{peerId}/inbox/ack", async (string peerId, InboxAckRequest req,
             PeerRepository peerRepo, InboxRepository inbox, CancellationToken ct) =>
         {

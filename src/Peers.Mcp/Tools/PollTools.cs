@@ -41,6 +41,29 @@ public sealed class PollTools
     private static string BrokerError(BrokerApiException ex) =>
         JsonSerializer.Serialize(new { error = ex.Message, status_code = (int)ex.StatusCode }, JsonOpts);
 
+    private static async Task AckPendingAsync(BrokerClient client, SessionState state)
+    {
+        var ids = state.PendingInboxAckIds;
+        if (ids is { Length: > 0 })
+        {
+            await client.AckInboxAsync(state.PeerId!, ids);
+            state.PendingInboxAckIds = null;
+        }
+    }
+
+    private static string ShapeAndStage(SessionState state, InboxResponse? resp, bool? timedOut)
+    {
+        // Reserve headroom when we'll inject timed_out post-shape, so the final JSON stays <= cap (T13 finding #1 / T6 overshoot class).
+        var reserve = timedOut is null ? 0 : 24;  // covers the widest ",\"timed_out\":false" rendering
+        var shape = InboxResultShaper.ShapeInbox(resp?.Items ?? new List<InboxItemDto>(),
+            state.LastCursor, Limits.MaxToolResultChars - reserve, JsonOpts);
+        state.PendingInboxAckIds = shape.IncludedInboxIds.Length > 0 ? shape.IncludedInboxIds : null;
+        if (timedOut is null) return shape.Json;
+        var node = System.Text.Json.Nodes.JsonNode.Parse(shape.Json)!.AsObject();
+        node["timed_out"] = timedOut.Value;
+        return node.ToJsonString();
+    }
+
     [McpServerTool(Name = "peer_inbox"), Description(
         "Drain the durable inbox of directed messages addressed to this peer (review requests, replies, DMs). This is the primary, everyday way to read peer activity — call at startup, after each task chunk, before finishing.\n" +
         "Delivery: at-least-once. Items fetched here are acked on the NEXT inbox call, so a tool error between calls causes redelivery.\n" +
@@ -55,22 +78,29 @@ public sealed class PollTools
 
         try
         {
-            // Ack previously fetched items first (deferred from last call)
-            var pendingAckIds = state.PendingInboxAckIds;
-            if (pendingAckIds is { Length: > 0 })
-            {
-                await client.AckInboxAsync(state.PeerId, pendingAckIds);
-                state.PendingInboxAckIds = null;
-            }
-
-            // Fetch new unacked items from durable broker inbox
+            await AckPendingAsync(client, state);
             var resp = await client.GetInboxAsync(state.PeerId, limit ?? 100);
+            return ShapeAndStage(state, resp, null);
+        }
+        catch (BrokerApiException ex) { return BrokerError(ex); }
+    }
 
-            // Shape the result: truncate large payloads and cap total size; only ack included items
-            var shape = InboxResultShaper.ShapeInbox(resp?.Items ?? new List<InboxItemDto>(), state.LastCursor, Limits.MaxToolResultChars, JsonOpts);
-            state.PendingInboxAckIds = shape.IncludedInboxIds.Length > 0 ? shape.IncludedInboxIds : null;
-
-            return shape.Json;
+    [McpServerTool(Name = "peer_wait"), Description(
+        "Long-poll: block up to timeout_seconds (default 60, max 120) until a directed message arrives, then drain it exactly like peer_inbox (same deferred at-least-once ack, same size shaping).\n" +
+        "Use this after requesting a review instead of repeatedly calling peer_inbox — it returns as soon as a message lands.\n" +
+        "Returns the same shape as peer_inbox, plus timed_out:true when it returns empty at the deadline.")]
+    public static async Task<string> Wait(
+        BrokerClient client,
+        SessionState state,
+        [Description("Max seconds to block waiting for a directed event (default 60, max 120)")] int? timeout_seconds = null)
+    {
+        if (state.PeerId is null) return """{"error":"Not registered. Call peer_register first."}""";
+        var t = Math.Clamp(timeout_seconds ?? 60, 1, 120);
+        try
+        {
+            await AckPendingAsync(client, state);
+            var resp = await client.WaitInboxAsync(state.PeerId, t);
+            return ShapeAndStage(state, resp, resp?.TimedOut ?? true);
         }
         catch (BrokerApiException ex) { return BrokerError(ex); }
     }

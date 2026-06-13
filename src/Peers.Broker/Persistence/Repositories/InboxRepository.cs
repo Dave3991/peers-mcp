@@ -133,6 +133,20 @@ public sealed class InboxRepository(SqliteConnectionFactory db)
         }, ct);
     }
 
+    public async Task<List<InboxItem>> WaitForUnackedAsync(
+        string peerId, TimeSpan timeout, int limit, TimeSpan pollInterval, CancellationToken ct)
+    {
+        var deadline = DateTime.UtcNow + timeout;
+        while (true)
+        {
+            var items = await GetUnackedAsync(peerId, limit, ct);
+            if (items.Count > 0) return items;
+            var remaining = deadline - DateTime.UtcNow;
+            if (remaining <= TimeSpan.Zero) return items; // empty -> caller infers timed_out
+            await Task.Delay(remaining < pollInterval ? remaining : pollInterval, ct);
+        }
+    }
+
     // Acks (does not delete) the OLDEST (lowest event_id) unacked rows beyond the cap for any peer;
     // keeps the audit row, drops only the event-pin. For a review backlog the oldest is the original
     // request — accepted ring-buffer default.
