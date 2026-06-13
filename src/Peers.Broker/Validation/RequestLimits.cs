@@ -39,6 +39,13 @@ public static class RequestLimits
         return null;
     }
 
+    public static IResult? ValidateSendMessage(Shared.Contracts.SendMessageRequest req)
+    {
+        if (Utf8Bytes(req.Content) > MaxEntryContentBytes)
+            return Results.Json(new { error = $"Message content exceeds {MaxEntryContentBytes / 1024} KB." }, statusCode: 413);
+        return null;
+    }
+
     public static IResult? ValidateRegisterPeer(Shared.Contracts.RegisterPeerRequest req)
     {
         if (req.Summary?.Length > MaxSummaryLength)

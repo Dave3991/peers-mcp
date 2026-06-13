@@ -148,7 +148,7 @@ public sealed class ScratchpadTools
         catch (BrokerApiException ex) { return BrokerError(ex); }
     }
 
-    private static string? FormatDeliverySummary(RecipientStatus? status)
+    internal static string? FormatDeliverySummary(RecipientStatus? status)
     {
         if (status is null) return null;
         var parts = new List<string>();

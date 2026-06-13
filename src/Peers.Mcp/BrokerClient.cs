@@ -65,6 +65,10 @@ public sealed class BrokerClient : IDisposable
     public async Task CloseScratchpadAsync(string padId, CloseScratchpadRequest req) =>
         await PatchAsync($"/scratchpads/{padId}/close", req);
 
+    // Messages
+    public async Task<SendMessageResponse> SendMessageAsync(SendMessageRequest req) =>
+        (await PostAsync<SendMessageResponse>("/messages", req))!;
+
     // Artifacts
     public async Task<PublishArtifactResponse> PublishArtifactAsync(PublishArtifactRequest req) =>
         (await PostAsync<PublishArtifactResponse>("/artifacts", req))!;

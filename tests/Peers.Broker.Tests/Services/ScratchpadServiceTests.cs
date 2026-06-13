@@ -23,7 +23,7 @@ public sealed class ScratchpadServiceTests : IDisposable
         var events = new EventRepository(_db.Factory);
         var eventService = new EventService(events, _peers, _inbox);
         _peerService = new PeerService(_peers, eventService);
-        _pads = new ScratchpadService(new ScratchpadRepository(_db.Factory), eventService, _peers);
+        _pads = new ScratchpadService(new ScratchpadRepository(_db.Factory), eventService, _peers, new RecipientResolver(_peers));
     }
 
     [Fact]

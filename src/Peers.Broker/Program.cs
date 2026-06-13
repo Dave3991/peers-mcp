@@ -31,9 +31,11 @@ builder.Services.AddScoped<InboxRepository>();
 
 // Services
 builder.Services.AddScoped<PeerService>();
+builder.Services.AddScoped<RecipientResolver>();
 builder.Services.AddScoped<ScratchpadService>();
 builder.Services.AddScoped<ArtifactService>();
 builder.Services.AddScoped<EventService>();
+builder.Services.AddScoped<MessageService>();
 
 // Background
 builder.Services.AddSingleton<Peers.Broker.Hosting.BrokerStatus>();
@@ -48,6 +50,7 @@ app.MapScratchpadRoutes();
 app.MapArtifactRoutes();
 app.MapPollRoutes();
 app.MapStatusRoutes();
+app.MapMessageRoutes();
 
 var discoveryDir = PeersPaths.GetStateDirectory();
 var discoveryFile = PeersPaths.GetDiscoveryFile();

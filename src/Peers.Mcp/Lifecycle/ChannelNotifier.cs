@@ -275,7 +275,7 @@ public sealed class ChannelNotifier : IDisposable, IAsyncDisposable
             // who authored the entry, not who created the scratchpad.
             var propertyNames = evt.Type == EventTypes.ScratchpadEntryAdded
                 ? new[] { "author_peer_id" }
-                : new[] { "peer_id", "author_peer_id", "created_by_peer_id", "published_by_peer_id" };
+                : new[] { "peer_id", "author_peer_id", "created_by_peer_id", "published_by_peer_id", "from_peer_id" };
 
             foreach (var propertyName in propertyNames)
             {
@@ -368,6 +368,17 @@ public sealed class ChannelNotifier : IDisposable, IAsyncDisposable
                     fromPeerId: null,
                     level: LoggingLevel.Info,
                     content: $"Peers: {root.GetProp("expired_count") ?? "?"} peer(s) expired"),
+
+                EventTypes.PeerMessage => BuildMessage(
+                    evt,
+                    scratchpadId: null,
+                    title: "Direct message",
+                    fromPeerId: root.GetProp("from_peer_id"),
+                    level: LoggingLevel.Warning,
+                    content: $"Peers DM from {root.GetProp("from_peer_id") ?? "unknown"}: " +
+                             (root.GetProp("content") is { } c
+                                 ? c.Length > 200 ? c[..200] + "..." : c
+                                 : "(empty)")),
 
                 _ => null,
             };

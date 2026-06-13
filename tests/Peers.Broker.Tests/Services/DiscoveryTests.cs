@@ -20,7 +20,7 @@ public sealed class DiscoveryTests : IDisposable
     }
 
     private ScratchpadService CreateScratchpadService(PeerRepository peerRepo, EventService eventService) =>
-        new ScratchpadService(new ScratchpadRepository(_db.Factory), eventService, peerRepo);
+        new ScratchpadService(new ScratchpadRepository(_db.Factory), eventService, peerRepo, new RecipientResolver(peerRepo));
 
     private ArtifactService CreateArtifactService(PeerRepository peerRepo, EventService eventService) =>
         new ArtifactService(new ArtifactRepository(_db.Factory), eventService, peerRepo);

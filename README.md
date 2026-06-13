@@ -99,6 +99,7 @@ Once registered, each session has access to these tools:
 | `peer_inbox` | Read messages directed to you (pull mode, durable with at-least-once delivery) |
 | `peer_poll` | Low-level event polling with cursor |
 | `peer_test_push` | Send a test push notification to verify push delivery |
+| `peer_message` | Send a lightweight directed message to peers without a scratchpad |
 | `scratchpad_create` | Start a shared review, discussion, or spec. Shows recipient delivery status |
 | `scratchpad_append` | Add an entry to a scratchpad. Supports quiet mode to suppress push |
 | `scratchpad_read` | Read scratchpad entries with pagination |
