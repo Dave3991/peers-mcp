@@ -1,5 +1,4 @@
 using System.ComponentModel;
-using System.Text;
 using System.Text.Json;
 using System.Text.RegularExpressions;
 using ModelContextProtocol.Server;
@@ -10,11 +9,12 @@ namespace Peers.Mcp.Tools;
 public sealed partial class ContextTools
 {
     private static readonly JsonSerializerOptions JsonOpts = new() { PropertyNamingPolicy = JsonNamingPolicy.SnakeCaseLower };
+    private static readonly JsonSerializerOptions JsonOptsIndented = new() { PropertyNamingPolicy = JsonNamingPolicy.SnakeCaseLower, WriteIndented = true };
 
     [McpServerTool(Name = "context_export"), Description(
         "Export the current session's context as a peers-context:v1 markdown packet, suitable for pasting into Codex or another tool during a handoff.\n" +
         "Includes (toggleable): active peers, open scratchpads, artifact list, optional task description, and free-form notes.\n" +
-        "Returns: a markdown string starting with '<!-- peers-context:v1 -->' and a single ```yaml block. Recommended Claude<->Codex handoff format.")]
+        "Returns: a markdown string starting with '<!-- peers-context:v1 -->' and a single ```json block. Recommended Claude<->Codex handoff format.")]
     public static async Task<string> Export(
         BrokerClient client,
         SessionState state,
@@ -22,9 +22,10 @@ public sealed partial class ContextTools
         [Description("Include open scratchpads")] bool include_scratchpads = true,
         [Description("Include artifact list")] bool include_artifacts = true,
         [Description("Custom task description to include")] string? task = null,
-        [Description("Custom notes to include (JSON array of strings)")] string? notes = null)
+        [Description("Custom notes to include (JSON array of strings)")] string? notes = null,
+        [Description("Include the newest ~3 entries (500-char previews) of each open scratchpad. Note: drawn from a bounded window of up to 200 entries per pad — on threads longer than 200 entries the absolute latest may be omitted; use scratchpad_read for the full tail.")] bool include_scratchpad_entries = false)
     {
-        try { return await ExportInner(client, state, include_peers, include_scratchpads, include_artifacts, task, notes); }
+        try { return await ExportInner(client, state, include_peers, include_scratchpads, include_artifacts, task, notes, include_scratchpad_entries); }
         catch (BrokerApiException ex) { return JsonSerializer.Serialize(new { error = ex.Message, status_code = (int)ex.StatusCode }, JsonOpts); }
     }
 
@@ -35,85 +36,118 @@ public sealed partial class ContextTools
         bool include_scratchpads,
         bool include_artifacts,
         string? task,
-        string? notes)
+        string? notes,
+        bool include_scratchpad_entries = false)
     {
-        var sb = new StringBuilder();
-        sb.AppendLine("<!-- peers-context:v1 -->");
-        sb.AppendLine("```yaml");
-        sb.AppendLine("task:");
-        sb.AppendLine($"  title: \"{task ?? "No task specified"}\"");
-        sb.AppendLine("session:");
-        sb.AppendLine($"  tool: {state.Tool ?? "unknown"}");
-        sb.AppendLine($"  peer_id: {state.PeerId ?? "not-registered"}");
+        var doc = new Dictionary<string, object?>();
+
+        doc["task"] = new { title = task ?? "No task specified" };
+        doc["session"] = new { tool = state.Tool ?? "unknown", peer_id = state.PeerId ?? "not-registered" };
 
         if (include_peers)
         {
             var peers = await client.ListPeersAsync();
-            sb.AppendLine("peers:");
-            foreach (var p in peers)
+            doc["peers"] = peers.Select(p => new
             {
-                sb.AppendLine($"  - peer_id: {p.PeerId}");
-                sb.AppendLine($"    tool: {p.Tool}");
-                sb.AppendLine($"    repo_root: {p.RepoRoot ?? "unknown"}");
-                sb.AppendLine($"    branch: {p.Branch ?? "unknown"}");
-                sb.AppendLine($"    summary: \"{p.Summary ?? ""}\"");
-            }
+                peer_id = p.PeerId,
+                tool = p.Tool,
+                repo_root = p.RepoRoot,
+                branch = p.Branch,
+                summary = p.Summary
+            }).ToList();
         }
 
         if (include_scratchpads)
         {
             var pads = await client.ListScratchpadsAsync(status: "open");
-            sb.AppendLine("scratchpads:");
+            var padList = new List<object>();
             foreach (var pad in pads)
             {
-                sb.AppendLine($"  - id: {pad.ScratchpadId}");
-                sb.AppendLine($"    type: {pad.Type}");
-                sb.AppendLine($"    title: \"{pad.Title}\"");
-                sb.AppendLine($"    status: {pad.Status}");
+                if (include_scratchpad_entries)
+                {
+                    var read = await client.ReadScratchpadAsync(pad.ScratchpadId, 200, 0);
+                    var entries = (read?.Entries ?? [])
+                        .OrderByDescending(e => e.CreatedAt)
+                        .Take(3)
+                        .Select(e => new
+                        {
+                            author_peer_id = e.AuthorPeerId,
+                            created_at = e.CreatedAt,
+                            preview = e.Content.Length <= 500 ? e.Content : e.Content[..500]
+                        })
+                        .ToList();
+                    padList.Add(new { id = pad.ScratchpadId, type = pad.Type, title = pad.Title, status = pad.Status, entries });
+                }
+                else
+                {
+                    padList.Add(new { id = pad.ScratchpadId, type = pad.Type, title = pad.Title, status = pad.Status });
+                }
             }
+            doc["scratchpads"] = padList;
         }
 
         if (include_artifacts)
         {
             var arts = await client.ListArtifactsAsync();
-            sb.AppendLine("artifacts:");
-            foreach (var a in arts)
+            doc["artifacts"] = arts.Select(a => new
             {
-                sb.AppendLine($"  - id: {a.ArtifactId}");
-                sb.AppendLine($"    namespace: {a.Namespace}");
-                sb.AppendLine($"    name: {a.Name}");
-                sb.AppendLine($"    version: {a.Version}");
-                sb.AppendLine($"    type: {a.Type}");
-            }
+                id = a.ArtifactId,
+                @namespace = a.Namespace,
+                name = a.Name,
+                version = a.Version,
+                type = a.Type
+            }).ToList();
         }
 
         if (notes is not null)
         {
-            sb.AppendLine("notes:");
             try
             {
                 var noteList = JsonSerializer.Deserialize<List<string>>(notes);
-                if (noteList is not null)
-                    foreach (var n in noteList)
-                        sb.AppendLine($"  - \"{n}\"");
+                doc["notes"] = noteList ?? (object)new[] { notes };
             }
-            catch { sb.AppendLine($"  - \"{notes}\""); }
+            catch (JsonException)
+            {
+                doc["notes"] = new[] { notes };
+            }
         }
 
-        sb.AppendLine("```");
-        return sb.ToString();
+        var json = JsonSerializer.Serialize(doc, JsonOptsIndented);
+        return $"<!-- peers-context:v1 -->\n```json\n{json}\n```\n";
     }
 
     [McpServerTool(Name = "context_import"), Description(
         "Parse a peers-context:v1 markdown packet (typically produced by context_export on a peer) into a typed JSON object: task, session, peers, scratchpads, artifacts, notes, changes.\n" +
-        "If no peers-context:v1 YAML block is found, returns { raw, warning } with the original markdown unparsed.\n" +
+        "Accepts a ```json block (current format) or the legacy ```yaml block.\n" +
+        "If no recognizable peers-context:v1 block is found, returns { raw, warning } with the original markdown unparsed.\n" +
         "Returns: a JSON object keyed by section name.")]
     public static Task<string> Import(
         [Description("Structured markdown context packet")] string markdown)
     {
-        var result = new Dictionary<string, object?>();
+        // Try to parse the current JSON format first
+        var markerIdx = markdown.IndexOf("<!-- peers-context:v1 -->", StringComparison.Ordinal);
+        if (markerIdx >= 0)
+        {
+            var braceIdx = markdown.IndexOf('{', markerIdx);
+            if (braceIdx >= 0)
+            {
+                var slice = markdown[braceIdx..];
+                var bytes = System.Text.Encoding.UTF8.GetBytes(slice);
+                try
+                {
+                    var reader = new System.Text.Json.Utf8JsonReader(bytes);
+                    reader.Read();   // StartObject
+                    reader.Skip();   // advance to matching EndObject
+                    var consumed = checked((int)reader.BytesConsumed);
+                    using var doc = JsonDocument.Parse(new ReadOnlyMemory<byte>(bytes, 0, consumed));
+                    return Task.FromResult(JsonSerializer.Serialize(doc.RootElement, JsonOpts));
+                }
+                catch (JsonException) { /* fall through to yaml legacy */ }
+            }
+        }
 
-        // Extract YAML block
+        // Legacy YAML fallback
+        var result = new Dictionary<string, object?>();
         var yamlMatch = YamlBlockRegex().Match(markdown);
         if (yamlMatch.Success)
         {
