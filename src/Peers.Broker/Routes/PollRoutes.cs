@@ -3,6 +3,7 @@ using Peers.Broker.Errors;
 using Peers.Broker.Persistence;
 using Peers.Broker.Persistence.Repositories;
 using Peers.Broker.Services;
+using Peers.Shared;
 using Peers.Shared.Contracts;
 
 namespace Peers.Broker.Routes;
@@ -70,7 +71,7 @@ public static class PollRoutes
             return Results.Ok(new { ok = true });
         });
 
-        app.MapGet("/health", () => Results.Ok(new { status = "ok", version = Schema.CurrentVersion }));
+        app.MapGet("/health", () => Results.Ok(new { status = "ok", version = Schema.CurrentVersion, contract = BrokerContract.Current }));
     }
 
     private static async Task<Result> GuardAsync(PeerRepository peerRepo, string peerId, int? limit, CancellationToken ct)

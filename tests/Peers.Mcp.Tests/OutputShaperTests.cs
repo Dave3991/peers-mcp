@@ -16,34 +16,6 @@ public class OutputShaperTests
 
     // ─── Helpers ────────────────────────────────────────────────────────────────
 
-    private static Scratchpad MakeScratchpad() => new()
-    {
-        ScratchpadId = "sp-test",
-        Type = "discussion",
-        Title = "Test pad",
-        Status = "open",
-        CreatedByPeerId = "peer-1",
-        CreatedAt = DateTime.UtcNow,
-    };
-
-    private static ScratchpadEntry MakeEntry(int i, int contentLength) => new()
-    {
-        EntryId = $"e{i}",
-        ScratchpadId = "sp-test",
-        AuthorPeerId = "peer-1",
-        Content = new string('x', contentLength),
-        ContentBytes = contentLength,
-        CreatedAt = DateTime.UtcNow,
-    };
-
-    private static ReadScratchpadResponse MakeResponse(int entryCount, int contentLength) => new()
-    {
-        Scratchpad = MakeScratchpad(),
-        Entries = Enumerable.Range(0, entryCount)
-            .Select(i => MakeEntry(i, contentLength))
-            .ToList(),
-    };
-
     private static Artifact MakeArtifact(string content) => new()
     {
         ArtifactId = "art-1",
@@ -57,60 +29,6 @@ public class OutputShaperTests
         PublishedByPeerId = "peer-1",
         CreatedAt = DateTime.UtcNow,
     };
-
-    // ─── Scratchpad Tests ────────────────────────────────────────────────────────
-
-    // Test 1: 10 entries × ~5000-char content, small maxChars → truncated, result ≤ maxChars
-    [Fact]
-    public void ShapeScratchpadRead_LargeEntries_TruncatesWithinBudget()
-    {
-        var resp = MakeResponse(10, 5_000);
-        var maxChars = 20_000;
-
-        var json = OutputShaper.ShapeScratchpadRead(resp, offset: 0, maxChars, JsonOpts);
-
-        Assert.True(json.Length <= maxChars, $"json.Length={json.Length} exceeds maxChars={maxChars}");
-
-        var doc = JsonNode.Parse(json)!.AsObject();
-        Assert.True(doc["truncated"]!.GetValue<bool>(), "truncated should be true");
-        var includedCount = doc["included_count"]!.GetValue<int>();
-        Assert.True(includedCount < 10, $"included_count={includedCount} should be < 10");
-        var entries = doc["entries"]!.AsArray();
-        Assert.Equal(includedCount, entries.Count);
-        var nextOffset = doc["next_offset"]!.GetValue<int>();
-        Assert.Equal(0 + includedCount, nextOffset);
-    }
-
-    // Test 2: entries that all fit → no truncated field, unchanged shape
-    [Fact]
-    public void ShapeScratchpadRead_SmallEntries_FullShapeNoTruncated()
-    {
-        var resp = MakeResponse(3, 50);
-        var maxChars = 30_000;
-
-        var json = OutputShaper.ShapeScratchpadRead(resp, offset: 0, maxChars, JsonOpts);
-
-        var doc = JsonNode.Parse(json)!.AsObject();
-        Assert.Null(doc["truncated"]);
-        Assert.Null(doc["included_count"]);
-        Assert.Null(doc["next_offset"]);
-        Assert.Equal(3, doc["entries"]!.AsArray().Count);
-    }
-
-    // Test 3: one entry alone > maxChars → exactly 1 entry, included_count==1
-    [Fact]
-    public void ShapeScratchpadRead_SingleHugeEntry_IncludesItAnyway()
-    {
-        var resp = MakeResponse(5, 50_000);
-        var maxChars = 100; // tiny — even 1 entry won't fit, but must be kept
-
-        var json = OutputShaper.ShapeScratchpadRead(resp, offset: 0, maxChars, JsonOpts);
-
-        var doc = JsonNode.Parse(json)!.AsObject();
-        Assert.True(doc["truncated"]!.GetValue<bool>());
-        Assert.Equal(1, doc["included_count"]!.GetValue<int>());
-        Assert.Single(doc["entries"]!.AsArray());
-    }
 
     // ─── Artifact Tests ──────────────────────────────────────────────────────────
 

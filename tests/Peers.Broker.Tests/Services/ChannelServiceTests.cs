@@ -1,0 +1,156 @@
+using Peers.Broker.Persistence.Repositories;
+using Peers.Broker.Services;
+using Peers.Broker.Tests.Helpers;
+using Peers.Shared.Contracts;
+using Xunit;
+
+namespace Peers.Broker.Tests.Services;
+
+/// <summary>
+/// The broker-side contract of the channel model: scoped names, mention resolution, quiet-whisper
+/// visibility, and the inbox rows a mention owes. Read filtering is THE quiet property — a whisper
+/// must be absent from other viewers' reads, present for author and mentions.
+/// </summary>
+public sealed class ChannelServiceTests : IDisposable
+{
+    private readonly TestDb _db = new();
+
+    private (PeerRepository peerRepo, PeerService peerSvc, EventService events, ChannelService channels) Create()
+    {
+        var peerRepo = new PeerRepository(_db.Factory);
+        var eventRepo = new EventRepository(_db.Factory);
+        var inboxRepo = new InboxRepository(_db.Factory);
+        var events = new EventService(eventRepo, peerRepo, inboxRepo);
+        var channels = new ChannelService(new ChannelRepository(_db.Factory), peerRepo, events, new RecipientResolver(peerRepo));
+        return (peerRepo, new PeerService(peerRepo, events, channels), events, channels);
+    }
+
+    private async Task<string> RegisterAsync(PeerService svc, string machine, string repo = "/repo", string? branch = "main")
+    {
+        var resp = await svc.RegisterAsync(new RegisterPeerRequest
+        {
+            Tool = "claude-code", MachineId = machine, RepoRoot = repo, Branch = branch,
+        }, CancellationToken.None);
+        return resp.PeerId;
+    }
+
+    [Fact]
+    public async Task Create_DuplicateNameInSameScope_Fails_ButOtherScopeSucceeds()
+    {
+        var (_, peerSvc, _, channels) = Create();
+        var me = await RegisterAsync(peerSvc, "m1");
+
+        var first = await channels.CreateAsync(new CreateChannelRequest { Name = "deploy", RepoRoot = "/repo", CreatedByPeerId = me }, CancellationToken.None);
+        Assert.True(first.IsSuccess);
+
+        var dup = await channels.CreateAsync(new CreateChannelRequest { Name = "deploy", RepoRoot = "/repo", CreatedByPeerId = me }, CancellationToken.None);
+        Assert.True(dup.IsFailed);
+
+        var otherScope = await channels.CreateAsync(new CreateChannelRequest { Name = "deploy", RepoRoot = "/other", CreatedByPeerId = me }, CancellationToken.None);
+        Assert.True(otherScope.IsSuccess);
+    }
+
+    private EventService CreateEvents() =>
+        new(new EventRepository(_db.Factory), new PeerRepository(_db.Factory), new InboxRepository(_db.Factory));
+
+    [Fact]
+    public async Task Send_LoudNoMentions_VisibleToEveryViewer_NoInboxRows()
+    {
+        var (peerRepo, peerSvc, events, channels) = Create();
+        var author = await RegisterAsync(peerSvc, "m-author");
+        var other = await RegisterAsync(peerSvc, "m-other");
+
+        var chan = (await channels.CreateAsync(new CreateChannelRequest { Name = "general", RepoRoot = "/repo", CreatedByPeerId = author }, CancellationToken.None)).Value;
+        var sent = await channels.SendAsync(chan.ChannelId, new SendMessageRequest { AuthorPeerId = author, Content = "hello all" }, CancellationToken.None);
+        Assert.True(sent.IsSuccess);
+
+        var authorView = await channels.ReadAsync(chan.ChannelId, viewer: author, 0, 100, CancellationToken.None);
+        var otherView = await channels.ReadAsync(chan.ChannelId, viewer: other, 0, 100, CancellationToken.None);
+        var anonView = await channels.ReadAsync(chan.ChannelId, viewer: null, 0, 100, CancellationToken.None);
+
+        Assert.Single(authorView!.Messages);
+        Assert.Single(otherView!.Messages);
+        Assert.Single(anonView!.Messages);
+
+        var inbox = new InboxRepository(_db.Factory);
+        Assert.Empty(await inbox.GetUnackedAsync(other, ct: CancellationToken.None));
+    }
+
+    [Fact]
+    public async Task Send_QuietWhisper_HiddenFromOthers_InvisibleWithoutMention()
+    {
+        var (peerRepo, peerSvc, events, channels) = Create();
+        var author = await RegisterAsync(peerSvc, "m-author");
+        var mentioned = await RegisterAsync(peerSvc, "m-mentioned");
+        var outsider = await RegisterAsync(peerSvc, "m-outsider");
+
+        var chan = (await channels.CreateAsync(new CreateChannelRequest { Name = "general", RepoRoot = "/repo", CreatedByPeerId = author }, CancellationToken.None)).Value;
+
+        var sent = await channels.SendAsync(chan.ChannelId, new SendMessageRequest
+        {
+            AuthorPeerId = author,
+            Content = "psst, review my diff",
+            To = [mentioned],
+            Quiet = true,
+        }, CancellationToken.None);
+        Assert.True(sent.IsSuccess);
+        Assert.Equal([mentioned], sent.Value.Mentions);
+
+        // Author and mentioned see it; outsider does not. Anonymous sees neither.
+        Assert.Single((await channels.ReadAsync(chan.ChannelId, author, 0, 100, CancellationToken.None))!.Messages);
+        Assert.Single((await channels.ReadAsync(chan.ChannelId, mentioned, 0, 100, CancellationToken.None))!.Messages);
+        Assert.Empty((await channels.ReadAsync(chan.ChannelId, outsider, 0, 100, CancellationToken.None))!.Messages);
+        Assert.Empty((await channels.ReadAsync(chan.ChannelId, null, 0, 100, CancellationToken.None))!.Messages);
+
+        // The whisper landed in exactly the mentioned peer's inbox. Roster churn (peer.registered)
+        // also lands there, so filter to the message event this test is about.
+        var inbox = new InboxRepository(_db.Factory);
+        Assert.Single(await MessagesFor(inbox, mentioned));
+        Assert.Empty(await MessagesFor(inbox, outsider));
+        _ = peerRepo; _ = events;
+    }
+
+    private static async Task<List<InboxItem>> MessagesFor(InboxRepository inbox, string peerId) =>
+        (await inbox.GetUnackedAsync(peerId, ct: CancellationToken.None))
+            .Where(i => i.Event.Type == Peers.Shared.Models.EventTypes.ChannelMessageAdded)
+            .ToList();
+
+    [Fact]
+    public async Task Send_QuietWithoutMentions_Rejected()
+    {
+        var (_, peerSvc, _, channels) = Create();
+        var author = await RegisterAsync(peerSvc, "m-q");
+        var chan = (await channels.CreateAsync(new CreateChannelRequest { Name = "c", RepoRoot = "/repo", CreatedByPeerId = author }, CancellationToken.None)).Value;
+
+        var result = await channels.SendAsync(chan.ChannelId, new SendMessageRequest
+        {
+            AuthorPeerId = author,
+            Content = "invisible forever",
+            Quiet = true,
+        }, CancellationToken.None);
+
+        Assert.True(result.IsFailed);
+    }
+
+    [Fact]
+    public async Task Read_SinceSeq_PagesForwardWithoutRepeats()
+    {
+        var (_, peerSvc, _, channels) = Create();
+        var author = await RegisterAsync(peerSvc, "m-seq");
+        var chan = (await channels.CreateAsync(new CreateChannelRequest { Name = "seq", RepoRoot = "/repo", CreatedByPeerId = author }, CancellationToken.None)).Value;
+
+        foreach (var i in Enumerable.Range(0, 3))
+            await channels.SendAsync(chan.ChannelId, new SendMessageRequest { AuthorPeerId = author, Content = $"m{i}" }, CancellationToken.None);
+
+        var page1 = await channels.ReadAsync(chan.ChannelId, author, 0, 2, CancellationToken.None);
+        Assert.Equal(2, page1!.Messages.Length);
+        Assert.True(page1.Truncated);
+
+        var lastSeq = page1.Messages.Last().Seq;
+        var page2 = await channels.ReadAsync(chan.ChannelId, author, lastSeq, 2, CancellationToken.None);
+        var msg = Assert.Single(page2!.Messages);
+        Assert.Equal("m2", msg.Content);
+    }
+
+    public void Dispose() => _db.Dispose();
+}

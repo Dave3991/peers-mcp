@@ -13,9 +13,7 @@ public static class EventTypes
     public const string PeerRegistered = "peer.registered";
     public const string PeerUpdated = "peer.updated";
     public const string PeerExpired = "peer.expired";
-    public const string ScratchpadCreated = "scratchpad.created";
-    public const string ScratchpadEntryAdded = "scratchpad.entry_added";
-    public const string ScratchpadResolved = "scratchpad.resolved";
-    public const string ScratchpadClosed = "scratchpad.closed";
+    public const string ChannelCreated = "channel.created";
+    public const string ChannelMessageAdded = "channel.message_added";
     public const string ArtifactPublished = "artifact.published";
 }

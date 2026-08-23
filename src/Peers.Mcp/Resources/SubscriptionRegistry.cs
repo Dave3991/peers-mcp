@@ -24,6 +24,10 @@ namespace Peers.Mcp.Resources;
 /// resources/list_changed — both lists are static for the life of the process — so nothing is lost
 /// by not implementing them; a future dynamic list would have to fan out from here.
 ///
+/// Quiet whispers are filtered per session at fan-out time: a quiet message notifies only its own
+/// participants' streams, because this registry always runs inside exactly one session's process and
+/// knows that session's peer id.
+///
 /// ponytail: stdio-only, deliberately. ActiveSubscription.RelatedTransport is null on stdio, so every
 /// notification routes over the one shared session channel and a subscription only needs to remember its
 /// McpServer. Streamable HTTP would need per-request transport routing — peers does not have that
@@ -32,10 +36,15 @@ namespace Peers.Mcp.Resources;
 public sealed class SubscriptionRegistry
 {
     private readonly McpServerResourceCollection _resources;
+    private readonly SessionState _state;
     private readonly Lock _gate = new();
     private readonly List<Subscription> _subscriptions = [];
 
-    public SubscriptionRegistry(McpServerResourceCollection resources) => _resources = resources;
+    public SubscriptionRegistry(McpServerResourceCollection resources, SessionState state)
+    {
+        _resources = resources;
+        _state = state;
+    }
 
     /// <summary>
     /// Open listen requests. Kept because deregistration is a SERVER-side fact the wire cannot report:
@@ -105,8 +114,6 @@ public sealed class SubscriptionRegistry
                     // null becomes ABSENT only because McpJsonUtilities.DefaultOptions ignores nulls —
                     // the SDK's setting, not ours, and these properties carry no per-property JsonIgnore
                     // of their own (measured: JsonIgnoreCondition.Never emits `"toolsListChanged": null`).
-                    // Pinned on the wire by
-                    // McpSubscriptionTests.Subscribe_AcknowledgesFirst_ThenDeliversTaggedUpdates.
                     ToolsListChanged = null,
                     PromptsListChanged = null,
                     ResourcesListChanged = null,
@@ -153,48 +160,69 @@ public sealed class SubscriptionRegistry
     ///
     /// Leaving it unset is not the same thing and is not an option: the SDK then answers
     /// resources/subscribe with an empty success, so the client believes it subscribed and waits forever
-    /// for updates that can never come — with nothing in any log to explain it. This turns that silent
-    /// lie into a loud, accurate refusal.
-    ///
-    /// <c>Resources.Subscribe</c> stays advertised regardless: the SDK drops resourceSubscriptions from
-    /// the subscriptions/listen acknowledgement when the Resources capability is absent, so that bit is
-    /// load-bearing for the path peers does serve.
-    /// </summary>
+    /// with nothing to debug.
     public ValueTask<EmptyResult> HandleSubscribeAsync(
         RequestContext<SubscribeRequestParams> request,
-        CancellationToken cancellationToken) =>
+        CancellationToken cancellationToken)
+    {
         throw Unsupported(RequestMethods.ResourcesSubscribe, request.Server);
+    }
 
-    /// <inheritdoc cref="HandleSubscribeAsync"/>
     public ValueTask<EmptyResult> HandleUnsubscribeAsync(
         RequestContext<UnsubscribeRequestParams> request,
-        CancellationToken cancellationToken) =>
+        CancellationToken cancellationToken)
+    {
         throw Unsupported(RequestMethods.ResourcesUnsubscribe, request.Server);
+    }
 
     /// <summary>
-    /// -32601 is chosen for symmetry, not by accident: it is what the SDK itself answers when
-    /// subscriptions/listen is called on a pre-2026-07-28 session ("requires a newer protocol revision
-    /// ...; the negotiated protocol version is '2025-11-25'"). Mirroring it gives a client one consistent
-    /// story across both subscription methods, and -32601 is the code a client reads as "this capability
-    /// is absent here" — which is exactly true. Reads and lists are unaffected and keep working.
+    /// True when this server actually serves <paramref name="uri"/>; concrete URIs match templates via the SDK.
+    ///
+    /// A TEMPLATE string is rejected even though McpServerResource.IsMatch accepts it — and a client can
+    /// plausibly send one, since 'peers://channel/{id}' is exactly what resources/templates/list hands
+    /// it. Granting it would put a URI in the ack that the fan-out, which only ever offers concrete URIs,
+    /// can never match: granted and permanently silent. RFC 6570 reserves braces for expressions, so an
+    /// expanded URI never has one.
     /// </summary>
+    private bool Serves(string uri)
+    {
+        if (uri.Contains('{'))
+            return false;
+
+        foreach (var resource in _resources)
+        {
+            if (resource.IsMatch(uri))
+                return true;
+        }
+
+        return false;
+    }
+
     private static McpProtocolException Unsupported(string method, McpServer server) =>
         new($"The method '{method}' is not served by peers; resource subscriptions are available only via " +
             $"'{RequestMethods.SubscriptionsListen}' (MCP 2026-07-28, SEP-2575), and the negotiated protocol " +
             $"version is '{server.NegotiatedProtocolVersion}'. Reading and listing resources is unaffected: " +
-            "read the resource on demand, or poll the peer_list / scratchpad_read tools.",
+            "read the resource on demand, or poll with the read / peers tools.",
             McpErrorCode.MethodNotFound);
 
     /// <summary>
     /// Maps one poll batch of broker events to the resources they changed and notifies every subscriber
     /// granted those URIs — and only them. At most one notification per URI per batch: resources/updated
     /// is a hint to re-read, so N changes to one resource in one batch are one hint, not N.
+    ///
+    /// Quiet whispers never leave their participants: a whisper event contributes its channel URI to this
+    /// session's dispatch only when this session authored it or was mentioned. Everyone else's subscriber
+    /// lists never see the URI at all — there is no notification to suppress downstream because none is
+    /// ever generated.
     /// </summary>
     public async Task NotifyEventsAsync(IEnumerable<PeerEvent> events, CancellationToken cancellationToken = default)
     {
         var uris = new HashSet<string>(StringComparer.Ordinal);
         foreach (var evt in events)
         {
+            if (evt.Type == EventTypes.ChannelMessageAdded && IsWhisperNotForUs(evt.Payload))
+                continue;
+
             if (ResourceUriFor(evt) is { } uri)
                 uris.Add(uri);
         }
@@ -210,16 +238,9 @@ public sealed class SubscriptionRegistry
 
         foreach (var subscription in listeners)
         {
-            // The snapshot above can be stale by now, and a stale send is NOT benign: on a live session a
-            // client that cancels one subscriptions/listen would receive a resources/updated tagged with
-            // the id it just cancelled, after the server processed the cancellation. Re-checked here,
-            // immediately before the send, against a flag deregistration clears first.
             if (!subscription.IsActive)
                 continue;
 
-            // Per subscriber, mirroring the per-batch catch in ChannelNotifier: the poll cursor has already
-            // advanced, so one throwing subscriber must not cost the others — or the remaining URIs in this
-            // batch — a notification that can never be re-sent.
             try
             {
                 await subscription.Server.SendNotificationAsync(
@@ -236,49 +257,61 @@ public sealed class SubscriptionRegistry
         }
     }
 
+    /// <summary>True when this quiet message names neither us as author nor us as a mention.</summary>
+    private bool IsWhisperNotForUs(string payload)
+    {
+        if (_state.PeerId is { } me)
+        {
+            try
+            {
+                using var doc = JsonDocument.Parse(payload);
+                var root = doc.RootElement;
+                var quiet = root.TryGetProperty("quiet", out var q) && q.ValueKind == JsonValueKind.True;
+                if (!quiet) return false;
+
+                if (root.TryGetProperty("author_peer_id", out var author) && author.GetString() == me)
+                    return false;
+
+                if (root.TryGetProperty("recipient_peer_ids", out var recipients))
+                    foreach (var r in recipients.EnumerateArray())
+                        if (r.GetString() == me)
+                            return false;
+
+                return true;
+            }
+            catch (JsonException)
+            {
+                return false; // unparsable payloads broadcast; delivery stays best-effort-loud
+            }
+        }
+        return false;
+    }
+
     /// <summary>The resource a broker event changed, or null when it changes none of them.</summary>
     internal static string? ResourceUriFor(PeerEvent evt) => evt.Type switch
     {
         EventTypes.PeerRegistered or EventTypes.PeerUpdated or EventTypes.PeerExpired => PeerResources.PeersUri,
-        EventTypes.ScratchpadEntryAdded or EventTypes.ScratchpadResolved or EventTypes.ScratchpadClosed =>
-            ScratchpadIdOf(evt) is { } padId ? PeerResources.ScratchpadUri(padId) : null,
+        EventTypes.ChannelMessageAdded => ChannelIdOf(evt) is { } id ? PeerResources.ChannelUri(id) : null,
         _ => null,
     };
 
-    private static string? ScratchpadIdOf(PeerEvent evt)
+    private static string? ChannelIdOf(PeerEvent evt)
     {
         try
         {
             using var doc = JsonDocument.Parse(evt.Payload);
-            return doc.RootElement.GetProp("scratchpad_id");
+            return doc.RootElement.GetProp("channel_id");
         }
         catch { return null; }
-    }
-
-    /// <summary>
-    /// True when this server actually serves <paramref name="uri"/>; concrete URIs match templates via the SDK.
-    ///
-    /// A TEMPLATE string is rejected even though McpServerResource.IsMatch accepts it — and a client can
-    /// plausibly send one, since 'peers://scratchpad/{id}' is exactly what resources/templates/list hands
-    /// it. Granting it would put a URI in the ack that the fan-out, which only ever offers concrete URIs,
-    /// can never match: granted and permanently silent, the same failure class as a silently-accepted
-    /// resources/subscribe. RFC 6570 reserves braces for expressions, so an expanded URI never has one.
-    /// </summary>
-    private bool Serves(string uri)
-    {
-        if (uri.Contains('{'))
-            return false;
-
-        foreach (var resource in _resources)
-        {
-            if (resource.IsMatch(uri))
-                return true;
-        }
-
-        return false;
     }
 
     // Serialized fresh per notification: a JsonNode can only be parented once.
     private static JsonNode SubscriptionId(RequestId id) =>
         JsonSerializer.SerializeToNode(id, McpJsonUtilities.DefaultOptions)!;
+}
+
+internal static class JsonElementExtensions
+{
+    public static string? GetProp(this JsonElement el, string name) =>
+        el.TryGetProperty(name, out var val) ? val.GetString() : null;
 }

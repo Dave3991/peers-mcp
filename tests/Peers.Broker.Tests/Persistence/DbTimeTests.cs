@@ -100,44 +100,47 @@ public sealed class DbTimeTests : IDisposable
     }
 
     // ──────────────────────────────────────────────
-    // 5. ScratchpadRepository round-trip — CreatedAt Kind == Utc
+    // 5. ChannelRepository round-trip — timestamps and sequence
     // ──────────────────────────────────────────────
 
     [Fact]
-    public async Task ScratchpadRepository_CreatedAt_HasUtcKind()
+    public async Task ChannelRepository_RoundTrip_KeepsSequenceAndTimestamps()
     {
-        var pads = new ScratchpadRepository(_db.Factory);
+        var channels = new ChannelRepository(_db.Factory);
 
-        var pad = await pads.InsertAsync(new Scratchpad
+        var channel = await channels.InsertAsync(new ChannelRow
         {
-            ScratchpadId = Guid.NewGuid().ToString("N"),
-            Type = "review",
-            Title = "Test pad",
-            Status = "open",
+            ChannelId = Guid.NewGuid().ToString("N")[..16],
+            Name = $"time-{Guid.NewGuid():N}",
+            RepoRoot = "/repo",
             CreatedByPeerId = "peer-test",
-            CreatedAt = DateTime.UtcNow,
+            CreatedAt = DateTime.UtcNow.ToString("O"),
         }, CancellationToken.None);
 
-        // Append an entry so GetEntriesAsync has something to return
-        var entry = await pads.AppendEntryAsync(new ScratchpadEntry
+        var first = await channels.AppendMessageAsync(new MessageRow
         {
-            EntryId = Guid.NewGuid().ToString("N"),
-            ScratchpadId = pad.ScratchpadId,
+            MessageId = Guid.NewGuid().ToString("N")[..16],
+            ChannelId = channel.ChannelId,
             AuthorPeerId = "peer-test",
-            Content = "test content",
-            ContentBytes = 12,
-            CreatedAt = DateTime.UtcNow,
+            Content = "first",
+            CreatedAt = DateTime.UtcNow.ToString("O"),
         }, CancellationToken.None);
-        Assert.NotNull(entry);
+        var second = await channels.AppendMessageAsync(new MessageRow
+        {
+            MessageId = Guid.NewGuid().ToString("N")[..16],
+            ChannelId = channel.ChannelId,
+            AuthorPeerId = "peer-test",
+            Content = "second",
+            CreatedAt = DateTime.UtcNow.ToString("O"),
+        }, CancellationToken.None);
 
-        var loaded = await pads.GetAsync(pad.ScratchpadId, CancellationToken.None);
-        Assert.NotNull(loaded);
-        Assert.Equal(DateTimeKind.Utc, loaded.CreatedAt.Kind);
+        // Per-channel sequence is assigned by the insert, monotonically.
+        Assert.Equal(1, first.Seq);
+        Assert.Equal(2, second.Seq);
 
-        var entries = await pads.GetEntriesAsync(pad.ScratchpadId, ct: CancellationToken.None);
-        Assert.NotEmpty(entries);
-        foreach (var e in entries)
-            Assert.Equal(DateTimeKind.Utc, e.CreatedAt.Kind);
+        var loaded = await channels.ReadMessagesAsync(channel.ChannelId, "peer-test", 0, 10, CancellationToken.None);
+        Assert.Equal(2, loaded.Count);
+        Assert.All(loaded, m => Assert.False(string.IsNullOrWhiteSpace(m.CreatedAt)));
     }
 
     // ──────────────────────────────────────────────

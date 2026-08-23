@@ -16,6 +16,23 @@ public sealed record BrokerStatus
     public BrokerInfo? Discovery { get; init; }
 }
 
+
+/// <summary>
+/// Version of the broker's HTTP request/response shapes, reported by /health alongside the SQLite
+/// schema version. Bump whenever a route's payload changes incompatibly for a peer of a different
+/// age — e.g. RegisterPeerResponse gaining a required field. <see cref="BrokerRuntime.EnsureBrokerRunningAsync"/>
+/// replaces any running broker advertising an older contract; without that check a long-lived daemon
+/// silently breaks every freshly-spawned MCP server while pre-change servers keep working, which is
+/// exactly how registration broke in August 2026 (latestEventId added, daemon three days old).
+///
+/// 2: channels replace scratchpads — /scratchpads* routes are gone and /channels* are new, so a
+/// pre-channel daemon cannot serve a current MCP server at all.
+/// </summary>
+public static class BrokerContract
+{
+    public const int Current = 2;
+}
+
 public static class BrokerRuntime
 {
     private const int DefaultPort = 7856;
@@ -86,7 +103,13 @@ public static class BrokerRuntime
 
         var status = await GetStatusAsync(ct);
         if (status.IsHealthy && status.Discovery is not null)
-            return status.Discovery;
+        {
+            if (await ReportedContractAsync(status.Port, ct) >= BrokerContract.Current)
+                return status.Discovery;
+
+            await StopOutdatedBrokerAsync(status.Discovery, ct);
+            status = await GetStatusAsync(ct);
+        }
 
         await using var lockStream = await AcquireLaunchLockAsync(ct);
 
@@ -128,6 +151,61 @@ public static class BrokerRuntime
         {
             return false;
         }
+    }
+
+    /// <summary>
+    /// Contract version the broker at <paramref name="port"/> advertises on /health. Pre-contract
+    /// brokers — and anything unparseable — report 0, which always reads as outdated.
+    /// </summary>
+    private static async Task<int> ReportedContractAsync(int port, CancellationToken ct)
+    {
+        try
+        {
+            using var http = new HttpClient
+            {
+                BaseAddress = new Uri($"http://127.0.0.1:{port}"),
+                Timeout = TimeSpan.FromSeconds(2),
+            };
+            using var doc = JsonDocument.Parse(await http.GetStringAsync("/health", ct));
+            return doc.RootElement.TryGetProperty("contract", out var contract) && contract.TryGetInt32(out var value)
+                ? value
+                : 0;
+        }
+        catch
+        {
+            return 0;
+        }
+    }
+
+    /// <summary>
+    /// Stops a running broker older than this build's <see cref="BrokerContract.Current"/> and clears its
+    /// discovery record so the launch path starts a fresh one on the same port. Refuses to kill a pid that
+    /// is not Peers.Broker — a recycled pid must never be shot on a stale file's word. Sessions attached
+    /// to the old broker self-heal: their heartbeats get 404 and HeartbeatService re-registers against
+    /// the replacement.
+    /// </summary>
+    private static async Task StopOutdatedBrokerAsync(BrokerInfo discovery, CancellationToken ct)
+    {
+        try
+        {
+            using var process = Process.GetProcessById(discovery.Pid);
+            if (!process.ProcessName.Contains("Peers.Broker", StringComparison.OrdinalIgnoreCase))
+                throw new InvalidOperationException(
+                    $"The peers discovery file names pid {discovery.Pid} as '{process.ProcessName}', not " +
+                    "Peers.Broker. A broker older than this build is running; stop it manually and retry. " +
+                    "Refusing to kill an unrecognized process.");
+
+            process.Kill(entireProcessTree: true);
+            await process.WaitForExitAsync(ct).WaitAsync(TimeSpan.FromSeconds(10), ct);
+        }
+        catch (ArgumentException)
+        {
+            // Pid already gone — exactly the state we wanted.
+        }
+
+        var discoveryFile = PeersPaths.GetDiscoveryFile();
+        if (File.Exists(discoveryFile))
+            File.Delete(discoveryFile);
     }
 
     private static async Task<BrokerInfo> WaitForBrokerReadyAsync(int port, Process? launchedProcess, CancellationToken ct)

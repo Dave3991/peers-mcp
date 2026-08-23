@@ -1,5 +1,6 @@
 using System.Text.Json;
 using FluentResults;
+using Microsoft.Extensions.Logging;
 using Peers.Broker.Errors;
 using Peers.Broker.Persistence.Repositories;
 using Peers.Shared.Contracts;
@@ -8,7 +9,7 @@ using Peers.Shared.Models;
 
 namespace Peers.Broker.Services;
 
-public sealed class PeerService(PeerRepository peers, EventService eventService)
+public sealed class PeerService(PeerRepository peers, EventService eventService, ChannelService channelService, ILogger<PeerService>? logger = null)
 {
     private static readonly TimeSpan LeaseDuration = TimeSpan.FromMinutes(2);
     // 7d (not 24h) so ScratchpadService.FindActiveReplacementAsync can still reroute a restarted reviewer to their live session across multi-day review pads.
@@ -47,6 +48,58 @@ public sealed class PeerService(PeerRepository peers, EventService eventService)
         var sameBranch = otherPeers.Where(p => p.PeerId != id && p.Branch == req.Branch && req.Branch is not null).ToList();
         var recipients = sameBranch.Count > 0 ? sameBranch : otherPeers.Where(p => p.PeerId != id).ToList();
         var recipientPeerIds = recipients.Select(p => p.PeerId).ToArray();
+
+        if (resumedPeer is null)
+        {
+            // Fresh joins announce themselves on every channel scoped to this repo plus global channels.
+            // ListAsync(null) returns ALL channels (@repo IS NULL short-circuits the WHERE clause).
+            var matchedChannels = (await channelService.ListAsync(repoRoot: null, 100, ct)).Channels
+                .Where(c => c.RepoRoot is null || c.RepoRoot == req.RepoRoot)
+                .ToList();
+
+            if (matchedChannels.Count > 0)
+            {
+                // Combined wake recipients FIRST, board rows NEXT, wake LAST — so rows are readable
+                // before anyone is woken. Net-new recipients: live members of any repo-matched
+                // channel, or everyone when a global channel matched. Union-distinct: EmitAsync
+                // inserts one inbox row per array entry.
+                var livePeers = await peers.ListAsync(includeExpired: false, ct: ct);
+                var netNew = livePeers
+                    .Where(p => p.PeerId != id)
+                    .Where(p => matchedChannels.Any(c => c.RepoRoot == p.RepoRoot) ||
+                                matchedChannels.Any(c => c.RepoRoot is null))
+                    .Select(p => p.PeerId);
+
+                recipientPeerIds = recipientPeerIds.Union(netNew).ToArray();
+
+                foreach (var channel in matchedChannels)
+                {
+                    Result<SendMessageResponse?> sendResult;
+                    try
+                    {
+                        sendResult = await channelService.SendAsync(channel.ChannelId, new SendMessageRequest
+                        {
+                            AuthorPeerId = id,
+                            Content = $"peer {id[..8]} ({req.Tool}) joined {req.RepoRoot ?? "global"}",
+                            Quiet = false,
+                            To = null,
+                        }, ct);
+                    }
+                    catch (Exception ex) when (ex is not OperationCanceledException)
+                    {
+                        logger?.LogWarning(ex, "Join announcement to channel {ChannelId} failed for peer {PeerId}", channel.ChannelId, id);
+                        continue;
+                    }
+
+                    if (sendResult.IsFailed)
+                    {
+                        logger?.LogWarning("Join announcement to channel {ChannelId} failed for peer {PeerId}: {Errors}",
+                            channel.ChannelId, id, string.Join("; ", sendResult.Errors.Select(e => e.Message)));
+                        continue;
+                    }
+                }
+            }
+        }
 
         var eventId = await eventService.EmitAsync(EventTypes.PeerRegistered,
             JsonSerializer.Serialize(new { peer_id = id, tool = req.Tool, repo_root = req.RepoRoot, recipient_peer_ids = recipientPeerIds }),

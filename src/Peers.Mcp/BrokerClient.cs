@@ -43,27 +43,25 @@ public sealed class BrokerClient : IDisposable
         return (await GetAsync<List<Peer>>($"/peers{query}"))!;
     }
 
-    // Scratchpads
-    public async Task<CreateScratchpadResponse> CreateScratchpadAsync(CreateScratchpadRequest req) =>
-        (await PostAsync<CreateScratchpadResponse>("/scratchpads", req))!;
+    // Channels
+    public async Task<CreateChannelResponse> CreateChannelAsync(CreateChannelRequest req) =>
+        (await PostAsync<CreateChannelResponse>("/channels", req))!;
 
-    public async Task<AppendEntryResponse?> AppendEntryAsync(string padId, AppendEntryRequest req) =>
-        await PostAsync<AppendEntryResponse>($"/scratchpads/{padId}/entries", req);
-
-    public async Task<ReadScratchpadResponse?> ReadScratchpadAsync(string padId, int limit = 200, int offset = 0) =>
-        await GetAsync<ReadScratchpadResponse>($"/scratchpads/{padId}?limit={limit}&offset={offset}");
-
-    public async Task<List<Scratchpad>> ListScratchpadsAsync(string? type = null, string? repoRoot = null, string? status = null, int limit = 50, int offset = 0)
+    public async Task<ListChannelsResponse> ListChannelsAsync(string? repoRoot = null, int limit = 100)
     {
-        var query = BuildQuery(("type", type), ("repo_root", repoRoot), ("status", status), ("limit", limit.ToString()), ("offset", offset.ToString()));
-        return (await GetAsync<List<Scratchpad>>($"/scratchpads{query}"))!;
+        var query = BuildQuery(("repo_root", repoRoot), ("limit", limit.ToString()));
+        return (await GetAsync<ListChannelsResponse>($"/channels{query}"))!;
     }
 
-    public async Task ResolveScratchpadAsync(string padId, ResolveScratchpadRequest req) =>
-        await PatchAsync($"/scratchpads/{padId}/resolve", req);
+    public async Task<SendMessageResponse?> SendMessageAsync(string channelId, SendMessageRequest req) =>
+        await PostAsync<SendMessageResponse>($"/channels/{Uri.EscapeDataString(channelId)}/messages", req);
 
-    public async Task CloseScratchpadAsync(string padId, CloseScratchpadRequest req) =>
-        await PatchAsync($"/scratchpads/{padId}/close", req);
+    public async Task<ReadMessagesResponse?> ReadChannelMessagesAsync(
+        string channelId, string? viewer, long sinceSeq = 0, int limit = 200)
+    {
+        var query = BuildQuery(("viewer", viewer), ("since_seq", sinceSeq.ToString()), ("limit", limit.ToString()));
+        return await GetAsync<ReadMessagesResponse>($"/channels/{Uri.EscapeDataString(channelId)}/messages{query}");
+    }
 
     // Artifacts
     public async Task<PublishArtifactResponse> PublishArtifactAsync(PublishArtifactRequest req) =>

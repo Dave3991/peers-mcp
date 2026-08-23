@@ -17,62 +17,6 @@ public static class OutputShaper
     }
 
     /// <summary>
-    /// Shape a <see cref="ReadScratchpadResponse"/> to fit within <paramref name="maxChars"/>.
-    /// Returns the full serialization unchanged when it already fits (back-compat).
-    /// On overflow, greedily includes entries and adds truncation metadata.
-    /// Always includes at least 1 entry whole, even if it alone exceeds maxChars.
-    /// </summary>
-    public static string ShapeScratchpadRead(
-        ReadScratchpadResponse resp,
-        int offset,
-        int maxChars,
-        JsonSerializerOptions opts)
-    {
-        // Fast path: full response fits — return as-is, no new fields.
-        var full = JsonSerializer.Serialize(new { scratchpad = resp.Scratchpad, entries = resp.Entries }, opts);
-        if (full.Length <= maxChars)
-            return full;
-
-        // Greedy partial: accumulate entries, checking size after each addition.
-        var included = new List<ScratchpadEntry>();
-
-        foreach (var entry in resp.Entries)
-        {
-            included.Add(entry);
-
-            // Build candidate envelope to check size.
-            var candidate = JsonSerializer.Serialize(new
-            {
-                scratchpad = resp.Scratchpad,
-                entries = included,
-                truncated = true,
-                included_count = included.Count,
-                page_entry_count = resp.Entries.Count,
-                next_offset = offset + included.Count,
-            }, opts);
-
-            if (candidate.Length > maxChars && included.Count > 1)
-            {
-                // Over limit with more than one entry — remove last and stop.
-                included.RemoveAt(included.Count - 1);
-                break;
-            }
-            // else: either still fits, or it's the first entry (must keep ≥1).
-        }
-
-        // Re-serialize the settled result.
-        return JsonSerializer.Serialize(new
-        {
-            scratchpad = resp.Scratchpad,
-            entries = included,
-            truncated = true,
-            included_count = included.Count,
-            page_entry_count = resp.Entries.Count,
-            next_offset = offset + included.Count,
-        }, opts);
-    }
-
-    /// <summary>
     /// Shape an <see cref="Artifact"/> for the artifact_get tool.
     /// Returns the full serialization unchanged when no range is requested and it fits (back-compat).
     /// On overflow or explicit range, returns a paged envelope with offset/next_offset/total_chars.

@@ -18,7 +18,8 @@ public sealed class RetentionTests : IDisposable
         var inbox = new InboxRepository(_db.Factory);
         var events = new EventRepository(_db.Factory);
         var eventSvc = new EventService(events, peers, inbox);
-        var peerSvc = new PeerService(peers, eventSvc);
+        var channels = new ChannelService(new ChannelRepository(_db.Factory), peers, eventSvc, new RecipientResolver(peers));
+        var peerSvc = new PeerService(peers, eventSvc, channels);
         return (peers, inbox, events, peerSvc, eventSvc);
     }
 

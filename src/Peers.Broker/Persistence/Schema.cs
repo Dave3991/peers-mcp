@@ -4,7 +4,7 @@ namespace Peers.Broker.Persistence;
 
 public static class Schema
 {
-    public const int CurrentVersion = 2;
+    public const int CurrentVersion = 3;
 
     public static void Migrate(SqliteConnection conn)
     {
@@ -14,6 +14,7 @@ public static class Schema
 
         if (version < 1) ApplyV1(conn);
         if (version < 2) ApplyV2(conn);
+        if (version < 3) ApplyV3(conn);
 
         using var setVersion = conn.CreateCommand();
         setVersion.CommandText = $"PRAGMA user_version = {CurrentVersion};";
@@ -128,6 +129,48 @@ public static class Schema
 
             CREATE INDEX IF NOT EXISTS idx_inbox_peer ON peer_inbox(peer_id, acked_at);
             CREATE INDEX IF NOT EXISTS idx_inbox_event ON peer_inbox(event_id);
+            """;
+
+        using var cmd = conn.CreateCommand();
+        cmd.CommandText = sql;
+        cmd.ExecuteNonQuery();
+    }
+
+    /// <summary>
+    /// Channels are the one communication primitive: named boards scoped optionally to a repo, with
+    /// append-only mention-addressed messages. Quiet messages ride the same table — visibility is
+    /// filtered at read time, so there is exactly one copy of every message ever stored. The scratchpad
+    /// tables this replaces are dropped: their data was session-scoped coordination, not durable state.
+    /// </summary>
+    private static void ApplyV3(SqliteConnection conn)
+    {
+        var sql = """
+            CREATE TABLE IF NOT EXISTS channels (
+                channel_id          TEXT PRIMARY KEY,
+                name                TEXT NOT NULL,
+                repo_root           TEXT,
+                created_by_peer_id  TEXT NOT NULL,
+                created_at          TEXT NOT NULL DEFAULT (datetime('now'))
+            );
+
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_channels_scope ON channels(COALESCE(repo_root, ''), name);
+
+            CREATE TABLE IF NOT EXISTS channel_messages (
+                message_id      TEXT PRIMARY KEY,
+                channel_id      TEXT NOT NULL REFERENCES channels(channel_id) ON DELETE CASCADE,
+                seq             INTEGER NOT NULL,
+                author_peer_id  TEXT NOT NULL,
+                content         TEXT NOT NULL,
+                mentions        TEXT NOT NULL DEFAULT '[]',
+                quiet           INTEGER NOT NULL DEFAULT 0,
+                created_at      TEXT NOT NULL DEFAULT (datetime('now'))
+            );
+
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_channel_messages_seq ON channel_messages(channel_id, seq);
+            CREATE INDEX IF NOT EXISTS idx_channel_messages_author ON channel_messages(author_peer_id);
+
+            DROP TABLE IF EXISTS scratchpad_entries;
+            DROP TABLE IF EXISTS scratchpads;
             """;
 
         using var cmd = conn.CreateCommand();

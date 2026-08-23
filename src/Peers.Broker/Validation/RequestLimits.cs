@@ -12,21 +12,22 @@ public static class RequestLimits
 
     private static int Utf8Bytes(string? s) => s is null ? 0 : Encoding.UTF8.GetByteCount(s);
 
-    public static IResult? ValidateScratchpadCreate(Shared.Contracts.CreateScratchpadRequest req)
+    public const int MaxChannelNameLength = 100;
+    public const int MaxMentionCount = 50;
+
+    public static IResult? ValidateChannelCreate(Shared.Contracts.CreateChannelRequest req)
     {
-        if (req.Title.Length > MaxTitleLength)
-            return Results.BadRequest(new { error = $"Title exceeds {MaxTitleLength} characters." });
-        if (Utf8Bytes(req.RequestedReviewers) > MaxJsonArrayBytes)
-            return Results.BadRequest(new { error = $"Requested reviewers JSON exceeds {MaxJsonArrayBytes} bytes." });
-        if (Utf8Bytes(req.ArtifactRefs) > MaxJsonArrayBytes)
-            return Results.BadRequest(new { error = $"Artifact refs JSON exceeds {MaxJsonArrayBytes} bytes." });
+        if (string.IsNullOrWhiteSpace(req.Name) || req.Name.Length > MaxChannelNameLength)
+            return Results.BadRequest(new { error = $"Channel name must be 1..{MaxChannelNameLength} characters." });
         return null;
     }
 
-    public static IResult? ValidateAppendEntry(Shared.Contracts.AppendEntryRequest req)
+    public static IResult? ValidateSendMessage(Shared.Contracts.SendMessageRequest req)
     {
         if (Utf8Bytes(req.Content) > MaxEntryContentBytes)
-            return Results.Json(new { error = $"Entry content exceeds {MaxEntryContentBytes / 1024} KB." }, statusCode: 413);
+            return Results.Json(new { error = $"Message content exceeds {MaxEntryContentBytes / 1024} KB." }, statusCode: 413);
+        if (req.To is { Length: > MaxMentionCount })
+            return Results.BadRequest(new { error = $"A message can mention at most {MaxMentionCount} peers." });
         return null;
     }
 

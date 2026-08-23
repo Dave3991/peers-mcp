@@ -16,11 +16,11 @@ public sealed class DiscoveryTests : IDisposable
         var peerRepo = new PeerRepository(_db.Factory);
         var inboxRepo = new InboxRepository(_db.Factory);
         var eventService = new EventService(eventRepo, peerRepo, inboxRepo);
-        return (peerRepo, new PeerService(peerRepo, eventService));
+        return (peerRepo, new PeerService(peerRepo, eventService, CreateChannelService(peerRepo, eventService)));
     }
 
-    private ScratchpadService CreateScratchpadService(PeerRepository peerRepo, EventService eventService) =>
-        new ScratchpadService(new ScratchpadRepository(_db.Factory), eventService, peerRepo, new RecipientResolver(peerRepo));
+    private ChannelService CreateChannelService(PeerRepository peerRepo, EventService eventService) =>
+        new ChannelService(new ChannelRepository(_db.Factory), peerRepo, eventService, new RecipientResolver(peerRepo));
 
     private ArtifactService CreateArtifactService(PeerRepository peerRepo, EventService eventService) =>
         new ArtifactService(new ArtifactRepository(_db.Factory), eventService, peerRepo);
@@ -61,61 +61,52 @@ public sealed class DiscoveryTests : IDisposable
         Assert.Contains(result, p => p.PeerId == resp.PeerId);
     }
 
-    // ── scratchpad_list: pagination + stable order ────────────────────────────
+    // ── channels: listing + repo scoping ──────────────────────────────────────
 
     [Fact]
-    public async Task ScratchpadList_Pagination_NewestFirstDisjointPages()
+    public async Task ChannelList_LimitAndOrdering_StableNewestFirst()
     {
         var (peerRepo, peerSvc) = CreatePeerService();
         var eventRepo = new EventRepository(_db.Factory);
         var inboxRepo = new InboxRepository(_db.Factory);
         var eventService = new EventService(eventRepo, peerRepo, inboxRepo);
-        var padSvc = CreateScratchpadService(peerRepo, eventService);
+        var channelSvc = CreateChannelService(peerRepo, eventService);
 
-        // Register a peer to use as creator
         var peer = await peerSvc.RegisterAsync(new RegisterPeerRequest
         {
-            Tool = "claude-code", MachineId = "m-pads", RepoRoot = "/repo",
+            Tool = "claude-code", MachineId = "m-channels", RepoRoot = "/repo",
         }, CancellationToken.None);
 
-        // Insert 5 scratchpads — they will be created fast enough to share the same created_at second,
-        // exercising the rowid tiebreaker
         const int total = 5;
-        var padIds = new List<string>();
+        var ids = new List<string>();
         for (var i = 0; i < total; i++)
         {
-            var result = await padSvc.CreateAsync(new CreateScratchpadRequest
+            var result = await channelSvc.CreateAsync(new CreateChannelRequest
             {
-                Type = "discussion",
-                Title = $"pad-{i}",
+                Name = $"chan-{i}",
                 RepoRoot = "/repo",
                 CreatedByPeerId = peer.PeerId,
             }, CancellationToken.None);
             Assert.True(result.IsSuccess);
-            padIds.Add(result.Value.ScratchpadId);
+            ids.Add(result.Value.ChannelId);
         }
 
-        // Fetch the full unpaginated list to establish the expected ordering
-        var allPads = await padSvc.ListAsync(null, null, null, 100, 0, CancellationToken.None);
-        Assert.Equal(total, allPads.Count);
+        var all = await channelSvc.ListAsync(null, 100, CancellationToken.None);
+        Assert.True(all.Channels.Length >= total);
 
-        // Page 0: first 2 (newest)
-        var page0 = await padSvc.ListAsync(null, null, null, 2, 0, CancellationToken.None);
-        // Page 1: next 2
-        var page1 = await padSvc.ListAsync(null, null, null, 2, 2, CancellationToken.None);
+        var limited = await channelSvc.ListAsync(null, 2, CancellationToken.None);
+        Assert.Equal(2, limited.Channels.Length);
 
-        Assert.Equal(2, page0.Count);
-        Assert.Equal(2, page1.Count);
+        // The limited page is a prefix of the full order (stable, newest first).
+        Assert.Equal(all.Channels.Take(2).Select(c => c.ChannelId), limited.Channels.Select(c => c.ChannelId));
 
-        // Pages must be disjoint
-        var page0Ids = page0.Select(p => p.ScratchpadId).ToHashSet();
-        var page1Ids = page1.Select(p => p.ScratchpadId).ToHashSet();
-        Assert.Empty(page0Ids.Intersect(page1Ids));
-
-        // Together they equal the first 4 in full-list order
-        var expected4Ids = allPads.Take(4).Select(p => p.ScratchpadId).ToList();
-        var combined = page0.Select(p => p.ScratchpadId).Concat(page1.Select(p => p.ScratchpadId)).ToList();
-        Assert.Equal(expected4Ids, combined);
+        // Repo scoping filters out other scopes.
+        await channelSvc.CreateAsync(new CreateChannelRequest
+        {
+            Name = "other-scope", RepoRoot = "/other", CreatedByPeerId = peer.PeerId,
+        }, CancellationToken.None);
+        var repoOnly = await channelSvc.ListAsync("/repo", 100, CancellationToken.None);
+        Assert.DoesNotContain(repoOnly.Channels, c => c.Name == "other-scope");
     }
 
     // ── artifact_list: pagination + stable order ──────────────────────────────

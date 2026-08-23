@@ -1,0 +1,86 @@
+namespace Peers.Shared.Contracts;
+
+public sealed class CreateChannelRequest
+{
+    public required string Name { get; init; }
+    public string? RepoRoot { get; init; }
+    public required string CreatedByPeerId { get; init; }
+}
+
+public sealed class CreateChannelResponse
+{
+    public required string ChannelId { get; init; }
+    public required string Name { get; init; }
+    public string? RepoRoot { get; init; }
+}
+
+public sealed class ListChannelsRequest
+{
+    public string? RepoRoot { get; init; }
+    public int? Limit { get; init; }
+}
+
+public sealed class ListChannelsResponse
+{
+    public required ChannelSummary[] Channels { get; init; }
+}
+
+public sealed class ChannelSummary
+{
+    public required string ChannelId { get; init; }
+    public required string Name { get; init; }
+    public string? RepoRoot { get; init; }
+    public required string CreatedByPeerId { get; init; }
+    public required string CreatedAt { get; init; }
+    public long MessageCount { get; init; }
+}
+
+public sealed class SendMessageRequest
+{
+    public required string AuthorPeerId { get; init; }
+
+    /// <summary>Explicit mentions: peer IDs (prefix match) or repo paths. Mentions are what makes a quiet message visible.</summary>
+    public string[]? To { get; init; }
+    public bool Quiet { get; init; }
+    public string? IdempotencyKey { get; init; }
+    public required string Content { get; init; }
+}
+
+public sealed class SendMessageResponse
+{
+    public required string MessageId { get; init; }
+    public required string ChannelId { get; init; }
+    public long Seq { get; init; }
+    public required string[] Mentions { get; init; }
+    public RecipientDeliveryStatus? Delivery { get; init; }
+}
+
+public sealed class ReadMessagesResponse
+{
+    public required string ChannelId { get; init; }
+    public required MessageDto[] Messages { get; init; }
+    public bool Truncated { get; init; }
+}
+
+public sealed class MessageDto
+{
+    public required string MessageId { get; init; }
+    public required string ChannelId { get; init; }
+    public long Seq { get; init; }
+    public required string AuthorPeerId { get; init; }
+    public required string Content { get; init; }
+    public required string[] Mentions { get; init; }
+    public bool Quiet { get; init; }
+    public required string CreatedAt { get; init; }
+}
+
+/// <summary>
+/// Delivery status of one message's mentions: who was online to be notified, whose session is gone,
+/// and which targets matched nobody. Same shape the scratchpad flow reported before channels.
+/// </summary>
+public sealed class RecipientDeliveryStatus
+{
+    public required string[] OnlinePeerIds { get; init; }
+    public required string[] OfflinePeerIds { get; init; }
+    public required string[] UnresolvedTargets { get; init; }
+}

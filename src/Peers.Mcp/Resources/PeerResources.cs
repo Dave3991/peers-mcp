@@ -1,51 +1,54 @@
-using Peers.Mcp.Tools;
+using System.Text.Json;
+using ModelContextProtocol.Protocol;
 
 namespace Peers.Mcp.Resources;
 
 /// <summary>
-/// The two MCP resources peers serves. Both are thin read-through views over tools that already
-/// exist (<c>peer_list</c>, <c>scratchpad_read</c>) — same payload, same size shaping — so a client
-/// can subscribe instead of polling a tool.
+/// The two MCP resources peers serves. Both are thin read-through views over the same broker calls the
+/// tools make, so a client can subscribe instead of polling a tool. Registration is automatic now, so
+/// neither resource has an inert phase: they read from the moment this process serves them.
 /// </summary>
 internal static class PeerResources
 {
     public const string PeersUri = "peers://peers";
-    public const string ScratchpadUriTemplate = "peers://scratchpad/{id}";
+    public const string ChannelUriTemplate = "peers://channel/{id}";
 
-    public static string ScratchpadUri(string scratchpadId) => $"peers://scratchpad/{scratchpadId}";
-
-    /// <summary>Same words as the tools' guard (PollTools.cs) so clients meet one idiom everywhere.</summary>
-    internal const string NotRegistered = """{"error":"Not registered. Call peer_register first."}""";
+    public static string ChannelUri(string channelId) => $"peers://channel/{channelId}";
 
     public const string PeersDescription = """
-        Live list of peer sessions known to the local broker — the same payload peer_list returns
-        (peer_id, tool, repo_root, branch, role, summary, focus_paths, self, is_expired), this session included.
+        Live roster of peer sessions known to the local broker — same payload as the peers tool
+        (peer_id, tool, repo_root, branch, role, summary, self, lease state).
 
         Subscriptions: notifications/resources/updated for this URI is A HINT TO RE-READ, never a delta stream.
         Delivery is best-effort and lossy: the broker cursor advances before dispatch, there is no retry, an MCP
-        process restart drops whatever was in flight, and granularity is the 5s poll — so several changes can
-        collapse into one notification, or into none. Always re-read when notified; never reconstruct state from
-        the notifications themselves.
-
-        Inert until peer_register has been called on this session: before that, reading returns
-        {"error":"Not registered. Call peer_register first."} and no updates are ever dispatched.
+        process restart drops whatever was in flight, and granularity is the 5s poll — several changes can
+        collapse into one notification, or into none. Always re-read when notified; never reconstruct roster
+        state from the notifications themselves.
         """;
 
-    public const string ScratchpadDescription = """
-        One scratchpad thread by id: metadata plus entries — the same payload scratchpad_read returns, with the
-        same size cap and truncation behaviour (re-read via scratchpad_read with an offset to page the rest).
+    public const string ChannelDescription = """
+        One channel's messages by id, oldest first — same payload and quiet-visibility rules as the read
+        tool: whispers addressed to other participants are never part of your view.
 
-        Subscriptions: notifications/resources/updated fires on entry appended, resolved, and closed, with the
-        same best-effort, lossy, hint-to-re-read semantics described on peers://peers. Always re-read when
-        notified; never reconstruct the thread from the notifications themselves.
-
-        Inert until peer_register has been called on this session: before that, reading returns
-        {"error":"Not registered. Call peer_register first."} and no updates are ever dispatched.
+        Subscriptions: notifications/resources/updated fires when any participant posts; quiet whispers
+        notify only their own participants. Same best-effort hint-to-re-read semantics as peers://peers.
         """;
 
-    public static Task<string> ReadPeers(BrokerClient client, SessionState state) =>
-        state.PeerId is null ? Task.FromResult(NotRegistered) : PeerTools.PeerList(client, state);
+    public static async Task<string> ReadPeers(BrokerClient client)
+    {
+        var peers = await client.ListPeersAsync();
+        return JsonSerializer.Serialize(peers, SnakeCase);
+    }
 
-    public static Task<string> ReadScratchpad(BrokerClient client, SessionState state, string id) =>
-        state.PeerId is null ? Task.FromResult(NotRegistered) : ScratchpadTools.Read(client, id);
+    /// <summary>
+    /// One channel's messages. The viewer is this session's own peer id, which is what filters quiet
+    /// whispers addressed to other participants out of the payload.
+    /// </summary>
+    public static async Task<string> ReadChannel(BrokerClient client, SessionState state, string id)
+    {
+        var messages = await client.ReadChannelMessagesAsync(id, state.PeerId);
+        return JsonSerializer.Serialize(messages, SnakeCase);
+    }
+
+    public static readonly JsonSerializerOptions SnakeCase = new() { PropertyNamingPolicy = JsonNamingPolicy.SnakeCaseLower };
 }

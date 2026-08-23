@@ -18,7 +18,7 @@ public sealed class PeerServiceTests : IDisposable
         var peerRepo = new PeerRepository(_db.Factory);
         var inboxRepo = new InboxRepository(_db.Factory);
         var eventService = new EventService(eventRepo, peerRepo, inboxRepo);
-        return (peerRepo, new PeerService(peerRepo, eventService));
+        return (peerRepo, new PeerService(peerRepo, eventService, new ChannelService(new ChannelRepository(_db.Factory), peerRepo, eventService, new RecipientResolver(peerRepo))));
     }
 
     private PeerService CreateService()
@@ -27,7 +27,7 @@ public sealed class PeerServiceTests : IDisposable
         var peerRepo = new PeerRepository(_db.Factory);
         var inboxRepo = new InboxRepository(_db.Factory);
         var eventService = new EventService(eventRepo, peerRepo, inboxRepo);
-        return new PeerService(peerRepo, eventService);
+        return new PeerService(peerRepo, eventService, new ChannelService(new ChannelRepository(_db.Factory), peerRepo, eventService, new RecipientResolver(peerRepo)));
     }
 
     [Fact]
@@ -165,7 +165,8 @@ public sealed class PeerServiceTests : IDisposable
         var eventRepo = new EventRepository(_db.Factory);
         var peerRepo = new PeerRepository(_db.Factory);
         var inboxRepo = new InboxRepository(_db.Factory);
-        var svc = new PeerService(peerRepo, new EventService(eventRepo, peerRepo, inboxRepo));
+        var svc = new PeerService(peerRepo, new EventService(eventRepo, peerRepo, inboxRepo),
+            new ChannelService(new ChannelRepository(_db.Factory), peerRepo, new EventService(eventRepo, peerRepo, inboxRepo), new RecipientResolver(peerRepo)));
 
         var resp = await svc.RegisterAsync(new RegisterPeerRequest
         {
@@ -310,5 +311,185 @@ public sealed class PeerServiceTests : IDisposable
         Assert.NotEqual(first.PeerId, second.PeerId);
     }
 
+    // --- Join announcements: a fresh join posts a loud row on every repo-matched / global channel
+    // --- and wakes every member exactly once. Resume stays byte-identical to pre-change behavior.
+
+    private (PeerRepository peerRepo, EventService events, ChannelService channels) CreateChannels()
+    {
+        var peerRepo = new PeerRepository(_db.Factory);
+        var events = new EventService(new EventRepository(_db.Factory), peerRepo, new InboxRepository(_db.Factory));
+        var channels = new ChannelService(new ChannelRepository(_db.Factory), peerRepo, events, new RecipientResolver(peerRepo));
+        return (peerRepo, events, channels);
+    }
+
+    private PeerService SvcFor(PeerRepository peerRepo, EventService events, ChannelService channels)
+        => new(peerRepo, events, channels);
+
+    private async Task<string> ChannelAsync(ChannelService channels, string creatorId, string name, string? repoRoot)
+    {
+        var res = await channels.CreateAsync(new CreateChannelRequest { Name = name, RepoRoot = repoRoot, CreatedByPeerId = creatorId }, CancellationToken.None);
+        Assert.True(res.IsSuccess);
+        return res.Value.ChannelId;
+    }
+
+    private Task<long> CountUnackedInboxAsync(string peerId, string eventType = "peer.registered")
+        => _db.Factory.ReadAsync(async conn =>
+        {
+            using var cmd = conn.CreateCommand();
+            cmd.CommandText = """
+                SELECT COUNT(*) FROM peer_inbox i
+                JOIN events e ON e.event_id = i.event_id
+                WHERE i.peer_id = @id AND i.acked_at IS NULL AND e.type = @type
+                """;
+            cmd.Parameters.AddWithValue("@id", peerId);
+            cmd.Parameters.AddWithValue("@type", eventType);
+            return Convert.ToInt64(await cmd.ExecuteScalarAsync());
+        }, CancellationToken.None);
+
+    private Task<bool> HasInboxNamingAsync(string peerId, string otherPeerId)
+        => _db.Factory.ReadAsync(async conn =>
+        {
+            using var cmd = conn.CreateCommand();
+            cmd.CommandText = """
+                SELECT COUNT(*) FROM peer_inbox i
+                JOIN events e ON e.event_id = i.event_id
+                WHERE i.peer_id = @id AND i.acked_at IS NULL AND e.type = 'peer.registered'
+                  AND e.payload LIKE '%' || @other || '%'
+                """;
+            cmd.Parameters.AddWithValue("@id", peerId);
+            cmd.Parameters.AddWithValue("@other", otherPeerId);
+            return Convert.ToInt64(await cmd.ExecuteScalarAsync()) > 0;
+        }, CancellationToken.None);
+
+    private Task<long> CountChannelMessagesAsync(string channelId)
+        => _db.Factory.ReadAsync(async conn =>
+        {
+            using var cmd = conn.CreateCommand();
+            cmd.CommandText = "SELECT COUNT(*) FROM channel_messages WHERE channel_id = @id";
+            cmd.Parameters.AddWithValue("@id", channelId);
+            return Convert.ToInt64(await cmd.ExecuteScalarAsync());
+        }, CancellationToken.None);
+
+    [Fact]
+    public async Task FreshJoin_GlobalChannel_NotifyCrossRepoLivePeer()
+    {
+        var (peerRepo, events, channels) = CreateChannels();
+        var svc = SvcFor(peerRepo, events, channels);
+
+        var a = await svc.RegisterAsync(new RegisterPeerRequest { Tool = "claude-code", MachineId = "m-a", RepoRoot = "/repo-a", Branch = "main" }, CancellationToken.None);
+        await ChannelAsync(channels, a.PeerId, "general", repoRoot: null);
+
+        var b = await svc.RegisterAsync(new RegisterPeerRequest { Tool = "codex", MachineId = "m-b", RepoRoot = "/repo-b", Branch = "main" }, CancellationToken.None);
+
+        Assert.True(await HasInboxNamingAsync(a.PeerId, b.PeerId));
+    }
+
+    [Fact]
+    public async Task FreshJoin_TwoMatchingChannels_OneWakePerPerson()
+    {
+        var (peerRepo, events, channels) = CreateChannels();
+        var svc = SvcFor(peerRepo, events, channels);
+
+        var member = await svc.RegisterAsync(new RegisterPeerRequest { Tool = "claude-code", MachineId = "m-member", RepoRoot = "/other-repo", Branch = "main" }, CancellationToken.None);
+        await ChannelAsync(channels, member.PeerId, "scoped", "/repo");
+        await ChannelAsync(channels, member.PeerId, "global", repoRoot: null);
+
+        var joiner = await svc.RegisterAsync(new RegisterPeerRequest { Tool = "codex", MachineId = "m-joiner", RepoRoot = "/repo", Branch = "main" }, CancellationToken.None);
+        Assert.False(joiner.Resumed);
+
+        Assert.Equal(1, await CountUnackedInboxAsync(member.PeerId));
+        Assert.Equal(0, await CountUnackedInboxAsync(joiner.PeerId));
+    }
+
+    [Fact]
+    public async Task Resume_NoBoardRows_FanoutUnchanged()
+    {
+        var (peerRepo, events, channels) = CreateChannels();
+        var svc = SvcFor(peerRepo, events, channels);
+
+        var first = await svc.RegisterAsync(new RegisterPeerRequest { Tool = "claude-code", MachineId = "m-x", RepoRoot = "/r", Branch = "main" }, CancellationToken.None);
+        await svc.DeregisterAsync(first.PeerId, CancellationToken.None);
+
+        var rowsBefore = await CountChannelMessagesTotal();
+        var second = await svc.RegisterAsync(new RegisterPeerRequest { Tool = "claude-code", MachineId = "m-x", RepoRoot = "/r", Branch = "main" }, CancellationToken.None);
+
+        Assert.True(second.Resumed);
+        Assert.Equal(rowsBefore, await CountChannelMessagesTotal());
+    }
+
+    [Fact]
+    public async Task NoChannels_BehaviorUnchanged()
+    {
+        var (peerRepo, events, channels) = CreateChannels();
+        var svc = SvcFor(peerRepo, events, channels);
+
+        var a = await svc.RegisterAsync(new RegisterPeerRequest { Tool = "claude-code", MachineId = "m-a", RepoRoot = "/repo", Branch = "main" }, CancellationToken.None);
+        var b = await svc.RegisterAsync(new RegisterPeerRequest { Tool = "codex", MachineId = "m-b", RepoRoot = "/repo", Branch = "main" }, CancellationToken.None);
+
+        Assert.Equal(1, await CountUnackedInboxAsync(a.PeerId));
+        Assert.True(await HasInboxNamingAsync(a.PeerId, b.PeerId));
+    }
+
+    [Fact]
+    public async Task OtherRepoChannel_MembersUntouched()
+    {
+        var (peerRepo, events, channels) = CreateChannels();
+        var svc = SvcFor(peerRepo, events, channels);
+
+        var member = await svc.RegisterAsync(new RegisterPeerRequest { Tool = "claude-code", MachineId = "m-member", RepoRoot = "/other-repo", Branch = "main" }, CancellationToken.None);
+        await ChannelAsync(channels, member.PeerId, "other-board", "/other-repo");
+
+        await svc.RegisterAsync(new RegisterPeerRequest { Tool = "codex", MachineId = "m-joiner", RepoRoot = "/repo", Branch = "main" }, CancellationToken.None);
+
+        Assert.Equal(0, await CountUnackedInboxAsync(member.PeerId));
+        Assert.Equal(0, await CountChannelMessagesAsync(await OnlyChannelId()));
+    }
+
+    [Fact]
+    public async Task JoinRowSendFailure_DoesNotFailRegistration()
+    {
+        var (peerRepo, events, channels) = CreateChannels();
+        var svc = SvcFor(peerRepo, events, channels);
+
+        var author = await svc.RegisterAsync(new RegisterPeerRequest { Tool = "claude-code", MachineId = "m-author", RepoRoot = "/join-repo", Branch = "main" }, CancellationToken.None);
+        var victimId = await ChannelAsync(channels, author.PeerId, "victim", "/join-repo");
+        var healthyId = await ChannelAsync(channels, author.PeerId, "healthy", "/join-repo");
+
+        await _db.Factory.WriteAsync(async conn =>
+        {
+            using var cmd = conn.CreateCommand();
+            cmd.CommandText = $"""
+                CREATE TRIGGER force_fail BEFORE INSERT ON channel_messages
+                WHEN NEW.channel_id = '{victimId}'
+                BEGIN SELECT RAISE(ABORT, 'forced'); END;
+                """;
+            await cmd.ExecuteNonQueryAsync();
+        }, CancellationToken.None);
+
+        var joiner = await svc.RegisterAsync(new RegisterPeerRequest { Tool = "codex", MachineId = "m-joiner", RepoRoot = "/join-repo", Branch = "main" }, CancellationToken.None);
+
+        Assert.False(joiner.Resumed);
+        Assert.Equal(1, await CountChannelMessagesAsync(healthyId));
+        Assert.Equal(0, await CountChannelMessagesAsync(victimId));
+        Assert.True(await HasInboxNamingAsync(author.PeerId, joiner.PeerId));
+    }
+
+    private Task<long> CountChannelMessagesTotal()
+        => _db.Factory.ReadAsync(async conn =>
+        {
+            using var cmd = conn.CreateCommand();
+            cmd.CommandText = "SELECT COUNT(*) FROM channel_messages";
+            return Convert.ToInt64(await cmd.ExecuteScalarAsync());
+        }, CancellationToken.None);
+
+    private Task<string> OnlyChannelId()
+        => _db.Factory.ReadAsync(async conn =>
+        {
+            using var cmd = conn.CreateCommand();
+            cmd.CommandText = "SELECT channel_id FROM channels LIMIT 1";
+            return (string)(await cmd.ExecuteScalarAsync())!;
+        }, CancellationToken.None);
+
     public void Dispose() => _db.Dispose();
+
 }

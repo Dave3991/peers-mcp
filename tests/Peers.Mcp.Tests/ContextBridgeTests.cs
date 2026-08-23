@@ -4,6 +4,7 @@ using System.Text.Json;
 using System.Text.Json.Nodes;
 using Peers.Mcp;
 using Peers.Mcp.Tools;
+using Microsoft.Extensions.Logging.Abstractions;
 using Xunit;
 
 namespace Peers.Mcp.Tests;
@@ -48,7 +49,7 @@ public class ContextBridgeTests
     {
         var path = req.RequestUri!.AbsolutePath;
         if (path == "/peers") return Json(HttpStatusCode.OK, "[]");
-        if (path == "/scratchpads") return Json(HttpStatusCode.OK, "[]");
+        if (path == "/channels") return Json(HttpStatusCode.OK, """{"channels":[]}""");
         if (path == "/artifacts") return Json(HttpStatusCode.OK, "[]");
         return Json(HttpStatusCode.OK, "[]");
     });
@@ -66,8 +67,8 @@ public class ContextBridgeTests
         var weirdTask = "Weird: \"quoted\"\nand: colon";
 
         var exported = await ContextTools.Export(
-            EmptyClient(), DefaultState(),
-            include_peers: false, include_scratchpads: false, include_artifacts: false,
+            EmptyClient(), DefaultState(), null!, NullLoggerFactory.Instance,
+            include_peers: false, include_channels: false, include_artifacts: false,
             task: weirdTask);
 
         var imported = await ContextTools.Import(exported);
@@ -87,8 +88,8 @@ public class ContextBridgeTests
         var fenceTask = "Here is ```code``` in title";
 
         var exported = await ContextTools.Export(
-            EmptyClient(), DefaultState(),
-            include_peers: false, include_scratchpads: false, include_artifacts: false,
+            EmptyClient(), DefaultState(), null!, NullLoggerFactory.Instance,
+            include_peers: false, include_channels: false, include_artifacts: false,
             task: fenceTask);
 
         var imported = await ContextTools.Import(exported);
@@ -101,9 +102,9 @@ public class ContextBridgeTests
         Assert.Equal(fenceTask, titleProp.GetString());
     }
 
-    // Test 3: Typed sections — peers/scratchpads/artifacts are JSON arrays of objects with expected keys
+    // Test 3: Typed sections — peers/channels/artifacts are JSON arrays of objects with expected keys
     [Fact]
-    public async Task TypedSections_PeerScratchpadArtifactAreObjectArrays()
+    public async Task TypedSections_PeerChannelArtifactAreObjectArrays()
     {
         var handler = new ScriptedHandler(req =>
         {
@@ -112,9 +113,9 @@ public class ContextBridgeTests
                 return Json(HttpStatusCode.OK, """
                     [{"peerId":"peer-1","tool":"codex","machineId":"m1","repoRoot":"/repo","branch":"main","summary":"working on feature","leaseExpiresAt":"2099-01-01T00:00:00Z","createdAt":"2026-01-01T00:00:00Z","updatedAt":"2026-01-01T00:00:00Z"}]
                     """);
-            if (path == "/scratchpads")
+            if (path == "/channels")
                 return Json(HttpStatusCode.OK, """
-                    [{"scratchpadId":"sp-1","type":"review","title":"My Review","status":"open","createdByPeerId":"peer-1","createdAt":"2026-01-01T00:00:00Z"}]
+                    {"channels":[{"channelId":"ch-1","name":"deploy","repoRoot":"/repo","createdByPeerId":"peer-1","createdAt":"2026-01-01T00:00:00Z","messageCount":3}]}
                     """);
             if (path == "/artifacts")
                 return Json(HttpStatusCode.OK, """
@@ -126,8 +127,8 @@ public class ContextBridgeTests
         var client = new BrokerClient(new HttpClient(handler) { BaseAddress = new Uri("http://localhost") });
 
         var exported = await ContextTools.Export(
-            client, DefaultState(),
-            include_peers: true, include_scratchpads: true, include_artifacts: true);
+            client, DefaultState(), null!, NullLoggerFactory.Instance,
+            include_peers: true, include_channels: true, include_artifacts: true);
 
         var imported = await ContextTools.Import(exported);
 
@@ -140,11 +141,14 @@ public class ContextBridgeTests
         Assert.Equal(1, peers.GetArrayLength());
         Assert.Equal("peer-1", peers[0].GetProperty("peer_id").GetString());
 
-        // scratchpads is array of objects with id
-        Assert.True(root.TryGetProperty("scratchpads", out var scratchpads));
-        Assert.Equal(JsonValueKind.Array, scratchpads.ValueKind);
-        Assert.Equal(1, scratchpads.GetArrayLength());
-        Assert.Equal("sp-1", scratchpads[0].GetProperty("id").GetString());
+        // channels is array of objects with the id/name/repo_root/message_count shape
+        Assert.True(root.TryGetProperty("channels", out var channels));
+        Assert.Equal(JsonValueKind.Array, channels.ValueKind);
+        Assert.Equal(1, channels.GetArrayLength());
+        Assert.Equal("ch-1", channels[0].GetProperty("id").GetString());
+        Assert.Equal("deploy", channels[0].GetProperty("name").GetString());
+        Assert.Equal("/repo", channels[0].GetProperty("repo_root").GetString());
+        Assert.Equal(3, channels[0].GetProperty("message_count").GetInt64());
 
         // artifacts is array of objects with id
         Assert.True(root.TryGetProperty("artifacts", out var artifacts));
@@ -189,8 +193,8 @@ public class ContextBridgeTests
         var notesInput = """["a \"quoted\" note", "line1\nline2"]""";
 
         var exported = await ContextTools.Export(
-            EmptyClient(), DefaultState(),
-            include_peers: false, include_scratchpads: false, include_artifacts: false,
+            EmptyClient(), DefaultState(), null!, NullLoggerFactory.Instance,
+            include_peers: false, include_channels: false, include_artifacts: false,
             notes: notesInput);
 
         var imported = await ContextTools.Import(exported);
@@ -213,8 +217,8 @@ public class ContextBridgeTests
 
         // Must not throw
         var exported = await ContextTools.Export(
-            EmptyClient(), DefaultState(),
-            include_peers: false, include_scratchpads: false, include_artifacts: false,
+            EmptyClient(), DefaultState(), null!, NullLoggerFactory.Instance,
+            include_peers: false, include_channels: false, include_artifacts: false,
             notes: notesInput);
 
         var imported = await ContextTools.Import(exported);
@@ -228,70 +232,4 @@ public class ContextBridgeTests
         Assert.Equal("not json", notes[0].GetString());
     }
 
-    // Test 7: Newest entries — when include_scratchpad_entries=true, returns newest 3 by created_at
-    [Fact]
-    public async Task NewestEntries_ReturnsNewest3NotOldest()
-    {
-        // 5 entries with distinct created_at; entries returned in ASC order (as the server does)
-        const string scratchpadId = "sp-abc";
-        var handler = new ScriptedHandler(req =>
-        {
-            var path = req.RequestUri!.AbsolutePath;
-            if (path == "/peers") return Json(HttpStatusCode.OK, "[]");
-            if (path == "/artifacts") return Json(HttpStatusCode.OK, "[]");
-            if (path == "/scratchpads")
-                return Json(HttpStatusCode.OK, $$"""
-                    [{"scratchpadId":"{{scratchpadId}}","type":"discussion","title":"Chat","status":"open","createdByPeerId":"p","createdAt":"2026-01-01T00:00:00Z"}]
-                    """);
-            if (path == $"/scratchpads/{scratchpadId}")
-                return Json(HttpStatusCode.OK, $$"""
-                    {
-                      "scratchpad": {"scratchpadId":"{{scratchpadId}}","type":"discussion","title":"Chat","status":"open","createdByPeerId":"p","createdAt":"2026-01-01T00:00:00Z"},
-                      "entries": [
-                        {"entryId":"e1","scratchpadId":"{{scratchpadId}}","authorPeerId":"p","content":"oldest entry","contentBytes":12,"createdAt":"2026-01-01T01:00:00Z"},
-                        {"entryId":"e2","scratchpadId":"{{scratchpadId}}","authorPeerId":"p","content":"second entry","contentBytes":12,"createdAt":"2026-01-01T02:00:00Z"},
-                        {"entryId":"e3","scratchpadId":"{{scratchpadId}}","authorPeerId":"p","content":"third entry","contentBytes":11,"createdAt":"2026-01-01T03:00:00Z"},
-                        {"entryId":"e4","scratchpadId":"{{scratchpadId}}","authorPeerId":"p","content":"fourth entry","contentBytes":12,"createdAt":"2026-01-01T04:00:00Z"},
-                        {"entryId":"e5","scratchpadId":"{{scratchpadId}}","authorPeerId":"p","content":"newest entry","contentBytes":12,"createdAt":"2026-01-01T05:00:00Z"}
-                      ]
-                    }
-                    """);
-            return Json(HttpStatusCode.OK, "[]");
-        });
-
-        var client = new BrokerClient(new HttpClient(handler) { BaseAddress = new Uri("http://localhost") });
-
-        var exported = await ContextTools.Export(
-            client, DefaultState(),
-            include_peers: false,
-            include_scratchpads: true,
-            include_artifacts: false,
-            include_scratchpad_entries: true);
-
-        var imported = await ContextTools.Import(exported);
-
-        using var doc = JsonDocument.Parse(imported);
-        var root = doc.RootElement;
-
-        Assert.True(root.TryGetProperty("scratchpads", out var scratchpads));
-        Assert.Equal(1, scratchpads.GetArrayLength());
-        var pad = scratchpads[0];
-
-        Assert.True(pad.TryGetProperty("entries", out var entries), $"No entries in: {imported}");
-        Assert.Equal(JsonValueKind.Array, entries.ValueKind);
-        Assert.Equal(3, entries.GetArrayLength());
-
-        // Entries should be newest first: e5, e4, e3
-        var previews = entries.EnumerateArray().Select(e => e.GetProperty("preview").GetString()).ToArray();
-        Assert.Contains("newest entry", previews);
-        Assert.Contains("fourth entry", previews);
-        Assert.Contains("third entry", previews);
-        // Oldest entries (e1, e2) should NOT be present
-        Assert.DoesNotContain("oldest entry", previews);
-        Assert.DoesNotContain("second entry", previews);
-
-        // All previews are <= 500 chars
-        foreach (var preview in previews)
-            Assert.True(preview!.Length <= 500);
-    }
 }

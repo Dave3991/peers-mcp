@@ -54,13 +54,13 @@ public sealed class RecipientResolverTests : IDisposable
         var peer = await InsertActivePeer("resolvetest-exactprefix-abc123");
 
         // Exact match
-        var exactResult = await resolver.ResolveAsync([peer.PeerId], null, CancellationToken.None);
+        var exactResult = await resolver.ResolveAsync([peer.PeerId], null, ct: CancellationToken.None);
         Assert.True(exactResult.IsSuccess);
         Assert.Contains(peer.PeerId, exactResult.Value.OnlinePeerIds);
 
         // Unique prefix (not a full peer id)
         var prefix = "resolvetest-exactprefix-";
-        var prefixResult = await resolver.ResolveAsync([prefix], null, CancellationToken.None);
+        var prefixResult = await resolver.ResolveAsync([prefix], null, ct: CancellationToken.None);
         Assert.True(prefixResult.IsSuccess);
         Assert.Contains(peer.PeerId, prefixResult.Value.OnlinePeerIds);
     }
@@ -78,7 +78,7 @@ public sealed class RecipientResolverTests : IDisposable
 
         // The shared prefix is NOT a full peer id (would hit exact path) — use a distinct prefix
         var sharedPrefix = "ambig-prefix-";
-        var result = await resolver.ResolveAsync([sharedPrefix], null, CancellationToken.None);
+        var result = await resolver.ResolveAsync([sharedPrefix], null, ct: CancellationToken.None);
         Assert.True(result.IsSuccess);
 
         // Should not appear online or offline — must be unresolved
@@ -98,7 +98,7 @@ public sealed class RecipientResolverTests : IDisposable
         var devPeer = await InsertActivePeer("repo-peer-dev", repoRoot: "/r", branch: "dev");
 
         // Resolve repo root with callerBranch = "main" — the main-branch peer should be preferred
-        var result = await resolver.ResolveAsync(["/r"], callerBranch: "main", CancellationToken.None);
+        var result = await resolver.ResolveAsync(["/r"], callerBranch: "main", ct: CancellationToken.None);
         Assert.True(result.IsSuccess);
 
         // The same-branch peer is online
@@ -106,6 +106,70 @@ public sealed class RecipientResolverTests : IDisposable
 
         // The dev-branch peer is NOT in the same-branch preferred set (activeSameBranch > 0 → only those are used)
         Assert.DoesNotContain(devPeer.PeerId, result.Value.OnlinePeerIds);
+    }
+
+
+    /// <summary>An expired peer row: lease in the past and expired_at set, exactly as cleanup leaves it.</summary>
+    private Task<Peer> InsertExpiredPeer(string peerId, string repoRoot = "/repo", string branch = "main", string machineId = "machine-x")
+        => _db.Factory.WriteAsync(async conn =>
+        {
+            using var cmd = conn.CreateCommand();
+            cmd.CommandText = """
+                INSERT INTO peers (peer_id, tool, machine_id, repo_root, branch,
+                    lease_expires_at, expired_at, created_at, updated_at)
+                VALUES (@id, 'claude-code', @machine, @repo, @branch,
+                    datetime('now', '-10 minutes'), datetime('now', '-9 minutes'),
+                    datetime('now', '-20 minutes'), datetime('now', '-9 minutes'))
+                """;
+            cmd.Parameters.AddWithValue("@id", peerId);
+            cmd.Parameters.AddWithValue("@machine", machineId);
+            cmd.Parameters.AddWithValue("@repo", repoRoot);
+            cmd.Parameters.AddWithValue("@branch", branch);
+            await cmd.ExecuteNonQueryAsync();
+            return new Peer
+            {
+                PeerId = peerId, Tool = "claude-code", MachineId = machineId, RepoRoot = repoRoot, Branch = branch,
+                LeaseExpiresAt = DateTime.UtcNow.AddMinutes(-10), ExpiredAt = DateTime.UtcNow.AddMinutes(-9),
+                CreatedAt = DateTime.UtcNow.AddMinutes(-20), UpdatedAt = DateTime.UtcNow.AddMinutes(-9),
+            };
+        }, CancellationToken.None);
+
+    // An expired mention reroutes to the peer's current live session — that is the whole point of the
+    // replacement lookup: mentions bind to ephemeral per-session ids.
+    [Fact]
+    public async Task Resolve_ExpiredTarget_ReroutesToGenuineReplacement()
+    {
+        var (_, resolver) = CreateResolver();
+
+        var gone = await InsertExpiredPeer("reroute-gone", machineId: "machine-r");
+        var live = await InsertActivePeer("reroute-live", machineId: "machine-r");
+        var caller = await InsertActivePeer("reroute-caller", machineId: "machine-other");
+
+        var result = await resolver.ResolveAsync([gone.PeerId], callerBranch: "main", callerPeerId: caller.PeerId, ct: CancellationToken.None);
+
+        Assert.Contains(live.PeerId, result.Value.OnlinePeerIds);
+        Assert.DoesNotContain(gone.PeerId, result.Value.OnlinePeerIds);
+    }
+
+    // ...but NEVER to the caller. When the caller is the only live session matching the expired
+    // target's identity (a reviewer answering a driver that has since exited on the same machine,
+    // repo and branch), rerouting rewrites the mention to the caller's own id and manufactures a
+    // delivery that reaches nobody. Offline is the honest answer, and it is what makes the review
+    // contract's "peer offline ⇒ stop and tell the user" rule fire.
+    [Fact]
+    public async Task Resolve_ExpiredTarget_NeverReroutesToTheCallerItself()
+    {
+        var (_, resolver) = CreateResolver();
+
+        // Same machine + tool + repo + branch: the caller IS the replacement candidate.
+        var gone = await InsertExpiredPeer("selfreroute-gone", machineId: "machine-self");
+        var caller = await InsertActivePeer("selfreroute-caller", machineId: "machine-self");
+
+        var result = await resolver.ResolveAsync([gone.PeerId], callerBranch: "main", callerPeerId: caller.PeerId, ct: CancellationToken.None);
+
+        Assert.DoesNotContain(caller.PeerId, result.Value.OnlinePeerIds);
+        Assert.Empty(result.Value.OnlinePeerIds);
+        Assert.Contains(gone.PeerId, result.Value.OfflinePeerIds);
     }
 
     public void Dispose() => _db.Dispose();

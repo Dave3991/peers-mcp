@@ -1,3 +1,4 @@
+using ModelContextProtocol.Server;
 using Peers.Mcp.Lifecycle;
 using Peers.Mcp.Resources;
 using Peers.Shared.Contracts;
@@ -6,14 +7,15 @@ namespace Peers.Mcp;
 
 public sealed class SessionState : IDisposable, IAsyncDisposable
 {
-    public SessionState()
-    {
-        ChatId = $"peers_{Environment.ProcessId}_{Guid.NewGuid():N}";
-    }
 
-    public string ChatId { get; }
     public string? PeerId { get; set; }
     public string? Tool { get; set; }
+
+    /// <summary>Derived at registration: the git workstream this session runs in.</summary>
+    public string? RepoRoot { get; set; }
+
+    /// <summary>The MCP connection this session serves; needed to construct the notifier and read client identity.</summary>
+    public McpServer? Server { get; set; }
 
     /// <summary>
     /// How far this session has consumed the broker's event stream. Three concurrent writers reach it —

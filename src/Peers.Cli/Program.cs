@@ -62,41 +62,18 @@ try
             break;
         }
 
-        case "register":
+        case "channels":
         {
             var brokerStatus = await RequireHealthyBrokerAsync();
             if (brokerStatus is null)
                 return 1;
 
             using var http = CreateHttpClient(brokerStatus.Port);
-            var tool = args.Length > 1 ? args[1] : "cli";
-            var repo = GetArg(args, "--repo");
-            var branch = GetArg(args, "--branch");
-            var summary = GetArg(args, "--summary");
-            var regReq = new RegisterPeerRequest
-            {
-                Tool = tool,
-                MachineId = Environment.MachineName,
-                RepoRoot = repo,
-                Branch = branch,
-                Summary = summary,
-            };
-            var regResp = await http.PostAsJsonAsync("/peers", regReq, jsonOpts);
-            Console.WriteLine(await regResp.Content.ReadAsStringAsync());
+            var channels = await http.GetFromJsonAsync<JsonElement>("/channels", jsonOpts);
+            Console.WriteLine(JsonSerializer.Serialize(channels, jsonOpts));
             break;
         }
 
-        case "scratchpads":
-        {
-            var brokerStatus = await RequireHealthyBrokerAsync();
-            if (brokerStatus is null)
-                return 1;
-
-            using var http = CreateHttpClient(brokerStatus.Port);
-            var pads = await http.GetFromJsonAsync<List<Scratchpad>>("/scratchpads", jsonOpts);
-            Console.WriteLine(JsonSerializer.Serialize(pads, jsonOpts));
-            break;
-        }
 
         case "artifacts":
         {
@@ -279,7 +256,7 @@ static string SummarizePayload(string payload)
         using var doc = JsonDocument.Parse(payload);
         if (doc.RootElement.ValueKind == JsonValueKind.Object)
         {
-            foreach (var keyName in new[] { "peer_id", "scratchpad_id", "artifact_id", "title", "type" })
+            foreach (var keyName in new[] { "peer_id", "channel_id", "artifact_id", "title", "type" })
             {
                 if (doc.RootElement.TryGetProperty(keyName, out var v) && v.ValueKind == JsonValueKind.String)
                     parts.Add($"{keyName}={v.GetString()}");
@@ -332,10 +309,8 @@ static void PrintUsage()
           broker-start            Launch the broker if needed and wait until healthy
           claude [args...]        Start Claude Code with `server:peers` development channel enabled
           status                  Show broker status and connected peers
-          register [tool]         Register a simulated peer (--repo, --branch, --summary)
-          scratchpads             List all scratchpads
+          channels                List all channels
           artifacts               List all artifacts
-          poll <peer-id>          Poll events (--cursor N)
           events --follow         Stream events for a peer (--peer <id> [--interval N])
         """);
 }

@@ -1,5 +1,4 @@
 using System.Reflection;
-using System.Text.Json;
 using Microsoft.Extensions.DependencyInjection;
 using ModelContextProtocol.Protocol;
 using ModelContextProtocol.Server;
@@ -22,28 +21,18 @@ internal static class ServerOptionsFactory
         // make the server reject the initialize handshake of every client that exists today — do not.
         var options = new McpServerOptions
         {
-            ServerInfo = new() { Name = "peers", Version = "1.0.0" },
+            ServerInfo = new() { Name = "peers", Version = "2.0.0" },
             ServerInstructions = """
                 Peers coordinates multiple AI coding sessions through a shared local broker.
 
-                Message delivery modes:
-                - Push mode: best-effort. Pre-2026-07-28 sessions get `notifications/message`; from 2026-07-28 (SEP-2577) nothing is pushed — use subscriptions or pull-mode `peer_inbox`. Claude Code sessions started with `--dangerously-load-development-channels server:peers` get direct channel pushes on any revision. `peer_test_push` reports which applies here.
-                - Pull mode: always available via `peer_inbox`, which returns directed messages and keeps returning them until you acknowledge them by echoing their `inbox_id`s as `ack_inbox_ids`.
+                Identity and delivery:
+                - This session registers itself automatically on your first peers tool call — there is no register step. Shape how you appear to others with `presence` (role, summary, capabilities).
+                - Directed messages (mentions, replies, review requests) arrive durably: `wait` blocks until one lands. At-least-once by receipt — echo inbox_ids as ack_inbox_ids once handled, or they are redelivered.
+                - Resource subscriptions (`subscriptions/listen`, MCP 2026-07-28) push re-read hints for peers://peers and peers://channel/{id}; they are best-effort hints, never deltas — always re-read.
 
-                Usage guidance:
-                - Call `peer_register` at startup.
-                - Call `peer_inbox` at startup, after completing a task chunk, when the user asks about peer activity, and before finishing.
-                - Use `peer_poll` only when you need raw broker events or cursor-based debugging.
-                - Use scratchpads for replies and longer async collaboration threads.
-
-                Resources (read instead of polling a tool):
-                - `peers://peers` — same payload as `peer_list`.
-                - `peers://scratchpad/{id}` — same payload as `scratchpad_read`.
-                - Both are inert until `peer_register`, and readable on any protocol revision.
-                - Subscribing needs MCP 2026-07-28 (`subscriptions/listen`); the older `resources/subscribe` is
-                  refused with an error. A `notifications/resources/updated` is A HINT TO RE-READ, never a delta
-                  stream: delivery is best-effort and lossy, and several changes can collapse into one
-                  notification or into none. Always re-read; never reconstruct state from the notifications.
+                Channels:
+                - A channel is a named board scoped to a repository (`channels`, `channel_create`, `send`, `read`). Names are agent-chosen; repo metadata says whose code it serves.
+                - Mention peers with `to`; quiet=true makes the message a whisper — delivered only to mentions, invisible to everyone else's reads.
                 """,
             ToolCollection = [],
             Capabilities = new ServerCapabilities
@@ -52,20 +41,11 @@ internal static class ServerOptionsFactory
                 // The SDK forces listChanged:true here once ResourceCollection is populated and offers no
                 // way to decline it. Known, accepted, not worked around: peers never fires the notification.
                 Resources = new() { Subscribe = true },
-#pragma warning disable MCP9005 // Logging capability deprecated by SEP-2577; still required by pre-2026-07-28 clients.
-                Logging = new(),
-#pragma warning restore MCP9005
-                Experimental = new Dictionary<string, object>
-                {
-                    ["claude/channel"] = JsonDocument.Parse("{}").RootElement.Clone()
-                }
             }
         };
 
-        RegisterTools<PeerTools>(options, services);
-        RegisterTools<ScratchpadTools>(options, services);
+        RegisterTools<ChannelTools>(options, services);
         RegisterTools<ArtifactTools>(options, services);
-        RegisterTools<PollTools>(options, services);
         RegisterTools<ContextTools>(options, services);
 
         options.ResourceCollection =
@@ -79,21 +59,23 @@ internal static class ServerOptionsFactory
                 MimeType = "application/json",
                 Services = services,
             }),
-            McpServerResource.Create(PeerResources.ReadScratchpad, new()
+            McpServerResource.Create(PeerResources.ReadChannel, new()
             {
-                UriTemplate = PeerResources.ScratchpadUriTemplate,
-                Name = "scratchpad",
-                Title = "Scratchpad thread",
-                Description = PeerResources.ScratchpadDescription,
+                UriTemplate = PeerResources.ChannelUriTemplate,
+                Name = "channel",
+                Title = "Channel messages",
+                Description = PeerResources.ChannelDescription,
                 MimeType = "application/json",
                 Services = services,
             }),
         ];
 
         // Session-scoped: one stdio session, one registry. Parked on SessionState because that is
-        // already the per-session holder ChannelNotifier reads from.
-        var subscriptions = new SubscriptionRegistry(options.ResourceCollection);
-        services.GetRequiredService<SessionState>().Subscriptions = subscriptions;
+        // already the per-session holder ChannelNotifier reads from — and the registry needs the same
+        // session's peer id to keep quiet whispers inside their participant set.
+        var state = services.GetRequiredService<SessionState>();
+        var subscriptions = new SubscriptionRegistry(options.ResourceCollection, state);
+        state.Subscriptions = subscriptions;
         // subscriptions/listen is the one subscription mechanism peers serves. The other two are wired
         // ONLY to refuse: unset, the SDK answers resources/subscribe with an empty success, so a
         // pre-2026-07-28 client believes it subscribed and then waits forever with nothing to debug.

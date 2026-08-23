@@ -22,14 +22,14 @@ public static class BrokerHost
         // Repositories (Scoped)
         builder.Services.AddScoped<PeerRepository>();
         builder.Services.AddScoped<EventRepository>();
-        builder.Services.AddScoped<ScratchpadRepository>();
+        builder.Services.AddScoped<ChannelRepository>();
         builder.Services.AddScoped<ArtifactRepository>();
         builder.Services.AddScoped<InboxRepository>();
 
         // Services (Scoped)
         builder.Services.AddScoped<PeerService>();
         builder.Services.AddScoped<RecipientResolver>();
-        builder.Services.AddScoped<ScratchpadService>();
+        builder.Services.AddScoped<ChannelService>();
         builder.Services.AddScoped<ArtifactService>();
         builder.Services.AddScoped<EventService>();
 
@@ -45,7 +45,7 @@ public static class BrokerHost
         app.UseMiddleware<BrokerExceptionMiddleware>();
 
         app.MapPeerRoutes();
-        app.MapScratchpadRoutes();
+        app.MapChannelRoutes();
         app.MapArtifactRoutes();
         app.MapPollRoutes();
         app.MapStatusRoutes();

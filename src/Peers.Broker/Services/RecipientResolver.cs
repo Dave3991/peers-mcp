@@ -25,7 +25,8 @@ public sealed record ResolvedRecipients(
 
 public sealed class RecipientResolver(PeerRepository peers)
 {
-    public async Task<Result<ResolvedRecipients>> ResolveAsync(IReadOnlyList<string> targets, string? callerBranch, CancellationToken ct)
+    public async Task<Result<ResolvedRecipients>> ResolveAsync(
+        IReadOnlyList<string> targets, string? callerBranch, string? callerPeerId = null, CancellationToken ct = default)
     {
         if (targets.Count == 0)
             return Result.Ok(ResolvedRecipients.Empty);
@@ -46,13 +47,15 @@ public sealed class RecipientResolver(PeerRepository peers)
                 }
                 else
                 {
-                    // The reviewer's session expired. requested_reviewers binds to an
-                    // ephemeral per-session peer ID, so a restarted reviewer that
-                    // re-registered under a fresh ID would silently stop receiving
-                    // pushes/inbox delivery. Re-route to their current live session on
-                    // the same machine if one exists; otherwise report it offline.
+                    // The target's session expired. Mentions bind to ephemeral per-session peer IDs,
+                    // so a restarted peer that re-registered under a fresh ID would silently stop
+                    // receiving pushes/inbox delivery. Re-route to their current live session on the
+                    // same machine+tool+repo+branch — but NEVER to the caller: when the caller is the
+                    // only live match (reviewing your own driver after it went away), "rerouting" to
+                    // yourself rewrites the mention to your own id and manufactures delivery that
+                    // reaches nobody. The honest answer is offline.
                     var replacement = await peers.FindActiveReplacementAsync(peer, ct);
-                    if (replacement is not null)
+                    if (replacement is not null && replacement.PeerId != callerPeerId)
                         online.Add(replacement.PeerId);
                     else
                         offline.Add(peer.PeerId);

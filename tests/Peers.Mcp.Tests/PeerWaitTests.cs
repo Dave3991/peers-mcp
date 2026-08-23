@@ -2,6 +2,8 @@ using System.Net;
 using System.Text;
 using System.Text.Json;
 using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Logging.Abstractions;
 using ModelContextProtocol;
 using Peers.Mcp;
 using Peers.Mcp.Tools;
@@ -43,6 +45,23 @@ public class PeerWaitTests
             Content = new StringContent(json, Encoding.UTF8, "application/json")
         };
     }
+
+    // The wait tool's server and logger factory are SDK wiring, not behavior: every test pins
+    // PeerId, so registration short-circuits inside WaitCore and both stay inert.
+    private static Task<string> Wait(
+        BrokerClient client, SessionState state, int? timeoutSeconds = null, string[]? ackInboxIds = null) =>
+        ChannelTools.Wait(client, state, null!, NullLoggerFactory.Instance, timeoutSeconds, ackInboxIds);
+
+    private static Task<string> WaitCore(
+        BrokerClient client,
+        SessionState state,
+        int? timeoutSeconds,
+        string[]? ackInboxIds,
+        IProgress<ProgressNotificationValue>? progress,
+        TimeSpan tickInterval,
+        CancellationToken cancellationToken = default) =>
+        ChannelTools.WaitCore(client, state, null!, NullLoggerFactory.Instance,
+            timeoutSeconds, ackInboxIds, progress, tickInterval, cancellationToken);
 
     // A single inbox item shaped like InboxItemDto (camelCase matches the BrokerClient JsonOpts)
     private static string OneItemBody(string inboxId = "ib1") => $$"""
@@ -87,7 +106,7 @@ public class PeerWaitTests
         var client = new BrokerClient(new HttpClient(handler) { BaseAddress = new Uri("http://localhost") });
         var state = new SessionState { PeerId = "p" };
 
-        var json = await PollTools.Wait(client, state, 5);
+        var json = await Wait(client, state, 5);
 
         using var doc = JsonDocument.Parse(json);
         var root = doc.RootElement;
@@ -120,7 +139,7 @@ public class PeerWaitTests
         var client = new BrokerClient(new HttpClient(handler) { BaseAddress = new Uri("http://localhost") });
         var state = new SessionState { PeerId = "p" };
 
-        var json = await PollTools.Wait(client, state, 1);
+        var json = await Wait(client, state, 1);
 
         using var doc = JsonDocument.Parse(json);
         var root = doc.RootElement;
@@ -151,8 +170,8 @@ public class PeerWaitTests
         var client = new BrokerClient(new HttpClient(handler) { BaseAddress = new Uri("http://localhost") });
         var state = new SessionState { PeerId = "p" };
 
-        // Must not throw — peer_wait catches BrokerApiException and returns error JSON
-        var json = await PollTools.Wait(client, state, 1);
+        // Must not throw — wait catches BrokerApiException and returns error JSON
+        var json = await Wait(client, state, 1);
 
         using var doc = JsonDocument.Parse(json);
         var root = doc.RootElement;
@@ -197,7 +216,7 @@ public class PeerWaitTests
         var client = new BrokerClient(new HttpClient(handler) { BaseAddress = new Uri("http://localhost") });
         var state = new SessionState { PeerId = "p" };
 
-        var json = await PollTools.Wait(client, state, 1);
+        var json = await Wait(client, state, 1);
 
         // Must stay under cap
         Assert.True(json.Length <= Limits.MaxToolResultChars,
@@ -317,20 +336,22 @@ public class PeerWaitTests
         Assert.True(condition(), because);
     }
 
-    // Spec: the progress value MUST strictly increase with every notification.
+    // Spec: the progress value MUST strictly increase with every notification. The ticker is private
+    // to ChannelTools now, so cadence is observed through WaitCore: the broker stays parked on a gate
+    // until five ticks have landed, so "ticks happened during the call" is a fact, not a race.
     [Fact]
-    public async Task Tick_ReportsStrictlyIncreasingProgress()
+    public async Task Wait_ProgressStrictlyIncreases_AndFirstTickReportsTheClampedBudget()
     {
+        var gate = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var handler = new GatedHandler(gate.Task, () => Json(HttpStatusCode.OK, OneItemBody("ib1")));
+        var client = new BrokerClient(new HttpClient(handler) { BaseAddress = new Uri("http://localhost") });
+        var state = new SessionState { PeerId = "p" };
         var recorder = new RecordingProgress();
-        var completed = false;
-        using var cts = new CancellationTokenSource();
 
-        var ticker = PollTools.TickAsync(recorder, 120, TimeSpan.FromMilliseconds(1), () => completed, cts.Token);
+        var call = WaitCore(client, state, 120, ackInboxIds: null, recorder, TimeSpan.FromMilliseconds(1));
         await WaitUntilAsync(() => recorder.Count >= 5, "ticker should have emitted at least 5 notifications");
-
-        completed = true;
-        cts.Cancel();
-        await ticker;
+        gate.SetResult();
+        await call;
 
         var values = recorder.Snapshot();
         for (var i = 1; i < values.Count; i++)
@@ -345,46 +366,20 @@ public class PeerWaitTests
         Assert.Equal("Waiting for peer messages… 5s/120s", values[0].Message);
     }
 
-    // The completed flag (set before Cancel) is what gates Report; cancellation alone cannot stop a ticker
-    // that is already past its delay.
-    [Fact]
-    public async Task Tick_ReportsNothingOnceCompletedFlagIsSet()
-    {
-        var recorder = new RecordingProgress();
-        using var cts = new CancellationTokenSource();
-
-        // Already completed before the first tick fires: the ticker must return without reporting.
-        await PollTools.TickAsync(recorder, 120, TimeSpan.FromMilliseconds(1), () => true, cts.Token)
-            .WaitAsync(TimeSpan.FromSeconds(10));
-
-        Assert.Equal(0, recorder.Count);
-    }
-
-    // Task.Delay throws TaskCanceledException on cancel. TickAsync must swallow it, otherwise `await ticker`
-    // in peer_wait's finally throws on essentially every call.
-    [Fact]
-    public async Task Tick_ReturnsNormallyWhenCancelled()
-    {
-        var recorder = new RecordingProgress();
-        using var cts = new CancellationTokenSource();
-
-        // Parked on a 5s delay, so cancellation is the only way this returns quickly.
-        var ticker = PollTools.TickAsync(recorder, 120, TimeSpan.FromSeconds(5), () => false, cts.Token);
-        cts.Cancel();
-        await ticker.WaitAsync(TimeSpan.FromSeconds(10));
-
-        Assert.Equal(0, recorder.Count);
-    }
-
     // Progress never runs past the clamped timeout it is reported against.
     [Fact]
-    public async Task Tick_StopsAtTotal()
+    public async Task Wait_ProgressStopsAtTotal()
     {
+        var gate = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var handler = new GatedHandler(gate.Task, () => Json(HttpStatusCode.OK, EmptyTimedOutBody()));
+        var client = new BrokerClient(new HttpClient(handler) { BaseAddress = new Uri("http://localhost") });
+        var state = new SessionState { PeerId = "p" };
         var recorder = new RecordingProgress();
-        using var cts = new CancellationTokenSource();
 
-        await PollTools.TickAsync(recorder, 10, TimeSpan.FromMilliseconds(1), () => false, cts.Token)
-            .WaitAsync(TimeSpan.FromSeconds(10));
+        var call = WaitCore(client, state, 10, ackInboxIds: null, recorder, TimeSpan.FromMilliseconds(1));
+        await WaitUntilAsync(() => recorder.Count >= 2, "both ticks inside the budget should have been reported");
+        gate.SetResult();
+        await call;
 
         Assert.Equal(new[] { 5f, 10f }, recorder.Snapshot().Select(v => v.Progress));
     }
@@ -401,7 +396,7 @@ public class PeerWaitTests
         var state = new SessionState { PeerId = "p" };
         var recorder = new RecordingProgress();
 
-        var call = PollTools.WaitCore(client, state, 120, ack_inbox_ids: null, recorder, TimeSpan.FromMilliseconds(5));
+        var call = WaitCore(client, state, 120, ackInboxIds: null, recorder, TimeSpan.FromMilliseconds(5));
         recorder.OperationFinished = () => call.IsCompleted;
 
         await WaitUntilAsync(() => recorder.Count >= 3, "the ticker should tick while the broker is parked");
@@ -425,7 +420,7 @@ public class PeerWaitTests
         var state = new SessionState { PeerId = "p" };
         var recorder = new RecordingProgress();
 
-        var call = PollTools.WaitCore(client, state, 120, ack_inbox_ids: null, recorder, TimeSpan.FromMilliseconds(5));
+        var call = WaitCore(client, state, 120, ackInboxIds: null, recorder, TimeSpan.FromMilliseconds(5));
         recorder.OperationFinished = () => call.IsCompleted;
 
         await WaitUntilAsync(() => recorder.Count >= 3, "the ticker should tick while the broker is parked");
@@ -454,7 +449,7 @@ public class PeerWaitTests
 
         // A tick interval far longer than any plausible answer, so "returned without waiting for a tick" is
         // a fact rather than a race: the scripted broker answers in milliseconds, the ticker sleeps 30s.
-        var call = PollTools.WaitCore(client, state, 120, ack_inbox_ids: null, new RecordingProgress(), TimeSpan.FromSeconds(30));
+        var call = WaitCore(client, state, 120, ackInboxIds: null, new RecordingProgress(), TimeSpan.FromSeconds(30));
 
         var json = await call.WaitAsync(TimeSpan.FromSeconds(5));
 
@@ -473,7 +468,7 @@ public class PeerWaitTests
         var state = new SessionState { PeerId = "p" };
         var progress = new ThrowingProgress();
 
-        var call = PollTools.WaitCore(client, state, 120, ack_inbox_ids: null, progress, TimeSpan.FromMilliseconds(5));
+        var call = WaitCore(client, state, 120, ackInboxIds: null, progress, TimeSpan.FromMilliseconds(5));
         await WaitUntilAsync(() => progress.Calls >= 1, "the ticker should have attempted one report");
         gate.SetResult();
         var json = await call;
@@ -495,7 +490,7 @@ public class PeerWaitTests
         var state = new SessionState { PeerId = "p" };
         var progress = new ThrowingProgress();
 
-        var call = PollTools.WaitCore(client, state, 120, ack_inbox_ids: null, progress, TimeSpan.FromMilliseconds(5));
+        var call = WaitCore(client, state, 120, ackInboxIds: null, progress, TimeSpan.FromMilliseconds(5));
         await WaitUntilAsync(() => progress.Calls >= 1, "the ticker should have attempted one report");
         gate.SetResult();
         var json = await call;
@@ -519,7 +514,7 @@ public class PeerWaitTests
         var recorder = new RecordingProgress();
         using var cts = new CancellationTokenSource();
 
-        var call = PollTools.WaitCore(client, state, 120, ack_inbox_ids: null, recorder, TimeSpan.FromMilliseconds(5), cts.Token);
+        var call = WaitCore(client, state, 120, ackInboxIds: null, recorder, TimeSpan.FromMilliseconds(5), cts.Token);
         recorder.OperationFinished = () => call.IsCompleted;
         // BOTH, and the handler one matters most: the ticker starts before the broker call, so tick count
         // alone can be satisfied while SendAsync has not been entered yet — cancel there and HttpClient
@@ -547,7 +542,7 @@ public class PeerWaitTests
         var state = new SessionState { PeerId = "p" };
         using var cts = new CancellationTokenSource();   // deliberately never cancelled
 
-        var json = await PollTools.WaitCore(client, state, 1, ack_inbox_ids: null, progress: null, TimeSpan.FromSeconds(5), cts.Token);
+        var json = await WaitCore(client, state, 1, ackInboxIds: null, progress: null, TimeSpan.FromSeconds(5), cts.Token);
 
         using var doc = JsonDocument.Parse(json);
         var root = doc.RootElement;
@@ -565,80 +560,26 @@ public class PeerWaitTests
     {
         Assert.Equal(
             new[] { "ack_inbox_ids", "timeout_seconds" },
-            SchemaPropertiesOf("peer_wait").Order().ToArray());
-    }
-
-    // Same contract for peer_inbox, which gained the SDK-bound CancellationToken in the same change.
-    [Fact]
-    public void Inbox_ToolSchema_ExposesNoSdkBoundParameters()
-    {
-        Assert.Equal(
-            new[] { "ack_inbox_ids", "limit" },
-            SchemaPropertiesOf("peer_inbox").Order().ToArray());
+            SchemaPropertiesOf("wait").Order().ToArray());
     }
 
     private static string[] SchemaPropertiesOf(string toolName)
     {
         var collection = new ServiceCollection();
+        // Production registers logging (Program.cs); without it the SDK treats loggerFactory as a
+        // declared parameter and leaks it into the schema this test pins.
+        collection.AddLogging();
         collection.AddSingleton(new BrokerClient(new HttpClient { BaseAddress = new Uri("http://localhost") }));
         collection.AddSingleton(new SessionState());
-        using var services = collection.BuildServiceProvider();
+        var services = collection.BuildServiceProvider();
 
-        var tool = Assert.Single(ServerOptionsFactory.Create(services).ToolCollection!,
-            t => t.ProtocolTool.Name == toolName);
+        var options = ServerOptionsFactory.Create(services);
+        var tool = Assert.Single(options.ToolCollection!, t => t.ProtocolTool.Name == toolName);
 
         return tool.ProtocolTool.InputSchema.GetProperty("properties").EnumerateObject().Select(p => p.Name).ToArray();
     }
 
     // ---- receipt acknowledgement (the ids the caller echoes back, and nothing else) ----
-
-    // The ack must land BEFORE the read, or an id acknowledged now comes straight back in this same result.
-    [Fact]
-    public async Task Inbox_EchoedIds_AreAckedBeforeTheRead()
-    {
-        var handler = new ScriptedHandler(req =>
-            req.RequestUri!.AbsolutePath.EndsWith("/inbox/ack")
-                ? Json(HttpStatusCode.OK, """{"ok":true}""")
-                : Json(HttpStatusCode.OK, """{"items":[],"count":0}"""));
-
-        var client = new BrokerClient(new HttpClient(handler) { BaseAddress = new Uri("http://localhost") });
-
-        await PollTools.Inbox(client, new SessionState { PeerId = "p" }, ack_inbox_ids: ["ib1", "ib2"]);
-
-        Assert.Collection(handler.Requests,
-            ack =>
-            {
-                Assert.Equal("POST", ack.Method);
-                Assert.Equal("/peers/p/inbox/ack", ack.Path);
-                // Exactly the echoed ids — not "all", which would sweep away everything that arrived since.
-                Assert.Equal("""{"inboxIds":["ib1","ib2"],"all":false}""", ack.Body);
-            },
-            read =>
-            {
-                Assert.Equal("GET", read.Method);
-                Assert.Equal("/peers/p/inbox", read.Path);
-            });
-    }
-
-    // The whole point of the change: a read acknowledges nothing on its own. An empty echo must not reach
-    // the broker either — /inbox/ack rejects a request carrying neither ids nor all=true.
-    [Fact]
-    public async Task Inbox_WithoutEchoedIds_AcksNothing()
-    {
-        foreach (var ackIds in new[] { null, Array.Empty<string>() })
-        {
-            var handler = new ScriptedHandler(_ => Json(HttpStatusCode.OK, OneItemBody("ib1")));
-            var client = new BrokerClient(new HttpClient(handler) { BaseAddress = new Uri("http://localhost") });
-
-            var json = await PollTools.Inbox(client, new SessionState { PeerId = "p" }, ack_inbox_ids: ackIds);
-
-            // The item came back...
-            using var doc = JsonDocument.Parse(json);
-            Assert.Equal("ib1", doc.RootElement.GetProperty("items")[0].GetProperty("inbox_id").GetString());
-            // ...and the broker was never asked to ack anything, so it will come back again.
-            Assert.DoesNotContain(handler.Requests, r => r.Path.EndsWith("/inbox/ack"));
-        }
-    }
 
     // Same receipt contract on the long-poll tool.
     [Fact]
@@ -651,7 +592,7 @@ public class PeerWaitTests
 
         var client = new BrokerClient(new HttpClient(handler) { BaseAddress = new Uri("http://localhost") });
 
-        await PollTools.Wait(client, new SessionState { PeerId = "p" }, timeout_seconds: 1, ack_inbox_ids: ["ib1"]);
+        await Wait(client, new SessionState { PeerId = "p" }, timeoutSeconds: 1, ackInboxIds: ["ib1"]);
 
         Assert.Collection(handler.Requests,
             ack => Assert.Equal(("POST", "/peers/p/inbox/ack"), (ack.Method, ack.Path)),
@@ -668,12 +609,12 @@ public class PeerWaitTests
         var handler = new ScriptedHandler(req => Json(HttpStatusCode.OK, EmptyTimedOutBody()));
         var client = new BrokerClient(new HttpClient(handler) { BaseAddress = new Uri("http://localhost") });
 
-        var noProgress = await PollTools.Wait(client, new SessionState { PeerId = "p" }, 5);
+        var noProgress = await Wait(client, new SessionState { PeerId = "p" }, 5);
         Assert.Equal(emptyBaseline, noProgress);
 
         // ...and reporting progress does not change it either.
-        var withProgress = await PollTools.WaitCore(
-            client, new SessionState { PeerId = "p" }, 5, ack_inbox_ids: null, new RecordingProgress(), TimeSpan.FromMilliseconds(5));
+        var withProgress = await WaitCore(
+            client, new SessionState { PeerId = "p" }, 5, ackInboxIds: null, new RecordingProgress(), TimeSpan.FromMilliseconds(5));
         Assert.Equal(noProgress, withProgress);
     }
 }

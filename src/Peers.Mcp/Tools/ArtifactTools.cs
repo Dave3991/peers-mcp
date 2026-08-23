@@ -2,6 +2,8 @@ using System.ComponentModel;
 using System.Text.Json;
 using ModelContextProtocol.Server;
 using Peers.Mcp;
+using Peers.Mcp.Lifecycle;
+using Microsoft.Extensions.Logging;
 using Peers.Shared.Contracts;
 
 namespace Peers.Mcp.Tools;
@@ -19,6 +21,8 @@ public sealed class ArtifactTools
     public static async Task<string> Publish(
         BrokerClient client,
         SessionState state,
+        McpServer server,
+        ILoggerFactory loggerFactory,
         [Description("Artifact namespace (e.g. repo name or project)")] string @namespace,
         [Description("Artifact name (e.g. 'auth-api-contract')")] string name,
         [Description("Artifact type: openapi-spec, typescript-types, diff, summary, test-report, schema, config, other")] string type,
@@ -29,7 +33,7 @@ public sealed class ArtifactTools
         [Description("Content MIME type")] string? content_type = null,
         [Description("Tags to attach to this artifact")] string[]? tags = null)
     {
-        if (state.PeerId is null) return """{"error":"Not registered. Call peer_register first."}""";
+        await SessionRegistration.EnsureRegisteredAsync(client, state, server, loggerFactory);
         try
         {
             var resp = await client.PublishArtifactAsync(new PublishArtifactRequest

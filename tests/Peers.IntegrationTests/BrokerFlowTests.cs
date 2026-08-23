@@ -96,62 +96,48 @@ public sealed class BrokerFlowTests : IAsyncLifetime
     }
 
     // -------------------------------------------------------------------------
-    // 3-5. Scratchpad flow  (ScratchpadRoutes + ScratchpadService + RecipientResolver
+    // 3-5. Channel flow (ChannelRoutes + ChannelService + RecipientResolver
     //      + InboxRepository + EventService)
     // -------------------------------------------------------------------------
     [Fact]
-    public async Task ScratchpadFlow_CreateAppendInbox()
+    public async Task ChannelFlow_CreateSendMentionInbox()
     {
         var peerA = await RegisterPeerAsync("m-a");
         var peerB = await RegisterPeerAsync("m-b");
 
-        // 3. Create scratchpad as A, requesting B as reviewer
-        var createReq = new CreateScratchpadRequest
+        var createResp = await _http.PostAsJsonAsync("/channels", new CreateChannelRequest
         {
-            Type = "review",
-            Title = "T15 smoke",
+            Name = "T15-smoke",
+            RepoRoot = "/repo",
             CreatedByPeerId = peerA,
-            RequestedReviewers = JsonSerializer.Serialize(new[] { peerB }),
-        };
-        var createResp = await _http.PostAsJsonAsync("/scratchpads", createReq, JsonOpts);
+        }, JsonOpts);
         Assert.Equal(HttpStatusCode.OK, createResp.StatusCode);
 
         var createDoc = await createResp.Content.ReadFromJsonAsync<JsonDocument>(JsonOpts);
         Assert.NotNull(createDoc);
-        var scratchpadId = createDoc!.RootElement.GetProperty("scratchpadId").GetString();
-        Assert.False(string.IsNullOrEmpty(scratchpadId));
+        var channelId = createDoc!.RootElement.GetProperty("channelId").GetString();
+        Assert.False(string.IsNullOrEmpty(channelId));
 
-        // Verify B is in recipients
-        var recipients = createDoc.RootElement.GetProperty("recipients");
-        var online = recipients.GetProperty("onlinePeerIds");
-        var hasB = Enumerable.Range(0, online.GetArrayLength())
-            .Any(i => online[i].GetString() == peerB);
-        Assert.True(hasB, "B should appear as an online recipient of the scratchpad.created event");
+        // A sends a LOUD message mentioning B: everyone sees it, B also gets an inbox row.
+        var sendReq = new SendMessageRequest { AuthorPeerId = peerA, Content = "hello all", To = [peerB] };
+        var sendResp = await _http.PostAsJsonAsync($"/channels/{channelId}/messages", sendReq, JsonOpts);
+        Assert.Equal(HttpStatusCode.OK, sendResp.StatusCode);
 
-        // 4. B's inbox should have the scratchpad.created event
-        var inboxResp = await _http.GetAsync($"/peers/{peerB}/inbox");
-        Assert.Equal(HttpStatusCode.OK, inboxResp.StatusCode);
+        var inbox = await _http.GetFromJsonAsync<JsonDocument>($"/peers/{peerB}/inbox", JsonOpts);
+        Assert.True(inbox!.RootElement.GetProperty("count").GetInt32() >= 1,
+            "B's inbox should hold the mention");
 
-        var inboxDoc = await inboxResp.Content.ReadFromJsonAsync<JsonDocument>(JsonOpts);
-        Assert.NotNull(inboxDoc);
-        var count = inboxDoc!.RootElement.GetProperty("count").GetInt32();
-        Assert.True(count >= 1, $"B's inbox should have ≥1 item, got {count}");
+        // A whisper to B is invisible in C's read — participant-scoped visibility over HTTP.
+        var peerC = await RegisterPeerAsync("m-c");
+        var quietReq = new SendMessageRequest { AuthorPeerId = peerA, Content = "whisper", To = [peerB], Quiet = true };
+        Assert.Equal(HttpStatusCode.OK, (await _http.PostAsJsonAsync($"/channels/{channelId}/messages", quietReq, JsonOpts)).StatusCode);
 
-        // 5. B appends a reply; A's inbox should receive it
-        var appendReq = new AppendEntryRequest
-        {
-            AuthorPeerId = peerB,
-            Content = "LGTM from B",
-        };
-        var appendResp = await _http.PostAsJsonAsync($"/scratchpads/{scratchpadId}/entries", appendReq, JsonOpts);
-        Assert.Equal(HttpStatusCode.OK, appendResp.StatusCode);
+        // Fresh joins post one loud row per repo-matched channel, so C's own join row is visible here too.
+        var cView = await _http.GetFromJsonAsync<JsonDocument>($"/channels/{channelId}/messages?viewer={peerC}", JsonOpts);
+        Assert.Equal(2, cView!.RootElement.GetProperty("messages").GetArrayLength());
 
-        var aInboxResp = await _http.GetAsync($"/peers/{peerA}/inbox");
-        Assert.Equal(HttpStatusCode.OK, aInboxResp.StatusCode);
-        var aInboxDoc = await aInboxResp.Content.ReadFromJsonAsync<JsonDocument>(JsonOpts);
-        Assert.NotNull(aInboxDoc);
-        var aCount = aInboxDoc!.RootElement.GetProperty("count").GetInt32();
-        Assert.True(aCount >= 1, $"A's inbox should have ≥1 item after B's reply, got {aCount}");
+        var bView = await _http.GetFromJsonAsync<JsonDocument>($"/channels/{channelId}/messages?viewer={peerB}", JsonOpts);
+        Assert.Equal(3, bView!.RootElement.GetProperty("messages").GetArrayLength());
     }
 
     // -------------------------------------------------------------------------
@@ -187,34 +173,16 @@ public sealed class BrokerFlowTests : IAsyncLifetime
     }
 
     // -------------------------------------------------------------------------
-    // 8. Scratchpad close — idempotency / conflict  (T16 #2 over HTTP)
+    // 8. Duplicate channel name in the same scope → 400
     // -------------------------------------------------------------------------
     [Fact]
-    public async Task CloseScratchpad_SecondCloseReturns409()
+    public async Task ChannelCreate_DuplicateNameInScope_ReturnsBadRequest()
     {
-        var peerA = await RegisterPeerAsync("m-close");
+        var peerA = await RegisterPeerAsync("m-dup");
 
-        var createReq = new CreateScratchpadRequest
-        {
-            Type = "review",
-            Title = "close-test",
-            CreatedByPeerId = peerA,
-        };
-        var createResp = await _http.PostAsJsonAsync("/scratchpads", createReq, JsonOpts);
-        createResp.EnsureSuccessStatusCode();
-
-        var createDoc = await createResp.Content.ReadFromJsonAsync<JsonDocument>(JsonOpts);
-        var scratchpadId = createDoc!.RootElement.GetProperty("scratchpadId").GetString()!;
-
-        var closeReq = new CloseScratchpadRequest { Resolution = "done" };
-
-        // First close → 200
-        var close1 = await _http.PatchAsJsonAsync($"/scratchpads/{scratchpadId}/close", closeReq, JsonOpts);
-        Assert.Equal(HttpStatusCode.OK, close1.StatusCode);
-
-        // Second close → 409 Conflict
-        var close2 = await _http.PatchAsJsonAsync($"/scratchpads/{scratchpadId}/close", closeReq, JsonOpts);
-        Assert.Equal(HttpStatusCode.Conflict, close2.StatusCode);
+        var createReq = new CreateChannelRequest { Name = "dup-test", RepoRoot = "/repo", CreatedByPeerId = peerA };
+        Assert.Equal(HttpStatusCode.OK, (await _http.PostAsJsonAsync("/channels", createReq, JsonOpts)).StatusCode);
+        Assert.Equal(HttpStatusCode.BadRequest, (await _http.PostAsJsonAsync("/channels", createReq, JsonOpts)).StatusCode);
     }
 
     // -------------------------------------------------------------------------
