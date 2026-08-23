@@ -75,14 +75,14 @@ public sealed class ScratchpadTools
         "Append a markdown entry to an existing scratchpad. Use for review comments, follow-ups, and ongoing discussion.\n" +
         "Limit: 100 KB per entry; for large blobs publish an artifact and reference it instead.\n" +
         "Idempotency: passing idempotency_key dedups per-pad — a duplicate returns {\"duplicate\":true,...} with no new entry.\n" +
-        "Side effect: emits an event and pushes to recipients unless quiet=true. Returns: { entry_id, recipients, delivery_summary } on first write.")]
+        "Side effect: emits an event and pushes to recipients unless quiet=true — quiet suppresses the push message only, subscribers to the pad resource are still notified. Returns: { entry_id, recipients, delivery_summary } on first write.")]
     public static async Task<string> Append(
         BrokerClient client,
         SessionState state,
         [Description("Scratchpad ID to append to")] string scratchpad_id,
         [Description("Markdown content to append")] string content,
         [Description("Unique key for idempotent append (prevents duplicates)")] string? idempotency_key = null,
-        [Description("Suppress push notification for this entry (event still recorded)")] bool? quiet = null)
+        [Description("Suppress the push notification for this entry. The entry is still recorded, still lands in each recipient's peer_inbox, and still notifies anyone subscribed to the pad resource.")] bool? quiet = null)
     {
         if (state.PeerId is null) return """{"error":"Not registered. Call peer_register first."}""";
         try

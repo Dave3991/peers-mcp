@@ -48,7 +48,7 @@ public sealed class PeerService(PeerRepository peers, EventService eventService)
         var recipients = sameBranch.Count > 0 ? sameBranch : otherPeers.Where(p => p.PeerId != id).ToList();
         var recipientPeerIds = recipients.Select(p => p.PeerId).ToArray();
 
-        await eventService.EmitAsync(EventTypes.PeerRegistered,
+        var eventId = await eventService.EmitAsync(EventTypes.PeerRegistered,
             JsonSerializer.Serialize(new { peer_id = id, tool = req.Tool, repo_root = req.RepoRoot, recipient_peer_ids = recipientPeerIds }),
             ct, recipientPeerIds);
 
@@ -57,6 +57,7 @@ public sealed class PeerService(PeerRepository peers, EventService eventService)
             PeerId = id,
             LastCursor = resumedPeer?.LastPolledEventId ?? 0,
             Resumed = resumedPeer is not null,
+            LatestEventId = eventId,
         };
     }
 
@@ -64,10 +65,28 @@ public sealed class PeerService(PeerRepository peers, EventService eventService)
     {
         var rows = await peers.RenewLeaseAsync(peerId, DateTime.UtcNow.Add(LeaseDuration),
             req.Summary, req.Role, req.Branch, req.CommitSha, req.FocusPaths, req.Capabilities, ct);
-        return rows == 0
-            ? Result.Fail(new NotFoundError($"Peer '{peerId}' not found. Re-register before sending heartbeats."))
-            : Result.Ok();
+        if (rows == 0)
+            return Result.Fail(new NotFoundError($"Peer '{peerId}' not found. Re-register before sending heartbeats."));
+
+        // Only a heartbeat that actually carries a status field changes what peers://peers shows, and only
+        // that one may emit. The 30s background heartbeat sends an all-null request purely to renew the
+        // lease, so an idle peer stays at 0 events/min — a per-peer 2/min event floor would be a bigger
+        // regression than the stale-resource bug this fixes.
+        //
+        // No recipients: this is a resource-change signal, not a directed message. Recipients would put a
+        // row in every peer's durable inbox and surface as unread traffic in peer_inbox.
+        if (Changes(req))
+            await eventService.EmitAsync(EventTypes.PeerUpdated,
+                JsonSerializer.Serialize(new { peer_id = peerId }), ct);
+
+        return Result.Ok();
     }
+
+    /// <summary>True when the heartbeat supplied at least one status field. RenewLeaseAsync COALESCEs nulls,
+    /// so an all-null request provably cannot change a single column other than the lease.</summary>
+    private static bool Changes(HeartbeatRequest req) =>
+        req.Summary is not null || req.Role is not null || req.Branch is not null ||
+        req.CommitSha is not null || req.FocusPaths is not null || req.Capabilities is not null;
 
     public async Task<List<Peer>> ListAsync(ListPeersRequest req, CancellationToken ct)
     {

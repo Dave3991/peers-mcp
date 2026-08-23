@@ -20,6 +20,7 @@
 
   <ItemGroup>
     <ProjectReference Include="..\..\src\Peers.Broker\Peers.Broker.csproj" />
+    <ProjectReference Include="..\..\src\Peers.Mcp\Peers.Mcp.csproj" />
   </ItemGroup>
 
 </Project>

@@ -18,5 +18,4 @@ public static class EventTypes
     public const string ScratchpadResolved = "scratchpad.resolved";
     public const string ScratchpadClosed = "scratchpad.closed";
     public const string ArtifactPublished = "artifact.published";
-    public const string PeerMessage = "peer.message";
 }

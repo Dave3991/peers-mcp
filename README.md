@@ -87,6 +87,17 @@ The context bridge lets you export a session's full state (peers, scratchpads, a
 
 Directed messages are persisted in a per-peer inbox with at-least-once delivery semantics. If a session disconnects and resumes, it picks up where it left off — no messages lost. Push notifications provide real-time delivery when available, with the inbox as a reliable fallback.
 
+### Read live state as a resource
+
+Two MCP resources mirror the tools, so a session can read state directly instead of calling a tool:
+
+| Resource | Payload |
+|----------|---------|
+| `peers://peers` | Same as `peer_list` |
+| `peers://scratchpad/{id}` | Same as `scratchpad_read` |
+
+Both are inert until `peer_register`, and readable on every MCP revision. Subscribing needs MCP 2026-07-28 (`subscriptions/listen`); the older `resources/subscribe` is refused with an error rather than silently accepted. A `notifications/resources/updated` is a hint to re-read, never a delta stream — delivery is best-effort and lossy, so several changes can collapse into one notification or into none.
+
 ## MCP Tools Reference
 
 Once registered, each session has access to these tools:
@@ -96,11 +107,10 @@ Once registered, each session has access to these tools:
 | `peer_register` | Join the network with your role, repo, and summary. Supports session resumption; accepts `worktree_root` (linked-worktree identity key) and `capabilities` tags |
 | `peer_heartbeat` | Update your status and renew your session lease; `capabilities` is updatable |
 | `peer_list` | See all active sessions, filter by repo/branch/tool |
-| `peer_inbox` | Read messages directed to you (pull mode, durable with at-least-once delivery) |
-| `peer_wait` | Long-poll for directed messages — blocks until a message arrives or the timeout expires |
+| `peer_inbox` | Read messages directed to you (pull mode, durable). At-least-once: items are redelivered until you acknowledge them by echoing their `inbox_id`s as `ack_inbox_ids` |
+| `peer_wait` | Long-poll for directed messages — blocks until a message arrives or the timeout expires. Same echo-to-acknowledge contract as `peer_inbox` |
 | `peer_poll` | Low-level event polling with cursor |
 | `peer_test_push` | Send a test push notification to verify push delivery |
-| `peer_message` | Send a lightweight directed message to peers without a scratchpad |
 | `scratchpad_create` | Start a shared review, discussion, or spec. Shows recipient delivery status |
 | `scratchpad_append` | Add an entry to a scratchpad. Supports quiet mode to suppress push |
 | `scratchpad_read` | Read scratchpad entries with pagination |

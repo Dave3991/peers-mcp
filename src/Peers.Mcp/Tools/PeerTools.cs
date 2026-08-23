@@ -12,7 +12,7 @@ public sealed class PeerTools
 {
     [McpServerTool(Name = "peer_register"), Description(
         "Register this session as a peer in the local broker. Call once at startup before any other peer tool.\n" +
-        "Side effects: starts a 30s heartbeat loop and a 5s channel-poll loop; lease expires after 2 min without heartbeat.\n" +
+        "Side effects: starts a 30s heartbeat loop and a 5s channel-poll loop, and activates the peers:// resources, which are inert until then; lease expires after 2 min without heartbeat.\n" +
         "Returns: { peer_id, resumed, last_cursor, message }. Pass resume_peer_id to reclaim a previous identity (only succeeds if MachineId matches).\n" +
         "Pass worktree_root when working in a linked git worktree — it participates in identity/resume so two worktrees of the same repo+branch are distinct resumable peers.")]
     public static async Task<string> PeerRegister(
@@ -54,7 +54,8 @@ public sealed class PeerTools
             await state.StopServicesAsync();
             state.PeerId = resp.PeerId;
             state.Tool = tool;
-            state.LastCursor = resp.LastCursor;
+            state.ResetCursorForRegistration(resp.LastCursor);
+            state.ResourceBaseline = resp.LatestEventId;
             state.LastRegisterRequest = req;
 
             state.Heartbeat = new HeartbeatService(client, state, loggerFactory.CreateLogger<HeartbeatService>());

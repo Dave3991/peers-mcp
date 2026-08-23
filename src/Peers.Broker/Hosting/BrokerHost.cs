@@ -32,7 +32,6 @@ public static class BrokerHost
         builder.Services.AddScoped<ScratchpadService>();
         builder.Services.AddScoped<ArtifactService>();
         builder.Services.AddScoped<EventService>();
-        builder.Services.AddScoped<MessageService>();
 
         // Background / status
         builder.Services.AddSingleton<BrokerStatus>();
@@ -50,6 +49,5 @@ public static class BrokerHost
         app.MapArtifactRoutes();
         app.MapPollRoutes();
         app.MapStatusRoutes();
-        app.MapMessageRoutes();
     }
 }

@@ -6,7 +6,7 @@
 
   <ItemGroup>
     <PackageReference Include="Microsoft.Extensions.Hosting" Version="10.0.5" />
-    <PackageReference Include="ModelContextProtocol" Version="1.1.0" />
+    <PackageReference Include="ModelContextProtocol" Version="2.2.0" />
   </ItemGroup>
 
   <PropertyGroup>
@@ -18,6 +18,7 @@
 
   <ItemGroup>
     <InternalsVisibleTo Include="Peers.Mcp.Tests" />
+    <InternalsVisibleTo Include="Peers.IntegrationTests" />
   </ItemGroup>
 
 </Project>

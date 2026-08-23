@@ -97,7 +97,7 @@ public sealed class HeartbeatService : IDisposable, IAsyncDisposable
             };
             var resp = await _client.RegisterAsync(clone);
             _state.PeerId = resp.PeerId;
-            _state.LastCursor = Math.Max(_state.LastCursor, resp.LastCursor); // don't rewind the poll cursor
+            _state.AdvanceCursor(resp.LastCursor); // don't rewind the poll cursor
             _logger.LogInformation("Broker lost peer; self-healed by re-registering as {PeerId} (resumed={Resumed}) — new identity", resp.PeerId, resp.Resumed);
         }
         catch (Exception ex)

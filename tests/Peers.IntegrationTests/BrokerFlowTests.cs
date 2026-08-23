@@ -187,34 +187,6 @@ public sealed class BrokerFlowTests : IAsyncLifetime
     }
 
     // -------------------------------------------------------------------------
-    // 7. Message flow  (MessageRoutes + MessageService)
-    // -------------------------------------------------------------------------
-    [Fact]
-    public async Task MessageFlow_SendAndReceiveInInbox()
-    {
-        var peerA = await RegisterPeerAsync("m-msg-a");
-        var peerB = await RegisterPeerAsync("m-msg-b");
-
-        var msgReq = new SendMessageRequest
-        {
-            FromPeerId = peerA,
-            Targets = new[] { peerB },
-            Content = "direct message smoke",
-        };
-        var msgResp = await _http.PostAsJsonAsync("/messages", msgReq, JsonOpts);
-        Assert.Equal(HttpStatusCode.OK, msgResp.StatusCode);
-
-        // B should see the peer.message in inbox
-        var inboxResp = await _http.GetAsync($"/peers/{peerB}/inbox");
-        Assert.Equal(HttpStatusCode.OK, inboxResp.StatusCode);
-
-        var inboxDoc = await inboxResp.Content.ReadFromJsonAsync<JsonDocument>(JsonOpts);
-        Assert.NotNull(inboxDoc);
-        var count = inboxDoc!.RootElement.GetProperty("count").GetInt32();
-        Assert.True(count >= 1, $"B's inbox should have ≥1 message, got {count}");
-    }
-
-    // -------------------------------------------------------------------------
     // 8. Scratchpad close — idempotency / conflict  (T16 #2 over HTTP)
     // -------------------------------------------------------------------------
     [Fact]

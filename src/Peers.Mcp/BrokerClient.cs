@@ -65,10 +65,6 @@ public sealed class BrokerClient : IDisposable
     public async Task CloseScratchpadAsync(string padId, CloseScratchpadRequest req) =>
         await PatchAsync($"/scratchpads/{padId}/close", req);
 
-    // Messages
-    public async Task<SendMessageResponse> SendMessageAsync(SendMessageRequest req) =>
-        (await PostAsync<SendMessageResponse>("/messages", req))!;
-
     // Artifacts
     public async Task<PublishArtifactResponse> PublishArtifactAsync(PublishArtifactRequest req) =>
         (await PostAsync<PublishArtifactResponse>("/artifacts", req))!;
@@ -86,33 +82,44 @@ public sealed class BrokerClient : IDisposable
     }
 
     // Poll
-    public async Task<PollResponse> PollAsync(string peerId, long cursor, int limit = 100) =>
-        (await GetAsync<PollResponse>($"/poll/{peerId}?cursor={cursor}&limit={limit}"))!;
+    /// <param name="cancellationToken">The caller's cancellation. The background notifier passes its
+    /// shutdown token so a broker that has stopped answering cannot hold process exit for the whole
+    /// 130s HttpClient.Timeout above.</param>
+    public async Task<PollResponse> PollAsync(string peerId, long cursor, int limit = 100, CancellationToken cancellationToken = default) =>
+        (await GetAsync<PollResponse>($"/poll/{peerId}?cursor={cursor}&limit={limit}", cancellationToken))!;
 
     // Inbox
     public async Task<InboxResponse?> GetInboxAsync(string peerId, int limit = 100) =>
         await GetAsync<InboxResponse>($"/peers/{peerId}/inbox?limit={limit}");
 
-    public async Task<InboxResponse?> WaitInboxAsync(string peerId, int timeoutSeconds, int limit = 100)
+    /// <param name="cancellationToken">The caller's cancellation (for peer_wait: the MCP request's).
+    /// Linked with — not replaced by — the broker-hang deadline, because the two stops mean different
+    /// things to the caller and the catch below has to tell them apart.</param>
+    public async Task<InboxResponse?> WaitInboxAsync(string peerId, int timeoutSeconds, int limit = 100, CancellationToken cancellationToken = default)
     {
-        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(timeoutSeconds + 10));
+        using var cts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        cts.CancelAfter(TimeSpan.FromSeconds(timeoutSeconds + 10));
         using var req = new HttpRequestMessage(HttpMethod.Get, $"/peers/{peerId}/inbox/wait?timeout_seconds={timeoutSeconds}&limit={limit}");
         try
         {
             var resp = await _http.SendAsync(req, cts.Token);
             if (!resp.IsSuccessStatusCode)
             {
-                var body = await resp.Content.ReadAsStringAsync();
+                var body = await resp.Content.ReadAsStringAsync(cts.Token);
                 throw new BrokerApiException(resp.StatusCode, body);
             }
-            return await resp.Content.ReadFromJsonAsync<InboxResponse>(JsonOpts);
+            return await resp.Content.ReadFromJsonAsync<InboxResponse>(JsonOpts, cts.Token);
         }
-        catch (OperationCanceledException) { throw new BrokerApiException(System.Net.HttpStatusCode.GatewayTimeout, "Broker did not respond within the wait window."); }
+        // Only OUR deadline (or HttpClient.Timeout) is a broker timeout. A caller-cancelled call is a
+        // different event and must not be laundered into one: peer_wait would report timed_out for a
+        // request the client abandoned.
+        catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
+        { throw new BrokerApiException(System.Net.HttpStatusCode.GatewayTimeout, "Broker did not respond within the wait window."); }
         catch (HttpRequestException ex) { throw BrokerApiException.FromTransport(ex); }
     }
 
-    public async Task AckInboxAsync(string peerId, string[]? inboxIds = null, bool all = false) =>
-        await PostAsync<object>($"/peers/{peerId}/inbox/ack", new { InboxIds = inboxIds, All = all });
+    public async Task AckInboxAsync(string peerId, string[]? inboxIds = null, bool all = false, CancellationToken cancellationToken = default) =>
+        await PostAsync<object>($"/peers/{peerId}/inbox/ack", new { InboxIds = inboxIds, All = all }, cancellationToken);
 
     // Health
     public async Task<bool> IsHealthyAsync()
@@ -125,32 +132,32 @@ public sealed class BrokerClient : IDisposable
         catch { return false; }
     }
 
-    private async Task<T?> GetAsync<T>(string path)
+    private async Task<T?> GetAsync<T>(string path, CancellationToken cancellationToken = default)
     {
         try
         {
-            var resp = await _http.GetAsync(path);
+            var resp = await _http.GetAsync(path, cancellationToken);
             if (!resp.IsSuccessStatusCode)
             {
-                var body = await resp.Content.ReadAsStringAsync();
+                var body = await resp.Content.ReadAsStringAsync(cancellationToken);
                 throw new BrokerApiException(resp.StatusCode, body);
             }
-            return await resp.Content.ReadFromJsonAsync<T>(JsonOpts);
+            return await resp.Content.ReadFromJsonAsync<T>(JsonOpts, cancellationToken);
         }
         catch (HttpRequestException ex) { throw BrokerApiException.FromTransport(ex); }
     }
 
-    private async Task<T?> PostAsync<T>(string path, object body)
+    private async Task<T?> PostAsync<T>(string path, object body, CancellationToken cancellationToken = default)
     {
         try
         {
-            var resp = await _http.PostAsJsonAsync(path, body, JsonOpts);
+            var resp = await _http.PostAsJsonAsync(path, body, JsonOpts, cancellationToken);
             if (!resp.IsSuccessStatusCode)
             {
-                var errorBody = await resp.Content.ReadAsStringAsync();
+                var errorBody = await resp.Content.ReadAsStringAsync(cancellationToken);
                 throw new BrokerApiException(resp.StatusCode, errorBody);
             }
-            return await resp.Content.ReadFromJsonAsync<T>(JsonOpts);
+            return await resp.Content.ReadFromJsonAsync<T>(JsonOpts, cancellationToken);
         }
         catch (HttpRequestException ex) { throw BrokerApiException.FromTransport(ex); }
     }

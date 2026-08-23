@@ -1,3 +1,14 @@
+// ponytail: MCP9005 disabled file-wide. The MCP Logging feature (LoggingLevel,
+// notifications/message) is deprecated as of spec revision 2026-07-28 (SEP-2577), but it is
+// still the only push path for clients on 2025-11-25 and earlier — which today is all of them.
+// Scoped to this file rather than <NoWarn> in the csproj so the NEXT MCP9005 elsewhere is still
+// reported. Remove the pragma, and this push path, once no supported client predates 2026-07-28.
+//
+// This disable runs to end of file, so DO NOT add new (non-legacy) code here: it would be silently
+// exempt from MCP9005. Subscription registry and resources/updated dispatch live in their own
+// files precisely so they stay under live deprecation warnings; this class only calls into them.
+#pragma warning disable MCP9005
+
 using System.Text.Json;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
@@ -15,11 +26,21 @@ public sealed class ChannelNotifier : IDisposable, IAsyncDisposable
     private readonly ILogger<ChannelNotifier> _logger;
     private readonly CancellationTokenSource _cts = new();
     private long _channelCursor;
+    private long _resourceBaseline;
     private Task? _task;
     private int _disposeStarted;
 
     private static readonly TimeSpan PollInterval = TimeSpan.FromSeconds(5);
     private const string LoggerName = "peers.channel";
+
+    /// <summary>
+    /// SEP-2577 retires the MCP logging feature: from this revision on, MetaKeys.LogLevel scopes log
+    /// notifications to a request, so an UNSOLICITED notifications/message has no conforming form.
+    /// The SDK's own McpProtocolVersions and McpSession.IsJuly2026OrLaterProtocol are both internal
+    /// (compile-checked against 2.2.0), so the comparison lives here. Revision strings are fixed-width
+    /// ISO dates, which order correctly under ordinal comparison.
+    /// </summary>
+    private const string July2026ProtocolVersion = "2026-07-28";
 
     public ChannelNotifier(BrokerClient client, SessionState state, McpServer server, ILogger<ChannelNotifier>? logger = null)
     {
@@ -37,13 +58,18 @@ public sealed class ChannelNotifier : IDisposable, IAsyncDisposable
             throw new InvalidOperationException("Channel notifier already started.");
 
         _channelCursor = _state.LastCursor;
+        // Resource dispatch starts at the broker head as of registration (the id of this session's own
+        // peer.registered event), NOT at _channelCursor. A fresh peer's cursor is 0, so sharing it would
+        // replay the whole retention window of every pad's history as resources/updated the moment a
+        // subscription opened. Separate baseline, so the push path's resume-from-cursor is untouched.
+        _resourceBaseline = _state.ResourceBaseline;
         _task = RunAsync(_cts.Token);
     }
 
     private async Task RunAsync(CancellationToken ct)
     {
-        _logger.LogDebug("ChannelNotifier started for peer {PeerId}, cursor={Cursor}, delivery={DeliveryMode}",
-            _state.PeerId, _channelCursor, DescribeDeliveryMode());
+        _logger.LogDebug("ChannelNotifier started for peer {PeerId}, cursor={Cursor}, claudeChannel={ClaudeChannel}, legacyLogPushRetired={Retired}",
+            _state.PeerId, _channelCursor, UsesClaudeChannel(), SuppressesLegacyLogPush());
 
         while (!ct.IsCancellationRequested)
         {
@@ -54,14 +80,39 @@ public sealed class ChannelNotifier : IDisposable, IAsyncDisposable
                 if (_state.PeerId is null)
                     continue;
 
-                var resp = await _client.PollAsync(_state.PeerId, _channelCursor, 50);
+                var resp = await _client.PollAsync(_state.PeerId, _channelCursor, 50, ct);
                 if (resp.Events.Count == 0)
                     continue;
 
+                var fromCursor = _channelCursor;
                 _logger.LogDebug("Poll returned {Count} events ({FromCursor} -> {ToCursor})",
-                    resp.Events.Count, _channelCursor, resp.Cursor);
+                    resp.Events.Count, fromCursor, resp.Cursor);
                 _channelCursor = resp.Cursor;
-                _state.LastCursor = Math.Max(_state.LastCursor, _channelCursor);
+                _state.AdvanceCursor(_channelCursor);
+
+                // Resource subscriptions dispatch BEFORE ShouldDeliver/IsOwnEvent on purpose. Those two
+                // filters are right for directed pushes and wrong for subscriptions: a subscriber to a pad
+                // wants every update to it, including ones it is not a named recipient of and ones it made
+                // itself — the resource genuinely changed, and the client can dedupe.
+                //
+                // Per-batch, not per-event: resources/updated is a hint to re-read, so N changes to one URI
+                // in one batch are one hint. The registry coalesces; this only feeds it the batch.
+                //
+                // Catch mirrors how TryPushAsync swallows: the cursor already advanced above, so one throw
+                // here would abandon the whole batch — past the cursor, unrecoverable — including the push
+                // path below.
+                try
+                {
+                    var subscriptions = _state.Subscriptions;
+                    if (subscriptions is not null)
+                        await subscriptions.NotifyEventsAsync(
+                            resp.Events.Where(evt => evt.EventId > _resourceBaseline), ct);
+                }
+                catch (Exception ex) when (ex is not OperationCanceledException)
+                {
+                    _logger.LogWarning(ex, "Resource-updated dispatch failed for batch ({FromCursor} -> {ToCursor})",
+                        fromCursor, resp.Cursor);
+                }
 
                 foreach (var evt in resp.Events)
                 {
@@ -95,15 +146,24 @@ public sealed class ChannelNotifier : IDisposable, IAsyncDisposable
                     await TryPushAsync(message, ct);
                 }
             }
-            catch (OperationCanceledException) { break; }
+            // ONLY our own shutdown ends the loop. An unfiltered catch here cannot tell that from an
+            // HttpClient timeout, which surfaces as TaskCanceledException — an OperationCanceledException —
+            // so one unresponsive-broker stall used to kill push and resources/updated for the whole life
+            // of the session, silently, while peer_inbox kept working and nothing looked broken.
+            catch (OperationCanceledException) when (ct.IsCancellationRequested) { break; }
+            // Everything else, including that timeout, is transient: logged and retried on the next tick.
             catch (Exception ex)
             {
-                _logger.LogWarning(ex, "ChannelNotifier poll loop error");
+                _logger.LogWarning(ex, "ChannelNotifier poll loop error; retrying in {PollInterval}", PollInterval);
             }
         }
     }
 
-    public async Task SendTestNotificationAsync(string content, CancellationToken ct = default)
+    /// <summary>
+    /// Diagnostic push for peer_test_push. Returns what actually happened — including "sent nothing, and
+    /// why" — because a diagnostic that reports success without delivering is worse than no diagnostic.
+    /// </summary>
+    public async Task<PushResult> SendTestNotificationAsync(string content, CancellationToken ct = default)
     {
         var msgId = $"peers_test_{DateTimeOffset.UtcNow.ToUnixTimeMilliseconds()}";
         _logger.LogDebug("Sending test notification {MessageId}", msgId);
@@ -121,39 +181,55 @@ public sealed class ChannelNotifier : IDisposable, IAsyncDisposable
             FromPeerId = "peers",
         };
 
-        await TryPushAsync(message, ct, throwOnFailure: true);
+        var result = await TryPushAsync(message, ct, throwOnFailure: true);
 
-        _logger.LogDebug("Test notification sent {MessageId}", msgId);
+        _logger.LogDebug("Test notification {MessageId}: {Outcome} — {Detail}", msgId, result.Outcome, result.Detail);
+        return result;
     }
 
-    private async Task TryPushAsync(PendingChannelMessage message, CancellationToken ct, bool throwOnFailure = false)
+    /// <summary>
+    /// Sends one message by the one method that applies. There is never a combination to fall back
+    /// through: notifications/claude/channel is custom and SEP-2577 has no opinion on it, so a Claude
+    /// client takes it and nothing else; every other client takes the legacy log push, unless the
+    /// negotiated revision retired that — which leaves nothing conforming to send at all.
+    /// </summary>
+    private async Task<PushResult> TryPushAsync(PendingChannelMessage message, CancellationToken ct, bool throwOnFailure = false)
     {
-        var methods = GetPushMethods();
-        Exception? lastFailure = null;
+        var claudeChannel = UsesClaudeChannel();
 
-        foreach (var method in methods)
+        // No method at all is not a failure to retry — it is a standing property of the negotiated
+        // revision. Reported, never thrown: the poll loop has nothing to do about it, and peer_test_push
+        // needs the reason rather than an exception message.
+        if (!claudeChannel && SuppressesLegacyLogPush())
         {
-            try
-            {
-                switch (method)
-                {
-                    case PushMethod.LoggingMessage:
-                        await TryPushViaLoggingMessageAsync(message, ct);
-                        return;
-                    case PushMethod.ClaudeChannel:
-                        await TryPushViaClaudeChannelAsync(message, ct);
-                        return;
-                }
-            }
-            catch (Exception ex)
-            {
-                lastFailure = ex;
-                _logger.LogWarning(ex, "Push failed for message {MessageId}", message.MessageId);
-            }
+            _logger.LogDebug("No conforming push method for message {MessageId}; pull-mode peer_inbox covers delivery",
+                message.MessageId);
+            return new PushResult(
+                PushOutcome.SuppressedByProtocolRevision,
+                $"Nothing sent: protocol revision {_server.NegotiatedProtocolVersion} retired unsolicited " +
+                "notifications/message (SEP-2577). Resource subscriptions or pull-mode peer_inbox cover delivery.");
         }
 
-        if (throwOnFailure && lastFailure is not null)
-            throw lastFailure;
+        try
+        {
+            if (claudeChannel)
+            {
+                await TryPushViaClaudeChannelAsync(message, ct);
+                return new PushResult(PushOutcome.ClaudeChannel, "Sent as notifications/claude/channel.");
+            }
+
+            await TryPushViaLoggingMessageAsync(message, ct);
+            return new PushResult(PushOutcome.LoggingMessage, "Sent as notifications/message.");
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Push failed for message {MessageId}", message.MessageId);
+            // The poll loop swallows — one dead push must not abandon the batch, whose cursor already
+            // advanced. peer_test_push asks to rethrow, because a diagnostic owes the caller the reason.
+            if (throwOnFailure)
+                throw;
+            return new PushResult(PushOutcome.Failed, ex.Message);
+        }
     }
 
     private async Task TryPushViaLoggingMessageAsync(PendingChannelMessage message, CancellationToken ct)
@@ -197,13 +273,9 @@ public sealed class ChannelNotifier : IDisposable, IAsyncDisposable
         _logger.LogDebug("Channel push succeeded {MessageId}", message.MessageId);
     }
 
-    private PushMethod[] GetPushMethods()
-    {
-        if (UsesClaudeChannel())
-            return [PushMethod.ClaudeChannel];
-
-        return [PushMethod.LoggingMessage];
-    }
+    /// <summary>True once the negotiated revision is 2026-07-28 or later. Null (pre-initialize) means no.</summary>
+    private bool SuppressesLegacyLogPush() =>
+        string.CompareOrdinal(_server.NegotiatedProtocolVersion, July2026ProtocolVersion) >= 0;
 
     private bool UsesClaudeChannel()
     {
@@ -215,23 +287,6 @@ public sealed class ChannelNotifier : IDisposable, IAsyncDisposable
         var clientName = _server.ClientInfo?.Name;
         return !string.IsNullOrWhiteSpace(clientName)
             && clientName.Contains("claude", StringComparison.OrdinalIgnoreCase);
-    }
-
-    private string DescribeDeliveryMode()
-    {
-        var methods = GetPushMethods();
-        return string.Join(", ", methods.Select(method => method switch
-        {
-            PushMethod.LoggingMessage => "notifications/message",
-            PushMethod.ClaudeChannel => "notifications/claude/channel",
-            _ => method.ToString(),
-        }));
-    }
-
-    private enum PushMethod
-    {
-        LoggingMessage,
-        ClaudeChannel,
     }
 
     private bool ShouldDeliver(PeerEvent evt)
@@ -368,17 +423,6 @@ public sealed class ChannelNotifier : IDisposable, IAsyncDisposable
                     fromPeerId: null,
                     level: LoggingLevel.Info,
                     content: $"Peers: {root.GetProp("expired_count") ?? "?"} peer(s) expired"),
-
-                EventTypes.PeerMessage => BuildMessage(
-                    evt,
-                    scratchpadId: null,
-                    title: "Direct message",
-                    fromPeerId: root.GetProp("from_peer_id"),
-                    level: LoggingLevel.Warning,
-                    content: $"Peers DM from {root.GetProp("from_peer_id") ?? "unknown"}: " +
-                             (root.GetProp("content") is { } c
-                                 ? c.Length > 200 ? c[..200] + "..." : c
-                                 : "(empty)")),
 
                 _ => null,
             };

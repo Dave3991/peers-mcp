@@ -55,7 +55,7 @@ public class HeartbeatServiceTests
             if (req.Method == HttpMethod.Patch && req.RequestUri!.AbsolutePath.Contains("/heartbeat"))
                 return Json(HttpStatusCode.NotFound, "{\"error\":\"not found\"}");
             if (req.Method == HttpMethod.Post && req.RequestUri!.AbsolutePath == "/peers")
-                return Json(HttpStatusCode.OK, "{\"peerId\":\"new-id\",\"resumed\":false,\"lastCursor\":7}");
+                return Json(HttpStatusCode.OK, "{\"peerId\":\"new-id\",\"resumed\":false,\"lastCursor\":7,\"latestEventId\":9}");
             return Json(HttpStatusCode.InternalServerError, "{}");
         });
 
@@ -63,9 +63,9 @@ public class HeartbeatServiceTests
         var state = new SessionState
         {
             PeerId = "old-id",
-            LastCursor = 3,
             LastRegisterRequest = new RegisterPeerRequest { Tool = "claude-code", MachineId = "m" }
         };
+        state.ResetCursorForRegistration(3);
 
         var service = new HeartbeatService(client, state, NullLogger<HeartbeatService>.Instance, interval: TimeSpan.FromMilliseconds(40));
         service.Start();
@@ -111,7 +111,6 @@ public class HeartbeatServiceTests
         var state = new SessionState
         {
             PeerId = "old-id",
-            LastCursor = 0,
             LastRegisterRequest = new RegisterPeerRequest { Tool = "claude-code", MachineId = "m" }
         };
 
@@ -156,7 +155,6 @@ public class HeartbeatServiceTests
         var state = new SessionState
         {
             PeerId = "old-id",
-            LastCursor = 0,
             LastRegisterRequest = new RegisterPeerRequest { Tool = "claude-code", MachineId = "m" }
         };
 

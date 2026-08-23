@@ -21,6 +21,14 @@ public sealed class RegisterPeerResponse
     public required string PeerId { get; init; }
     public required long LastCursor { get; init; }
     public required bool Resumed { get; init; }
+
+    /// <summary>
+    /// Id of this registration's own peer.registered event — i.e. the broker's newest event at the moment
+    /// this session came into existence. Event ids are assigned in commit order by a serialised writer, so
+    /// "id &gt; LatestEventId" is exactly "happened after this session registered". Resource subscriptions
+    /// start here; the push path keeps using <see cref="LastCursor"/>.
+    /// </summary>
+    public required long LatestEventId { get; init; }
 }
 
 public sealed class HeartbeatRequest

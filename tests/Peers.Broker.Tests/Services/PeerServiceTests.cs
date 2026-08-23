@@ -3,6 +3,7 @@ using Peers.Broker.Persistence.Repositories;
 using Peers.Broker.Services;
 using Peers.Broker.Tests.Helpers;
 using Peers.Shared.Contracts;
+using Peers.Shared.Models;
 using Xunit;
 
 namespace Peers.Broker.Tests.Services;
@@ -153,6 +154,40 @@ public sealed class PeerServiceTests : IDisposable
         Assert.True(resumed.Resumed);
         Assert.Equal(respA.PeerId, resumed.PeerId);
         Assert.NotEqual(respB.PeerId, resumed.PeerId);
+    }
+
+    // A session that changes role must be visible to peers://peers subscribers, and an idle session must
+    // stay silent: the background heartbeat fires every 30s with an all-null request, so emitting on every
+    // heartbeat would put every peer at a permanent 2 events/min floor.
+    [Fact]
+    public async Task Heartbeat_EmitsPeerUpdated_OnlyWhenAStatusFieldIsSupplied()
+    {
+        var eventRepo = new EventRepository(_db.Factory);
+        var peerRepo = new PeerRepository(_db.Factory);
+        var inboxRepo = new InboxRepository(_db.Factory);
+        var svc = new PeerService(peerRepo, new EventService(eventRepo, peerRepo, inboxRepo));
+
+        var resp = await svc.RegisterAsync(new RegisterPeerRequest
+        {
+            Tool = "claude-code", MachineId = "m", RepoRoot = "/r", Role = "implementing",
+        }, CancellationToken.None);
+        var cursor = resp.LatestEventId;
+
+        // The 30s background heartbeat: renews the lease, changes nothing, emits nothing.
+        Assert.True((await svc.HeartbeatAsync(resp.PeerId, new HeartbeatRequest(), CancellationToken.None)).IsSuccess);
+        Assert.Empty(await eventRepo.GetSinceAsync(cursor, 100, CancellationToken.None));
+
+        // A deliberate status change: exactly one peer.updated.
+        Assert.True((await svc.HeartbeatAsync(resp.PeerId,
+            new HeartbeatRequest { Role = "reviewing" }, CancellationToken.None)).IsSuccess);
+
+        var emitted = await eventRepo.GetSinceAsync(cursor, 100, CancellationToken.None);
+        var evt = Assert.Single(emitted);
+        Assert.Equal(EventTypes.PeerUpdated, evt.Type);
+        Assert.Equal(resp.PeerId, JsonDocument.Parse(evt.Payload).RootElement.GetProperty("peer_id").GetString());
+
+        // Resource-change signal, not a directed message: no inbox row, so peer_inbox stays clean.
+        Assert.Empty(await inboxRepo.GetUnackedAsync(resp.PeerId, 100, CancellationToken.None));
     }
 
     [Fact]
