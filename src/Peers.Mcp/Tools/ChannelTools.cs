@@ -183,14 +183,15 @@ public sealed class ChannelTools
     }
 
     [McpServerTool(Name = "wait"), Description(
-        "Long-poll: block up to timeout_seconds (default 60, max 120) until a directed message arrives — mentions, replies, review requests. Returns as soon as something lands; timed_out:true at the deadline.\n" +
+        "Long-poll: block up to timeout_seconds (default 25, max 120) until a directed message arrives — mentions, replies, review requests. Returns as soon as something lands; timed_out:true at the deadline.\n" +
+        "The default fits inside the 30s MCP request timeout most clients ship. Progress keepalives go out every 5s, but a client that does not reset its deadline on them aborts a longer wait as a transport error — indistinguishable from broker silence — so raise the client's per-server MCP timeout before passing more than 25.\n" +
         "At-least-once by receipt: pass inbox_id values from your PREVIOUS result as ack_inbox_ids; ids you never echo are redelivered, never lost.")]
     public static Task<string> Wait(
         BrokerClient client,
         SessionState state,
         McpServer server,
         ILoggerFactory loggerFactory,
-        [Description("Max seconds to block waiting for directed events (default 60, max 120)")] int? timeout_seconds = null,
+        [Description("Max seconds to block waiting for directed events (default 25, max 120; above 25 needs the client's MCP request timeout raised to match)")] int? timeout_seconds = null,
         [Description("inbox_id values from a PREVIOUS wait result, to acknowledge them")] string[]? ack_inbox_ids = null,
         // SDK-bound (progress token / request cancellation), excluded from the tool schema; see WaitCore.
         IProgress<ProgressNotificationValue>? progress = null,
@@ -220,7 +221,10 @@ public sealed class ChannelTools
             if (ack_inbox_ids is { Length: > 0 })
                 await client.AckInboxAsync(state.PeerId!, ack_inbox_ids, cancellationToken: cancellationToken);
 
-            var t = Math.Clamp(timeout_seconds ?? 60, 1, 120);
+            // 25s, not the broker route's 60: an MCP client's request timeout is one-shot (omp: 30s
+            // default, no progress-based reset), so a longer default hands the caller a transport error
+            // instead of timed_out. Callers who raised their client budget can still ask for up to 120.
+            var t = Math.Clamp(timeout_seconds ?? 25, 1, 120);
             var completed = false;
             // Linked, so a client cancellation stops the ticker as well as the broker call.
             using var cts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);

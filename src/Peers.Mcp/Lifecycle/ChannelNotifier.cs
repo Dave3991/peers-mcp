@@ -4,8 +4,8 @@ using Microsoft.Extensions.Logging.Abstractions;
 namespace Peers.Mcp.Lifecycle;
 
 /// <summary>
-/// The session-side engine of SEP-2575 push: polls the broker every 5 seconds and feeds each batch of
-/// events to the subscription registry, which coalesces them into resources/updated hints per granted
+/// The session-side engine of resource push: polls the broker every 5 seconds and feeds each batch of
+/// events to the subscription registry, which coalesces them into resources/updated hints per subscribed
 /// URI. Directed delivery does NOT run through here — the broker writes inbox rows durably at emit
 /// time, and wait drains them — so this loop is purely a best-effort freshness hint and its failure
 /// modes are deliberately boring.

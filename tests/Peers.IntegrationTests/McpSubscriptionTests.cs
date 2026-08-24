@@ -1,4 +1,5 @@
 using System.Collections.Concurrent;
+using System.Diagnostics;
 using System.IO.Pipelines;
 using System.Reflection;
 using System.Text;
@@ -24,9 +25,9 @@ namespace Peers.IntegrationTests;
 
 /// <summary>
 /// The production wiring end to end: a real broker (in-process), the REAL McpServerOptions the
-/// production entry point builds, and a real MCP client over a stream-pair transport. SEP-2575
-/// subscriptions are the bulk of it; the tools/list and inbox-acknowledgement tests share the same
-/// harness precisely because "real wiring" is the property they all assert.
+/// production entry point builds, and a real MCP client over a stream-pair transport. resources/subscribe
+/// behaviour is the bulk of it; the tools/list and inbox-acknowledgement tests share the same harness
+/// precisely because "real wiring" is the property they all assert.
 ///
 /// The fast tests drive <see cref="SubscriptionRegistry.NotifyEventsAsync"/> with events polled from
 /// the real broker — the same call ChannelNotifier's loop body makes, minus its 5s timer, so they
@@ -42,7 +43,6 @@ public sealed class McpSubscriptionTests : IAsyncLifetime
     private BrokerClient _broker = null!;
     private McpServer _server = null!;
     private StreamServerTransport _transport = null!;
-    private Pipe _clientToServer = null!;
     private Task _serverTask = null!;
     private McpClient _client = null!;
     private RecordingStream _tap = null!;
@@ -85,8 +85,7 @@ public sealed class McpSubscriptionTests : IAsyncLifetime
         // The real production wiring — not a second copy that can pass while production is broken.
         var options = ServerOptionsFactory.Create(_services);
 
-        _clientToServer = new Pipe();
-        var clientToServer = _clientToServer;
+        var clientToServer = new Pipe();
         var serverToClient = new Pipe();
         _tap = new RecordingStream(serverToClient.Writer.AsStream(), _wire);
         _transport = new StreamServerTransport(
@@ -107,7 +106,6 @@ public sealed class McpSubscriptionTests : IAsyncLifetime
 
         _handlers =
         [
-            _client.RegisterNotificationHandler(NotificationMethods.SubscriptionsAcknowledgedNotification, Capture),
             _client.RegisterNotificationHandler(NotificationMethods.ResourceUpdatedNotification, Capture),
             _client.RegisterNotificationHandler(NotificationMethods.CancelledNotification, Capture),
         ];
@@ -153,7 +151,8 @@ public sealed class McpSubscriptionTests : IAsyncLifetime
     }
 
     // -------------------------------------------------------------------------
-    // 1. THE NEGATIVE TEST: a subscriber to pad A hears nothing about pad B.
+    // THE PUSH CONTRACT, case (b): a URI nobody subscribed to yields NOTHING, and
+    // the same batch proves the positive half so silence is never ambiguous.
     // -------------------------------------------------------------------------
     [Fact]
     public async Task SubscriberToPadA_ReceivesNothing_WhenPadBChanges()
@@ -162,7 +161,7 @@ public sealed class McpSubscriptionTests : IAsyncLifetime
         var padA = await CreatePadAsync("pad A");
         var padB = await CreatePadAsync("pad B");
 
-        using var listen = await ListenAsync("sub-neg", PeerResources.ChannelUri(padA));
+        await SubscribeAsync(PeerResources.ChannelUri(padA));
         _notifications.Clear();
 
         await AppendAsync(padB, "change on the pad nobody subscribed to");
@@ -181,180 +180,202 @@ public sealed class McpSubscriptionTests : IAsyncLifetime
             Assert.NotEqual(PeerResources.ChannelUri(padB), n.Params?["uri"]?.GetValue<string>()));
     }
 
-    // -------------------------------------------------------------------------
-    // 2. Positive: ack first, then the update — every message tagged with the subscription id.
-    // -------------------------------------------------------------------------
     [Fact]
-    public async Task Subscribe_AcknowledgesFirst_ThenDeliversTaggedUpdates()
+    public async Task UnsubscribedUri_YieldsNoHints_AtAll()
     {
         await RegisterAsync();
-        var padA = await CreatePadAsync("pad A");
-        var uri = PeerResources.ChannelUri(padA);
+        _notifications.Clear();
 
-        using var listen = await ListenAsync("sub-pos", uri);
+        // A mention lands durably while NOTHING is subscribed: no resources/updated may be generated,
+        // because the push path must never invent delivery for URIs the client did not ask about.
+        await SendReviewRequestToSessionPeerAsync("mention with zero subscribers");
+        await DispatchBrokerEventsAsync();
+        await Task.Delay(Settle);
 
-        // The acknowledgement is the FIRST thing on the subscription.
-        Assert.True(_notifications.TryPeek(out var first));
-        Assert.Equal(NotificationMethods.SubscriptionsAcknowledgedNotification, first.Method);
-        Assert.Equal("sub-pos", SubscriptionIdOf(first.Params!));
-        Assert.Equal(new[] { uri }, GrantedUris(first.Params!));
+        Assert.DoesNotContain(_notifications, n => n.Method == NotificationMethods.ResourceUpdatedNotification);
+    }
 
-        // Declined types are OMITTED, not present-and-false: the spec has clients compare the ack against
-        // what they asked for, and false is a promise about a notification peers never fires.
-        var acknowledged = first.Params!["notifications"]!.AsObject().Select(kv => kv.Key).ToArray();
-        Assert.DoesNotContain("toolsListChanged", acknowledged);
-        Assert.DoesNotContain("promptsListChanged", acknowledged);
-        Assert.DoesNotContain("resourcesListChanged", acknowledged);
+    // -------------------------------------------------------------------------
+    // Case (d): a TEMPLATE URI is what resources/templates/list hands a client, so
+    // subscribing to it verbatim is a plausible mistake. IsMatch accepts it; the
+    // dispatch only ever offers concrete URIs, so granting it would be a
+    // subscription that can never fire. The subscribe call SUCCEEDS on the wire
+    // (there is no refusal protocol to speak of) — "not granted" means the server
+    // never put the URI in its subscriber set, which only the server can see.
+    // -------------------------------------------------------------------------
+    [Fact]
+    public async Task TemplateUri_SubscribeAttempt_IsNotGranted()
+    {
+        await RegisterAsync();
+        var registry = _state.Subscriptions!;
 
-        // ...and again on the wire, which is where the spec's claim actually lives. Omission is not the
-        // registry's doing — it sets those properties to null and relies on McpJsonUtilities.DefaultOptions
-        // ignoring nulls (measured: flip that to JsonIgnoreCondition.Never and `"toolsListChanged": null`
-        // really is emitted). The assertions above only see it through the SDK client's parsed params.
-        var ackFrame = Assert.Single(WireFrames(), f =>
-            Str(f["method"]) == NotificationMethods.SubscriptionsAcknowledgedNotification).ToJsonString();
-        Assert.DoesNotContain("toolsListChanged", ackFrame);
-        Assert.DoesNotContain("promptsListChanged", ackFrame);
-        Assert.DoesNotContain("resourcesListChanged", ackFrame);
+        await _client.SubscribeToResourceAsync(PeerResources.ChannelUriTemplate);
+        await _client.SubscribeToResourceAsync("peers://not-a-resource");
+        Assert.Equal(0, registry.CountForTests);
 
-        await AppendAsync(padA, "an entry");
+        // Control: a concrete URI the server serves IS granted.
+        await _client.SubscribeToResourceAsync(PeerResources.PeersUri);
+        Assert.True(registry.IsSubscribedForTests(PeerResources.PeersUri));
+        Assert.Equal(1, registry.CountForTests);
+    }
+
+    // -------------------------------------------------------------------------
+    // Case (a): the inbox push path. Two mentions land in ONE poll batch — N
+    // changes to one resource are ONE hint, not N.
+    // -------------------------------------------------------------------------
+    [Fact]
+    public async Task MentionBatch_ForSubscribedInbox_YieldsExactlyOneHint()
+    {
+        await RegisterAsync();
+        await SubscribeAsync(PeerResources.InboxUri);
+        _notifications.Clear();
+
+        var author = await _broker.RegisterAsync(new RegisterPeerRequest
+        {
+            Tool = "codex", MachineId = "mention-machine", RepoRoot = "/other-repo", Branch = "main",
+        });
+        var channel = await _broker.CreateChannelAsync(new CreateChannelRequest
+        {
+            Name = $"mentions-{Guid.NewGuid():N}",
+            RepoRoot = "/other-repo",
+            CreatedByPeerId = author.PeerId,
+        });
+        for (var i = 0; i < 2; i++)
+        {
+            var sent = await _broker.SendMessageAsync(channel.ChannelId, new SendMessageRequest
+            {
+                AuthorPeerId = author.PeerId, Content = $"mention {i}", To = [_peerId!],
+            });
+            Assert.NotNull(sent);
+        }
+
         await DispatchBrokerEventsAsync();
 
         var update = await WaitForNotificationAsync(NotificationMethods.ResourceUpdatedNotification);
-        Assert.Equal(uri, update["uri"]!.GetValue<string>());
-        Assert.Equal("sub-pos", SubscriptionIdOf(update));
+        Assert.Equal(PeerResources.InboxUri, update["uri"]!.GetValue<string>());
 
-        // Every message on the stream carries the demux tag, without exception.
-        Assert.All(_notifications, n => Assert.Equal("sub-pos", SubscriptionIdOf(n.Params!)));
-    }
-
-    [Fact]
-    public async Task Subscribe_ToAUriWeDoNotServe_OrToATemplateItself_IsNotGranted()
-    {
-        await RegisterAsync();
-        var pad = await CreatePadAsync("a real pad");
-
-        // The template string is what resources/templates/list hands a client, so subscribing to it
-        // verbatim is a plausible mistake. IsMatch accepts it; the fan-out only offers concrete URIs, so
-        // granting it would be a subscription that can never fire.
-        using var listen = await ListenAsync(
-            "sub-unknown",
-            "peers://not-a-resource",
-            PeerResources.ChannelUriTemplate,
-            PeerResources.ChannelUri(pad),
-            PeerResources.PeersUri);
-
-        Assert.True(_notifications.TryPeek(out var ack));
-        Assert.Equal(
-            new[] { PeerResources.ChannelUri(pad), PeerResources.PeersUri }.Order().ToArray(),
-            GrantedUris(ack.Params!).Order().ToArray());
+        await Task.Delay(Settle);
+        Assert.Single(_notifications);
     }
 
     // -------------------------------------------------------------------------
-    // 3. THE CONCURRENCY PIN. The whole design rests on this: a parked
-    //    subscriptions/listen must not block other requests on the same stdio session.
+    // Case (c): a quiet whisper addressed to a THIRD peer must not produce even a
+    // hint here. The loud mention below proves the stream was alive either way.
     // -------------------------------------------------------------------------
     [Fact]
-    public async Task ToolCall_StillReturns_WhileASubscriptionsListenIsParked()
+    public async Task QuietWhisperForAThirdPeer_YieldsNoInboxHintHere()
     {
         await RegisterAsync();
-        using var listen = await ListenAsync("sub-conc", PeerResources.PeersUri);
-
-        var call = _client.CallToolAsync("peers").AsTask();
-        var finished = await Task.WhenAny(call, Task.Delay(TimeSpan.FromSeconds(10)));
-
-        Assert.True(ReferenceEquals(finished, call),
-            "tools/call did not return while a subscriptions/listen request was parked — the SDK serialises requests and this design is wrong.");
-
-        var result = await call;
-        Assert.True(result.IsError is not true, TextOf(result));
-        Assert.False(listen.Request.IsCompleted, "the listen request should still be parked");
-    }
-
-    // -------------------------------------------------------------------------
-    // 4. Cancellation returns and deregisters.
-    // -------------------------------------------------------------------------
-    [Fact]
-    public async Task CancellingListen_ReturnsAndDeregisters()
-    {
-        await RegisterAsync();
-        var padA = await CreatePadAsync("pad A");
-
-        var listen = await ListenAsync("sub-cancel", PeerResources.ChannelUri(padA));
-        Assert.Equal(1, _state.Subscriptions!.CountForTests);
-
-        // A real stdio client ends a subscription by sending notifications/cancelled referencing
-        // the listen request's id — the client-side CTS alone does NOT reach the server (verified
-        // empirically against the SDK: local token cancellation never fires the server handler's
-        // token). This is what actually unblocks HandleListenAsync's finally-block deregistration.
-        await listen.CancelAsync();
-        listen.Dispose();
-
-        // Verified empirically: once notifications/cancelled is sent, the SDK client faults the
-        // pending request locally with TaskCanceledException (an OperationCanceledException) —
-        // it never surfaces the server's graceful EmptyResult response to the caller.
-        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => listen.Request);
-        await WaitForAsync(() => _state.Subscriptions!.CountForTests == 0, TimeSpan.FromSeconds(5),
-            "the cancelled subscription was never deregistered");
-
+        await SubscribeAsync(PeerResources.InboxUri);
         _notifications.Clear();
-        await AppendAsync(padA, "after cancellation");
+
+        var stranger = await _broker.RegisterAsync(new RegisterPeerRequest
+        {
+            Tool = "codex", MachineId = "stranger-machine", RepoRoot = "/other-repo", Branch = "main",
+        });
+        var channel = await CreatePadAsync("whispers-for-someone-else");
+        await WhisperFromOtherPeerAsync(channel, "not for you", stranger.PeerId);
+        await DispatchBrokerEventsAsync();
+        await Task.Delay(Settle);
+
+        Assert.DoesNotContain(_notifications, n => n.Method == NotificationMethods.ResourceUpdatedNotification);
+
+        // Loud control, same subscription.
+        await SendReviewRequestToSessionPeerAsync("loud control mention");
+        await DispatchBrokerEventsAsync();
+
+        var update = await WaitForNotificationAsync(NotificationMethods.ResourceUpdatedNotification);
+        Assert.Equal(PeerResources.InboxUri, update["uri"]!.GetValue<string>());
+    }
+
+    // -------------------------------------------------------------------------
+    // Case (e), the presence-through-quietness guard: recipient_peer_ids rides
+    // QUIET sends too, so a whisper addressed TO this session produces exactly one
+    // peers://inbox hint even though it is invisible to every other session.
+    // -------------------------------------------------------------------------
+    [Fact]
+    public async Task QuietWhisperAddressedToUs_YieldsExactlyOneInboxHint()
+    {
+        await RegisterAsync();
+        await SubscribeAsync(PeerResources.InboxUri);
+        _notifications.Clear();
+
+        var channel = await CreatePadAsync("whispers-addressed-to-us");
+        await WhisperFromOtherPeerAsync(channel, "quiet, but for you", _peerId!);
+        await DispatchBrokerEventsAsync();
+
+        var update = await WaitForNotificationAsync(NotificationMethods.ResourceUpdatedNotification);
+        Assert.Equal(PeerResources.InboxUri, update["uri"]!.GetValue<string>());
+
+        await Task.Delay(Settle);
+        Assert.Single(_notifications);
+    }
+
+    // -------------------------------------------------------------------------
+    // Reading acknowledges nothing: the resource read leaves the item deliverable,
+    // and wait keeps redelivering it until the caller echoes ack_inbox_ids.
+    // -------------------------------------------------------------------------
+    [Fact]
+    public async Task ReadingTheInboxResource_NeverAcknowledges()
+    {
+        await RegisterAsync();
+        await SendReviewRequestToSessionPeerAsync("read me, but do not ack");
+
+        var first = await _client.ReadResourceAsync(PeerResources.InboxUri);
+        Assert.Contains("inbox_id", TextOf(first));
+
+        // Still there on the second read — reading staged no acknowledgement.
+        var second = await _client.ReadResourceAsync(PeerResources.InboxUri);
+        Assert.Single(InboxIds(JsonNode.Parse(TextOf(second))!));
+
+        // And wait still delivers it, until it is explicitly acked.
+        Assert.Single(InboxIds(await InboxAsync()));
+    }
+
+    [Fact]
+    public async Task Unsubscribe_StopsDelivery()
+    {
+        await RegisterAsync();
+        var pad = await CreatePadAsync("pad going quiet");
+        var uri = PeerResources.ChannelUri(pad);
+
+        await SubscribeAsync(uri);
+        await AppendAsync(pad, "while subscribed");
+        await DispatchBrokerEventsAsync();
+        await WaitForNotificationAsync(NotificationMethods.ResourceUpdatedNotification);
+
+        await _client.UnsubscribeFromResourceAsync(uri);
+        _notifications.Clear();
+
+        await AppendAsync(pad, "after unsubscribing");
         await DispatchBrokerEventsAsync();
         await Task.Delay(Settle);
 
         Assert.Empty(_notifications);
     }
 
-    // -------------------------------------------------------------------------
-    // 4b. ...and a subscription cancelled WHILE the fan-out is mid-flight gets nothing either.
-    //     NotifyUriAsync snapshots its subscribers under the lock and then releases it to await the
-    //     sends, so on a live session a client that cancels one subscriptions/listen could receive a
-    //     resources/updated tagged with the id it just cancelled, AFTER the server had processed the
-    //     cancellation — the exact ordering SEP-2575's subscription id exists to keep straight.
-    //
-    //     Measured, not reasoned about: the wire tap parks the server inside the FIRST subscriber's
-    //     send, which is after the snapshot was taken, and the cancellation is completed server-side
-    //     while it is parked. Without the active-flag re-check this test fails.
-    // -------------------------------------------------------------------------
     [Fact]
-    public async Task SubscriptionCancelledMidFanOut_ReceivesNoUpdate_EvenThoughTheSnapshotPredatesIt()
+    public async Task ThreeChangesToOneResourceInOnePollBatch_CoalesceToOneNotification()
     {
         await RegisterAsync();
-        // The 5s notifier would dispatch this same event on its own schedule and make the window
-        // non-deterministic. This test drives the dispatch itself.
-        await _state.StopServicesAsync();
-
-        var pad = await CreatePadAsync("pad A");
+        var pad = await CreatePadAsync("busy pad");
         var uri = PeerResources.ChannelUri(pad);
 
-        using var held = await ListenAsync("sub-held", uri);
-        var cancelled = await ListenAsync("sub-cancelled-midflight", uri);
+        await SubscribeAsync(uri);
         _notifications.Clear();
 
-        await AppendAsync(pad, "one change, two subscribers");
+        await AppendAsync(pad, "one");
+        await AppendAsync(pad, "two");
+        await AppendAsync(pad, "three");
 
-        // Park the server inside the first subscriber's send: the snapshot of BOTH subscribers is
-        // already taken, and the second one's notification has not gone out yet.
-        _tap.HoldFirstWriteContaining = NotificationMethods.ResourceUpdatedNotification;
-        var dispatch = DispatchBrokerEventsAsync();
-        await _tap.Held.WaitAsync(TimeSpan.FromSeconds(15));
-
-        // Server-side deregistration, waited for explicitly: the SDK client faults a cancelled request
-        // locally the moment it sends, so the client side proves nothing about what the server did.
-        await cancelled.CancelAsync();
-        cancelled.Dispose();
-        await WaitForAsync(() => _state.Subscriptions!.CountForTests == 1, TimeSpan.FromSeconds(10),
-            "the cancellation was never processed server-side, so the race under test never happened");
-
-        _tap.Release();
-        await dispatch;
+        // One poll batch carrying three channel.message_added events for the same URI.
+        await DispatchBrokerEventsAsync();
 
         var update = await WaitForNotificationAsync(NotificationMethods.ResourceUpdatedNotification);
-        Assert.Equal("sub-held", SubscriptionIdOf(update));
+        Assert.Equal(uri, update["uri"]!.GetValue<string>());
 
         await Task.Delay(Settle);
-        Assert.DoesNotContain(_notifications, n =>
-            n.Method == NotificationMethods.ResourceUpdatedNotification
-            && SubscriptionIdOf(n.Params!) == "sub-cancelled-midflight");
+        Assert.Single(_notifications);
     }
 
     // -------------------------------------------------------------------------
@@ -369,7 +390,7 @@ public sealed class McpSubscriptionTests : IAsyncLifetime
         var padA = await CreatePadAsync("pad A");
         var uri = PeerResources.ChannelUri(padA);
 
-        using var listen = await ListenAsync("sub-loop", uri);
+        await SubscribeAsync(uri);
         _notifications.Clear();
 
         await AppendAsync(padA, "authored by the subscriber, addressed to nobody");
@@ -379,7 +400,6 @@ public sealed class McpSubscriptionTests : IAsyncLifetime
             NotificationMethods.ResourceUpdatedNotification, TimeSpan.FromSeconds(25));
 
         Assert.Equal(uri, update["uri"]!.GetValue<string>());
-        Assert.Equal("sub-loop", SubscriptionIdOf(update));
     }
 
     // -------------------------------------------------------------------------
@@ -444,7 +464,7 @@ public sealed class McpSubscriptionTests : IAsyncLifetime
     }
 
     // -------------------------------------------------------------------------
-    // 5. peer_wait's progressToken reaches the client over the wire.
+    // peer_wait's progressToken reaches the client over the wire.
     // -------------------------------------------------------------------------
     [Fact]
     public async Task PeerWait_WithProgressToken_DeliversProgressNotifications()
@@ -466,61 +486,39 @@ public sealed class McpSubscriptionTests : IAsyncLifetime
     }
 
     // -------------------------------------------------------------------------
-    // 5b. The other ending, and the only one a stdio session has besides client
-    //     cancellation: the transport closes. SEP-2575 lists it as its own
-    //     obligation-free ending ("an abrupt transport drop, which carries no
-    //     response"), so peers sends NOTHING — there is no server-initiated
-    //     teardown left to send it from. What still has to happen is local, and it
-    //     is not free: RunAsync waits for in-flight handlers and transport EOF does
-    //     not cancel a parked one, so only McpHost's dispose ends this session. A
-    //     plain `await server.RunAsync()` hangs here instead — measured, not feared.
+    // The regression that started all this: `wait` with NO arguments must come back with a result
+    // inside the request budget a default-configured client gives it. An MCP client's deadline is
+    // one-shot — omp resolves 30s and never extends it on the 5s progress keepalives — so an
+    // advertised window above that budget turned every idle wait into a client-side transport error
+    // the caller could not tell apart from peer silence.
     // -------------------------------------------------------------------------
     [Fact]
-    public async Task TransportClose_EndsAParkedListen_WithoutPuttingAnythingOnTheWire()
+    public async Task PeerWait_DefaultWindow_ReturnsTimedOutInsideAThirtySecondClientBudget()
     {
         await RegisterAsync();
-        var registry = _state.Subscriptions!;
-        using var listen = await ListenAsync("sub-transport", PeerResources.PeersUri);
-        Assert.Equal(1, registry.CountForTests);
 
-        // stdio process exit, faithfully: the write end the server reads from goes away.
-        await _clientToServer.Writer.CompleteAsync();
+        // The client deadline, modelled the way omp models it: fixed at the call, never extended.
+        using var budget = new CancellationTokenSource(TimeSpan.FromSeconds(30));
+        var ticks = new ProgressCollector();
+        var startedAt = Stopwatch.StartNew();
 
-        await _serverTask.WaitAsync(TimeSpan.FromSeconds(10));
-        Assert.Equal(0, registry.CountForTests);
+        // Nothing is addressed to this peer, so only the default window can end the call.
+        var result = await _client.CallToolAsync("wait", progress: ticks, cancellationToken: budget.Token);
+        startedAt.Stop();
 
-        var frames = WireFrames();
-        Assert.DoesNotContain(frames, f => Str(f["method"]) == NotificationMethods.CancelledNotification);
-        Assert.DoesNotContain(frames, f => Str(f["id"]) == "sub-transport");
-    }
-
-    [Fact]
-    public async Task ClientCancelledSubscription_ProducesNoServerSentCancelled()
-    {
-        await RegisterAsync();
-        var listen = await ListenAsync("sub-client-cancel", PeerResources.PeersUri);
-        _notifications.Clear();
-
-        await listen.CancelAsync();
-        listen.Dispose();
-        await WaitForAsync(() => _state.Subscriptions!.CountForTests == 0, TimeSpan.FromSeconds(5),
-            "the cancelled subscription was never deregistered");
-        await Task.Delay(Settle);
-
-        Assert.DoesNotContain(_notifications, n => n.Method == NotificationMethods.CancelledNotification);
-
-        // The cancellation page: a server SHOULD NOT respond to a cancelled request. Measured on the wire
-        // because a cancelled request is off the client's pending map, so a late response is dropped
-        // silently there. (SDK 2.2.0 suppresses it for us; asserted so an SDK bump cannot change that
-        // quietly.)
-        var frames = WireFrames();
-        Assert.DoesNotContain(frames, f => Str(f["id"]) == "sub-client-cancel");
-        Assert.DoesNotContain(frames, f => Str(f["method"]) == NotificationMethods.CancelledNotification);
+        Assert.True(result.IsError is not true, TextOf(result));
+        Assert.True(JsonNode.Parse(TextOf(result))!["timed_out"]!.GetValue<bool>(),
+            $"the default window must report timed_out, not an error: {TextOf(result)}");
+        Assert.True(startedAt.Elapsed < TimeSpan.FromSeconds(30),
+            $"the default window took {startedAt.Elapsed.TotalSeconds:F1}s, past a 30s client budget");
+        // Keepalives still go out inside the shortened window, so a client that DOES reset on progress
+        // can still park for the full 120s maximum.
+        Assert.False(ticks.Values.IsEmpty, "no progress keepalive reached the client");
     }
 
     // -------------------------------------------------------------------------
-    // The same cancellation page, applied to peer_wait — the tool that actually parks. A client that
-    // asks for 120s and changes its mind must get: work stopped, and NO response frame.
+    // A client that asks peer_wait for 120s and changes its mind gets: work stopped,
+    // and NO response frame on the wire.
     // -------------------------------------------------------------------------
     [Fact]
     public async Task CancelledPeerWait_StopsProgress_AndPutsNoResponseOnTheWire()
@@ -556,7 +554,7 @@ public sealed class McpSubscriptionTests : IAsyncLifetime
             new CancelledNotificationParams { RequestId = requestId, Reason = "test" },
             McpJsonUtilities.DefaultOptions);
 
-        // Same local fault as a cancelled subscriptions/listen: the SDK client never surfaces a server result here.
+        // The SDK client never surfaces a server result for a request it cancelled.
         await Assert.ThrowsAnyAsync<OperationCanceledException>(() => call);
 
         // Longer than one tick interval, and it has to be: there is no gate to insert into a real long poll.
@@ -599,49 +597,167 @@ public sealed class McpSubscriptionTests : IAsyncLifetime
             $"resource dispatch would replay history: baseline {_state.ResourceBaseline} <= head {brokerHead}");
     }
 
+    // -------------------------------------------------------------------------
+    // Cold start, through the LIVE poll loop — the only place ChannelNotifier's
+    // resource baseline is applied at all. A fresh registration's cursor is 0, so
+    // a baseline read from LastCursor (or no baseline filter) replays the whole
+    // retention window at the first subscriber. Register_SeedsTheResourceBaseline
+    // above only proves the FIELD was written; this proves the field is used.
+    // -------------------------------------------------------------------------
     [Fact]
-    public async Task ThreeChangesToOneResourceInOnePollBatch_CoalesceToOneNotification()
+    public async Task ColdStart_ReplaysNoHistory_ThroughTheLivePollLoop()
     {
         await RegisterAsync();
-        var pad = await CreatePadAsync("busy pad");
-        var uri = PeerResources.ChannelUri(pad);
+        var history = await CreatePadAsync("pad with history");
+        await AppendAsync(history, "an entry from before the session under test existed");
+        var fresh = await CreatePadAsync("pad changed afterwards");
 
-        using var listen = await ListenAsync("sub-coalesce", uri);
+        // A second registration with no resume id is a NEW peer: last_cursor 0, baseline at the broker
+        // head. That is the cold start, and the notifier it starts is the one under test.
+        await RegisterAsync();
+
+        await SubscribeAsync(PeerResources.ChannelUri(history), PeerResources.ChannelUri(fresh));
         _notifications.Clear();
 
-        await AppendAsync(pad, "one");
-        await AppendAsync(pad, "two");
-        await AppendAsync(pad, "three");
+        await AppendAsync(fresh, "the only change that happened after this session started");
 
-        // One poll batch carrying three channel.message_added events for the same URI.
+        // Nothing here drives the dispatch; the notifier polls every 5s. Its first batch starts at cursor 0
+        // and therefore CARRIES the historical entry — only the baseline filter keeps it off the wire.
+        var update = await WaitForNotificationAsync(
+            NotificationMethods.ResourceUpdatedNotification, TimeSpan.FromSeconds(25));
+        Assert.Equal(PeerResources.ChannelUri(fresh), update["uri"]!.GetValue<string>());
+
+        await Task.Delay(Settle);
+        Assert.DoesNotContain(_notifications, n =>
+            n.Params?["uri"]?.GetValue<string>() == PeerResources.ChannelUri(history));
+    }
+
+    // -------------------------------------------------------------------------
+    // A subscription belongs to the MCP connection, not to a peer registration:
+    // re-registering must not disturb a subscription nobody cancelled. StopServicesAsync
+    // is what re-register calls, and it deliberately does not touch subscriptions.
+    // -------------------------------------------------------------------------
+    [Fact]
+    public async Task ReRegistering_LeavesSubscriptionsNobodyCancelledAlone()
+    {
+        await RegisterAsync();
+        var pad = await CreatePadAsync("pad A");
+        var uri = PeerResources.ChannelUri(pad);
+
+        await SubscribeAsync(uri);
+
+        await RegisterAsync();
+        _notifications.Clear();
+
+        Assert.True(_state.Subscriptions!.IsSubscribedForTests(uri),
+            "the re-register dropped a subscription nobody cancelled");
+
+        // Still registered is not the same as still delivering, so prove delivery too.
+        await AppendAsync(pad, "after the re-register");
         await DispatchBrokerEventsAsync();
 
         var update = await WaitForNotificationAsync(NotificationMethods.ResourceUpdatedNotification);
         Assert.Equal(uri, update["uri"]!.GetValue<string>());
-
-        await Task.Delay(Settle);
-        Assert.Single(_notifications);
     }
 
     // -------------------------------------------------------------------------
-    // 6. THE REVISION THAT ACTUALLY SHIPS. Every test above negotiates the newest
-    //    revision the SDK knows, so they only ever exercise subscriptions/listen —
-    //    a method no client in the field speaks. Peers does not serve the older
-    //    mechanism; this pins a client to 2025-11-25 and proves it is REFUSED
-    //    rather than answered with the SDK's manufactured empty success.
+    // peers://peers actually fires. Several other resources/updated assertions in this
+    // file are on channel or inbox URIs, so the peer arm of ResourceUrisFor could be
+    // deleted with the suite still green — and peers://peers would go permanently
+    // silent, which is the whole point of the peer.updated event behind it.
     // -------------------------------------------------------------------------
     [Fact]
-    public async Task On2025_11_25_SubscriptionsAreRefused_ButResourceReadsStillWork()
+    public async Task PeerChange_NotifiesThePeersResource()
+    {
+        await RegisterAsync();
+        await SubscribeAsync(PeerResources.PeersUri);
+
+        // Drain what predates the subscription, so what follows is only the change under test.
+        await DispatchBrokerEventsAsync();
+        _notifications.Clear();
+
+        // A heartbeat carrying a status field is exactly what changes the peers://peers payload; the
+        // broker emits peer.updated for it (an all-null lease renewal deliberately emits nothing).
+        await _client.CallToolAsync(
+            "presence", new Dictionary<string, object?> { ["summary"] = "now reviewing" });
+        await DispatchBrokerEventsAsync();
+
+        var update = await WaitForNotificationAsync(NotificationMethods.ResourceUpdatedNotification);
+        Assert.Equal(PeerResources.PeersUri, update["uri"]!.GetValue<string>());
+    }
+
+    // -------------------------------------------------------------------------
+    // QUIET WHISPERS ARE PARTICIPANT-SCOPED on the CHANNEL arm too. A quiet message
+    // addressed to somebody else must not generate the channel's hint on this
+    // session's stream. The loud control proves the stream is alive either way.
+    // -------------------------------------------------------------------------
+    [Fact]
+    public async Task QuietWhisperForSomebodyElse_NotifiesNothing_ButALoudMessageStillDoes()
+    {
+        await RegisterAsync();
+        var channel = await CreatePadAsync("whispers");
+        var uri = PeerResources.ChannelUri(channel);
+
+        await SubscribeAsync(uri);
+        _notifications.Clear();
+
+        // Addressed to a third peer: this session is neither author nor mention.
+        var stranger = await _broker.RegisterAsync(new RegisterPeerRequest
+        {
+            Tool = "codex", MachineId = "stranger-machine", RepoRoot = "/other-repo", Branch = "main",
+        });
+        await WhisperFromOtherPeerAsync(channel, "not for you", stranger.PeerId);
+        await DispatchBrokerEventsAsync();
+        await Task.Delay(Settle);
+
+        Assert.DoesNotContain(_notifications, n => n.Method == NotificationMethods.ResourceUpdatedNotification);
+
+        // Same stream, loud message: the silence above was the whisper filter, not a dead subscription.
+        await AppendAsync(channel, "for everyone");
+        await DispatchBrokerEventsAsync();
+
+        var update = await WaitForNotificationAsync(NotificationMethods.ResourceUpdatedNotification);
+        Assert.Equal(uri, update["uri"]!.GetValue<string>());
+    }
+
+    // -------------------------------------------------------------------------
+    // ...and a whisper this session IS mentioned in does notify the channel arm.
+    // -------------------------------------------------------------------------
+    [Fact]
+    public async Task QuietWhisperMentioningUs_NotifiesOurChannelSubscription()
+    {
+        await RegisterAsync();
+        var channel = await CreatePadAsync("whispers-for-us");
+        var uri = PeerResources.ChannelUri(channel);
+
+        await SubscribeAsync(uri);
+        _notifications.Clear();
+
+        await WhisperFromOtherPeerAsync(channel, "just for you", _peerId!);
+        await DispatchBrokerEventsAsync();
+
+        var update = await WaitForNotificationAsync(NotificationMethods.ResourceUpdatedNotification);
+        Assert.Equal(uri, update["uri"]!.GetValue<string>());
+    }
+
+    // -------------------------------------------------------------------------
+    // THE REVISION THAT ACTUALLY SHIPS. The server pins ProtocolVersion to
+    // 2025-11-25 — the revision every shipping client negotiates — so this session
+    // is not a special case, it is EVERY session. On it, resources/subscribe must
+    // WORK (that is the mechanism peers serves now) and the plain resource surface
+    // must keep working.
+    // -------------------------------------------------------------------------
+    [Fact]
+    public async Task OnThePinnedRevision_SubscribesSucceed_AndResourceReadsStillWork()
     {
         await using var legacy = await StartLegacySessionAsync();
         Assert.Equal(November2025ProtocolVersion, legacy.Client.NegotiatedProtocolVersion);
 
-        // The half that must KEEP working. resources/list, resources/templates/list and resources/read
-        // carry no revision gating, and for every client shipping today they are the entire delivered
-        // value of the resource surface. Only subscribing is refused below.
+        // The always-on half: list, templates and read carry no revision gating.
         Assert.Contains(await legacy.Client.ListResourcesAsync(), r => r.Uri == PeerResources.PeersUri);
         Assert.Contains(await legacy.Client.ListResourceTemplatesAsync(),
             t => t.UriTemplate == PeerResources.ChannelUriTemplate);
+        Assert.Contains(await legacy.Client.ListResourcesAsync(), r => r.Uri == PeerResources.InboxUri);
 
         var peers = await legacy.Client.ReadResourceAsync(PeerResources.PeersUri);
         Assert.Contains("peer_id", TextOf(peers));
@@ -652,28 +768,20 @@ public sealed class McpSubscriptionTests : IAsyncLifetime
         var channel = await legacy.Client.ReadResourceAsync(PeerResources.ChannelUri(padId));
         Assert.Contains("messages", TextOf(channel));
 
-        // resources/subscribe: ours. Without the handler the SDK answers {"result":{}} and the client
-        // waits forever; with it, the client gets a reason it can print.
-        var subscribe = await Assert.ThrowsAsync<McpProtocolException>(
-            () => legacy.Client.SubscribeToResourceAsync(PeerResources.PeersUri));
-        Assert.Equal(McpErrorCode.MethodNotFound, subscribe.ErrorCode);
-        Assert.Contains(RequestMethods.SubscriptionsListen, subscribe.Message);
-        Assert.Contains(November2025ProtocolVersion, subscribe.Message);
+        // resources/subscribe: served, on the revision everyone negotiates.
+        await legacy.Client.SubscribeToResourceAsync(PeerResources.PeersUri);
+        await legacy.Client.SubscribeToResourceAsync(PeerResources.InboxUri);
+        await legacy.Client.UnsubscribeFromResourceAsync(PeerResources.PeersUri);
 
-        var unsubscribe = await Assert.ThrowsAsync<McpProtocolException>(
-            () => legacy.Client.UnsubscribeFromResourceAsync(PeerResources.PeersUri));
-        Assert.Equal(McpErrorCode.MethodNotFound, unsubscribe.ErrorCode);
-
-        // subscriptions/listen: the SDK's, already unreachable on this revision. Asserted so a future SDK
-        // bump that quietly starts serving it here does not go unnoticed.
-        var listen = await Assert.ThrowsAsync<McpProtocolException>(() =>
+        // subscriptions/listen: the 2026-only method is GONE — refused, not served, so an SDK bump
+        // cannot quietly reintroduce it.
+        await Assert.ThrowsAnyAsync<McpException>(() =>
             legacy.Client.SendRequestAsync<SubscriptionsListenRequestParams, EmptyResult>(
                 RequestMethods.SubscriptionsListen,
                 new SubscriptionsListenRequestParams { Notifications = new() { ResourceSubscriptions = [PeerResources.PeersUri] } },
                 McpJsonUtilities.DefaultOptions,
                 new RequestId("legacy-listen"),
                 CancellationToken.None).AsTask());
-        Assert.Equal(McpErrorCode.MethodNotFound, listen.ErrorCode);
     }
 
     /// <summary>The revision every shipping client negotiates. The SDK's McpProtocolVersions is internal, so this is a literal.</summary>
@@ -728,200 +836,6 @@ public sealed class McpSubscriptionTests : IAsyncLifetime
 
         await EnsureSessionRegisteredAsync(client);
         return new LegacySession(services, state, server, serverTask, client);
-    }
-
-    // -------------------------------------------------------------------------
-    // Cold start, through the LIVE poll loop — the only place ChannelNotifier's
-    // resource baseline is applied at all. A fresh registration's cursor is 0, so
-    // a baseline read from LastCursor (or no baseline filter) replays the whole
-    // retention window at the first subscriber. Register_SeedsTheResourceBaseline
-    // above only proves the FIELD was written; this proves the field is used.
-    // -------------------------------------------------------------------------
-    [Fact]
-    public async Task ColdStart_ReplaysNoHistory_ThroughTheLivePollLoop()
-    {
-        await RegisterAsync();
-        var history = await CreatePadAsync("pad with history");
-        await AppendAsync(history, "an entry from before the session under test existed");
-        var fresh = await CreatePadAsync("pad changed afterwards");
-
-        // A second registration with no resume id is a NEW peer: last_cursor 0, baseline at the broker
-        // head. That is the cold start, and the notifier it starts is the one under test.
-        await RegisterAsync();
-
-        using var listen = await ListenAsync(
-            "sub-cold", PeerResources.ChannelUri(history), PeerResources.ChannelUri(fresh));
-        _notifications.Clear();
-
-        await AppendAsync(fresh, "the only change that happened after this session started");
-
-        // Nothing here drives the dispatch; the notifier polls every 5s. Its first batch starts at cursor 0
-        // and therefore CARRIES the historical entry — only the baseline filter keeps it off the wire.
-        var update = await WaitForNotificationAsync(
-            NotificationMethods.ResourceUpdatedNotification, TimeSpan.FromSeconds(25));
-        Assert.Equal(PeerResources.ChannelUri(fresh), update["uri"]!.GetValue<string>());
-
-        await Task.Delay(Settle);
-        Assert.DoesNotContain(_notifications, n =>
-            n.Params?["uri"]?.GetValue<string>() == PeerResources.ChannelUri(history));
-    }
-
-    // -------------------------------------------------------------------------
-    // A subscription belongs to the MCP connection, not to a peer registration:
-    // re-registering must not disturb a stream nobody cancelled. StopServicesAsync
-    // is what re-register calls, and it deliberately does not touch subscriptions.
-    // -------------------------------------------------------------------------
-    [Fact]
-    public async Task ReRegistering_LeavesSubscriptionsNobodyCancelledAlone()
-    {
-        await RegisterAsync();
-        var pad = await CreatePadAsync("pad A");
-        var uri = PeerResources.ChannelUri(pad);
-
-        using var listen = await ListenAsync("sub-rereg", uri);
-        Assert.Equal(1, _state.Subscriptions!.CountForTests);
-
-        await RegisterAsync();
-        _notifications.Clear();
-
-        Assert.Equal(1, _state.Subscriptions!.CountForTests);
-        Assert.False(listen.Request.IsCompleted, "the re-register ended a listen stream nobody cancelled");
-
-        // Still registered is not the same as still delivering, so prove delivery too.
-        await AppendAsync(pad, "after the re-register");
-        await DispatchBrokerEventsAsync();
-
-        var update = await WaitForNotificationAsync(NotificationMethods.ResourceUpdatedNotification);
-        Assert.Equal(uri, update["uri"]!.GetValue<string>());
-        Assert.Equal("sub-rereg", SubscriptionIdOf(update));
-        Assert.DoesNotContain(_notifications, n => n.Method == NotificationMethods.CancelledNotification);
-    }
-
-    // -------------------------------------------------------------------------
-    // peers://peers actually fires. Every other resources/updated assertion in this
-    // file is on a channel URI, so the peer arm of ResourceUriFor could be
-    // deleted with the suite still green — and peers://peers would go permanently
-    // silent, which is the whole point of the peer.updated event behind it.
-    // -------------------------------------------------------------------------
-    [Fact]
-    public async Task PeerChange_NotifiesThePeersResource()
-    {
-        await RegisterAsync();
-        using var listen = await ListenAsync("sub-peers", PeerResources.PeersUri);
-
-        // Drain what predates the subscription, so what follows is only the change under test.
-        await DispatchBrokerEventsAsync();
-        _notifications.Clear();
-
-        // A heartbeat carrying a status field is exactly what changes the peers://peers payload; the
-        // broker emits peer.updated for it (an all-null lease renewal deliberately emits nothing).
-        await _client.CallToolAsync(
-            "presence", new Dictionary<string, object?> { ["summary"] = "now reviewing" });
-        await DispatchBrokerEventsAsync();
-
-        var update = await WaitForNotificationAsync(NotificationMethods.ResourceUpdatedNotification);
-        Assert.Equal(PeerResources.PeersUri, update["uri"]!.GetValue<string>());
-        Assert.Equal("sub-peers", SubscriptionIdOf(update));
-    }
-
-    // -------------------------------------------------------------------------
-    // QUIET WHISPERS ARE PARTICIPANT-SCOPED. A quiet message addressed to somebody else must not
-    // even generate a hint on this session's stream: the registry filters by this session's peer id
-    // before any URI reaches the fan-out. The loud control proves the stream is alive either way.
-    // -------------------------------------------------------------------------
-    [Fact]
-    public async Task QuietWhisperForSomebodyElse_NotifiesNothing_ButALoudMessageStillDoes()
-    {
-        await RegisterAsync();
-        var channel = await CreatePadAsync("whispers");
-        var uri = PeerResources.ChannelUri(channel);
-
-        using var listen = await ListenAsync("sub-whisper", uri);
-        _notifications.Clear();
-
-        // Addressed to a third peer: this session is neither author nor mention.
-        var stranger = await _broker.RegisterAsync(new RegisterPeerRequest
-        {
-            Tool = "codex", MachineId = "stranger-machine", RepoRoot = "/other-repo", Branch = "main",
-        });
-        await WhisperFromOtherPeerAsync(channel, "not for you", stranger.PeerId);
-        await DispatchBrokerEventsAsync();
-        await Task.Delay(Settle);
-
-        Assert.DoesNotContain(_notifications, n => n.Method == NotificationMethods.ResourceUpdatedNotification);
-
-        // Same stream, loud message: the silence above was the whisper filter, not a dead subscription.
-        await AppendAsync(channel, "for everyone");
-        await DispatchBrokerEventsAsync();
-
-        var update = await WaitForNotificationAsync(NotificationMethods.ResourceUpdatedNotification);
-        Assert.Equal(uri, update["uri"]!.GetValue<string>());
-        Assert.Equal("sub-whisper", SubscriptionIdOf(update));
-    }
-
-    // -------------------------------------------------------------------------
-    // ...and a whisper this session IS mentioned in does notify it.
-    // -------------------------------------------------------------------------
-    [Fact]
-    public async Task QuietWhisperMentioningUs_NotifiesOurStream()
-    {
-        await RegisterAsync();
-        var channel = await CreatePadAsync("whispers-for-us");
-        var uri = PeerResources.ChannelUri(channel);
-
-        using var listen = await ListenAsync("sub-whisper-mine", uri);
-        _notifications.Clear();
-
-        await WhisperFromOtherPeerAsync(channel, "just for you", _peerId!);
-        await DispatchBrokerEventsAsync();
-
-        var update = await WaitForNotificationAsync(NotificationMethods.ResourceUpdatedNotification);
-        Assert.Equal(uri, update["uri"]!.GetValue<string>());
-        Assert.Equal("sub-whisper-mine", SubscriptionIdOf(update));
-    }
-
-    // -------------------------------------------------------------------------
-    // Two listen streams open at once — what the _meta subscription id EXISTS for.
-    // Every other test here opens exactly one, so tagging every notification with
-    // the first subscription's id would pass all of them while a real multiplexing
-    // client routed pad B's update into pad A's stream.
-    // -------------------------------------------------------------------------
-    [Fact]
-    public async Task TwoOpenSubscriptions_EachUpdateIsTaggedForItsOwnStream()
-    {
-        await RegisterAsync();
-        var padA = await CreatePadAsync("pad A");
-        var padB = await CreatePadAsync("pad B");
-        var uriA = PeerResources.ChannelUri(padA);
-        var uriB = PeerResources.ChannelUri(padB);
-
-        // Overlapping grants: both streams asked for pad A, only one asked for pad B.
-        using var one = await ListenAsync("sub-one", uriA);
-        using var two = await ListenAsync("sub-two", uriA, uriB);
-        _notifications.Clear();
-
-        await AppendAsync(padA, "both streams asked for this");
-        await AppendAsync(padB, "only sub-two asked for this");
-        await DispatchBrokerEventsAsync();
-
-        await WaitForAsync(
-            () => Updates().Count(u => u.Uri == uriA) >= 2 && Updates().Any(u => u.Uri == uriB),
-            TimeSpan.FromSeconds(10),
-            "both subscriptions should have been notified about the shared URI");
-
-        // Distinct, because the live 5s poll loop may re-deliver the same URI while this test runs.
-        var updates = Updates();
-        Assert.Equal(
-            new[] { "sub-one", "sub-two" },
-            updates.Where(u => u.Uri == uriA).Select(u => u.Id).Distinct().Order().ToArray());
-        Assert.Equal(
-            new[] { "sub-two" },
-            updates.Where(u => u.Uri == uriB).Select(u => u.Id).Distinct().ToArray());
-
-        (string Uri, string Id)[] Updates() => _notifications
-            .Where(n => n.Method == NotificationMethods.ResourceUpdatedNotification)
-            .Select(n => (n.Params!["uri"]!.GetValue<string>(), SubscriptionIdOf(n.Params!)))
-            .ToArray();
     }
 
     // -------------------------------------------------------------------------
@@ -1103,20 +1017,6 @@ public sealed class McpSubscriptionTests : IAsyncLifetime
         public int DroppedFrames => Volatile.Read(ref _dropped);
         private int _dropped;
 
-        /// <summary>
-        /// When set, the FIRST outbound write containing this text is parked before it reaches the stream
-        /// and <see cref="Held"/> completes; it resumes on <see cref="Release"/>. That is the only way to
-        /// stand inside the server's fan-out — between the subscriber snapshot and a later subscriber's
-        /// send — and change the registry while it is there.
-        /// </summary>
-        public string? HoldFirstWriteContaining { get; set; }
-
-        public Task Held => _held.Task;
-        private readonly TaskCompletionSource _held = new(TaskCreationOptions.RunContinuationsAsynchronously);
-        private readonly TaskCompletionSource _release = new(TaskCreationOptions.RunContinuationsAsynchronously);
-
-        public void Release() => _release.TrySetResult();
-
         /// <summary>Partial frame carried across a chunk boundary while dropping is armed.</summary>
         private string _carry = "";
 
@@ -1130,15 +1030,6 @@ public sealed class McpSubscriptionTests : IAsyncLifetime
         public override async ValueTask WriteAsync(ReadOnlyMemory<byte> buffer, CancellationToken ct = default)
         {
             var bytes = buffer.ToArray();
-
-            var hold = HoldFirstWriteContaining;
-            if (hold is not null && Encoding.UTF8.GetString(bytes).Contains(hold, StringComparison.Ordinal))
-            {
-                HoldFirstWriteContaining = null;
-                _held.TrySetResult();
-                await _release.Task.WaitAsync(TimeSpan.FromSeconds(30), ct);
-            }
-
             var pass = Filter(bytes);
             if (pass.Length > 0)
                 await inner.WriteAsync(pass, ct);
@@ -1195,48 +1086,10 @@ public sealed class McpSubscriptionTests : IAsyncLifetime
         public void Report(ProgressNotificationValue value) => Values.Enqueue(value);
     }
 
-    private sealed class Listen(Task request, CancellationTokenSource cts, McpClient client, RequestId requestId)
-        : IDisposable
+    private async Task SubscribeAsync(params string[] uris)
     {
-        public Task Request { get; } = request;
-
-        /// <summary>
-        /// Cancels the way a real stdio client does: sends notifications/cancelled referencing this
-        /// listen request's id. The SDK does NOT do this on local CTS cancellation alone (verified
-        /// empirically — see CancellingListen_ReturnsAndDeregisters), so the server handler's token
-        /// only fires once this notification arrives.
-        /// </summary>
-        public Task CancelAsync() => client.SendNotificationAsync(
-            NotificationMethods.CancelledNotification,
-            new CancelledNotificationParams { RequestId = requestId, Reason = "test" },
-            McpJsonUtilities.DefaultOptions);
-
-        public void Dispose() => cts.Cancel();
-    }
-
-    /// <summary>Opens a subscriptions/listen with an explicit request id, and returns once acknowledged.</summary>
-    private async Task<Listen> ListenAsync(string subscriptionId, params string[] uris)
-    {
-        var cts = new CancellationTokenSource();
-        var requestId = new RequestId(subscriptionId);
-        var request = _client.SendRequestAsync<SubscriptionsListenRequestParams, EmptyResult>(
-            RequestMethods.SubscriptionsListen,
-            new SubscriptionsListenRequestParams { Notifications = new() { ResourceSubscriptions = uris } },
-            McpJsonUtilities.DefaultOptions,
-            requestId,
-            cts.Token).AsTask();
-
-        try
-        {
-            await WaitForNotificationAsync(NotificationMethods.SubscriptionsAcknowledgedNotification);
-        }
-        catch
-        {
-            cts.Cancel();
-            throw;
-        }
-
-        return new Listen(request, cts, _client, requestId);
+        foreach (var uri in uris)
+            await _client.SubscribeToResourceAsync(uri);
     }
 
     // Registration is no longer an agent-facing tool: sessions register themselves. Tests drive the
@@ -1341,13 +1194,6 @@ public sealed class McpSubscriptionTests : IAsyncLifetime
 
         return frames;
     }
-
-    private static string[] GrantedUris(JsonNode ackParams) =>
-        ackParams["notifications"]!["resourceSubscriptions"]!.AsArray()
-            .Select(n => n!.GetValue<string>()).ToArray();
-
-    private static string SubscriptionIdOf(JsonNode notificationParams) =>
-        notificationParams["_meta"]![MetaKeys.SubscriptionId]!.GetValue<string>();
 
     private static string TextOf(CallToolResult result) =>
         Assert.IsType<TextContentBlock>(Assert.Single(result.Content)).Text;

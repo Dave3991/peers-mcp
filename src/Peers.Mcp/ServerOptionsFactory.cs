@@ -16,11 +16,14 @@ internal static class ServerOptionsFactory
 {
     public static McpServerOptions Create(IServiceProvider services)
     {
-        // ProtocolVersion is deliberately left UNSET, i.e. "supports every revision". Peers serves all
-        // protocol revisions; only the SUBSCRIPTION feature is 2026-07-28+. Pinning it to 2026-07-28 would
-        // make the server reject the initialize handshake of every client that exists today — do not.
+        // Pinned to 2025-11-25 — the revision every shipping client negotiates. Downgrade audit (recorded
+        // to end re-litigation): the only 2026-only server surface peers ever had was subscriptions/listen
+        // itself, removed when resources/subscribe became the served mechanism; peer_wait's progress
+        // notifications predate that revision and are unaffected. Whenever a change reintroduces a
+        // 2026-only server feature, THAT change owns revisiting ProtocolVersion.
         var options = new McpServerOptions
         {
+            ProtocolVersion = "2025-11-25",
             ServerInfo = new() { Name = "peers", Version = "2.0.0" },
             ServerInstructions = """
                 Peers coordinates multiple AI coding sessions through a shared local broker.
@@ -28,7 +31,7 @@ internal static class ServerOptionsFactory
                 Identity and delivery:
                 - This session registers itself automatically on your first peers tool call — there is no register step. Shape how you appear to others with `presence` (role, summary, capabilities).
                 - Directed messages (mentions, replies, review requests) arrive durably: `wait` blocks until one lands. At-least-once by receipt — echo inbox_ids as ack_inbox_ids once handled, or they are redelivered.
-                - Resource subscriptions (`subscriptions/listen`, MCP 2026-07-28) push re-read hints for peers://peers and peers://channel/{id}; they are best-effort hints, never deltas — always re-read.
+                - Resource subscriptions (`resources/subscribe`) push re-read hints for peers://peers and peers://inbox; they are best-effort hints, never deltas — always re-read. omp injects them into the conversation when `mcp.notifications` is on.
 
                 Channels:
                 - A channel is a named board scoped to a repository (`channels`, `channel_create`, `send`, `read`). Names are agent-chosen; repo metadata says whose code it serves.
@@ -59,6 +62,15 @@ internal static class ServerOptionsFactory
                 MimeType = "application/json",
                 Services = services,
             }),
+            McpServerResource.Create(PeerResources.ReadInbox, new()
+            {
+                UriTemplate = PeerResources.InboxUri,
+                Name = "inbox",
+                Title = "Unacknowledged inbox",
+                Description = PeerResources.InboxDescription,
+                MimeType = "application/json",
+                Services = services,
+            }),
             McpServerResource.Create(PeerResources.ReadChannel, new()
             {
                 UriTemplate = PeerResources.ChannelUriTemplate,
@@ -76,12 +88,11 @@ internal static class ServerOptionsFactory
         var state = services.GetRequiredService<SessionState>();
         var subscriptions = new SubscriptionRegistry(options.ResourceCollection, state);
         state.Subscriptions = subscriptions;
-        // subscriptions/listen is the one subscription mechanism peers serves. The other two are wired
-        // ONLY to refuse: unset, the SDK answers resources/subscribe with an empty success, so a
-        // pre-2026-07-28 client believes it subscribed and then waits forever with nothing to debug.
+        // resources/subscribe is the one subscription mechanism peers serves. Leaving these handlers
+        // unset is not an option: the SDK then answers with an empty success, so a client believes it
+        // subscribed and waits forever with nothing to debug.
         options.Handlers = new McpServerHandlers
         {
-            SubscriptionsListenHandler = subscriptions.HandleListenAsync,
             SubscribeToResourcesHandler = subscriptions.HandleSubscribeAsync,
             UnsubscribeFromResourcesHandler = subscriptions.HandleUnsubscribeAsync,
         };

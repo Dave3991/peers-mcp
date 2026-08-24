@@ -15,10 +15,14 @@ internal static class McpHost
     /// and disposes it — callers must not also wrap it in an <c>await using</c>.
     ///
     /// NOT just <c>await server.RunAsync()</c>, and the difference is a hang, not a nicety. Measured
-    /// against SDK 2.2.0: RunAsync waits for in-flight request handlers, and a parked
-    /// <c>subscriptions/listen</c> is released only when the SERVER IS DISPOSED — transport EOF alone does
-    /// not cancel its token. Awaiting RunAsync first therefore deadlocks stdio exit for any session with an
-    /// open subscription: the disposal that would release the handler sits behind the handler.
+    /// against SDK 2.2.0: RunAsync waits for in-flight request handlers, and only SERVER DISPOSAL cancels
+    /// a handler that is still parked — transport EOF alone does not. Awaiting RunAsync first can
+    /// therefore deadlock stdio exit: the disposal that would release an in-flight handler sits behind
+    /// the handler it would release.
+    ///
+    /// PENDING VERIFICATION: the long-parked handler that motivated this (a subscriptions/listen wait)
+    /// is gone now that peers serves resources/subscribe, so plain RunAsync may suffice. Do not simplify
+    /// until the integration suite proves it — this wrapper is kept until then.
     ///
     /// The transport's inbound channel completing IS stdin EOF, and it is observable without consuming the
     /// channel. WhenAny rather than awaiting it alone, so a RunAsync that faults on its own still gets here
@@ -28,7 +32,7 @@ internal static class McpHost
     {
         var run = server.RunAsync();
         await Task.WhenAny(run, transport.MessageReader.Completion);
-        // finally: DisposeAsync releases the parked handler that lets run complete. If disposal itself
+        // finally: DisposeAsync releases any in-flight handler that lets run complete. If disposal itself
         // throws, run must still be joined below or its exception goes unobserved, masked by the
         // disposal exception.
         try { await server.DisposeAsync(); }

@@ -3,7 +3,6 @@ using Microsoft.Extensions.Logging;
 using ModelContextProtocol.Server;
 using Peers.Mcp;
 using Peers.Mcp.Lifecycle;
-
 var client = await BrokerDiscovery.EnsureBrokerAsync();
 var sessionState = new SessionState();
 
@@ -21,9 +20,9 @@ using var serviceProvider = services.BuildServiceProvider();
 var options = ServerOptionsFactory.Create(serviceProvider);
 
 var transport = new StdioServerTransport(options, loggerFactory: null);
-// No `await using`: McpHost.RunUntilTransportClosedAsync takes ownership and disposes it, and it has to —
-// disposal is what releases a parked subscriptions/listen, so it happens BEFORE the run task is awaited,
-// not after it returns.
+// No `await using`: McpHost.RunUntilTransportClosedAsync takes ownership and disposes it, and disposal
+// must happen BEFORE the run task is awaited — only server disposal releases an in-flight handler, so
+// awaiting RunAsync first could deadlock stdio exit. See McpHost's pending-verification note.
 var server = McpServer.Create(transport, options, loggerFactory: null, serviceProvider);
 
 try

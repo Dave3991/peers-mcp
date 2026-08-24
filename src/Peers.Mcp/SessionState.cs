@@ -65,12 +65,12 @@ public sealed class SessionState : IDisposable, IAsyncDisposable
     public ChannelNotifier? ChannelNotifier { get; set; }
 
     /// <summary>
-    /// Open subscriptions/listen streams. Set once when the server options are built and deliberately
-    /// NOT cleared by StopServicesAsync: subscriptions belong to the MCP connection, not to a peer
-    /// registration, so re-registering as a different peer must not silently drop them.
+    /// The session's resource-subscription state (which URIs the client subscribed to via
+    /// resources/subscribe). Set once when the server options are built and deliberately NOT cleared by
+    /// StopServicesAsync: subscriptions belong to the MCP connection, not to a peer registration, so
+    /// re-registering as a different peer must not silently drop them.
     /// </summary>
     public SubscriptionRegistry? Subscriptions { get; set; }
-
     public RegisterPeerRequest? LastRegisterRequest { get; set; }
 
     public async ValueTask StopServicesAsync()
@@ -88,10 +88,9 @@ public sealed class SessionState : IDisposable, IAsyncDisposable
     }
 
     /// <summary>
-    /// Stops this session's loops. Open subscriptions are deliberately left alone here too: by the time
-    /// anything disposes the session the stdio transport is already closed, so a listen stream ends the
-    /// way SEP-2575 calls an abrupt transport drop — no notification, no response, nothing owed. See
-    /// SubscriptionRegistry.HandleListenAsync.
+    /// Stops this session's loops. Subscriptions are deliberately left alone here too: by the time
+    /// anything disposes the session the stdio transport is already closed, so nothing is owed on it —
+    /// no notification, no response. See SubscriptionRegistry.
     /// </summary>
     public ValueTask DisposeAsync() => StopServicesAsync();
 

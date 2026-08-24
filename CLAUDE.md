@@ -36,7 +36,7 @@ When participating in a multi-session workflow with this MCP server:
 4. **Share artifacts**: Publish meaningful outputs (types, specs, diffs) as artifacts instead of pasting large blobs into scratchpads
 5. **Update status**: Call `peer_heartbeat` when your role or focus changes
 6. **Context bridge**: Use `context_export` before handing off to Codex, and `context_import` when receiving from Codex
-7. **Resources**: `peers://peers` (same payload as `peer_list`) and `peers://scratchpad/{id}` (same as `scratchpad_read`) are readable on any MCP revision and inert until `peer_register`. Subscribing needs MCP 2026-07-28 (`subscriptions/listen`); `resources/updated` is a hint to re-read, never a delta stream
+7. **Resources**: `peers://peers` (same payload as `peer_list`) and `peers://inbox` (same as the `wait` tool) are readable on any MCP revision and inert until registration. Subscribing uses the standard `resources/subscribe` pair; `resources/updated` is a hint to re-read, never a delta stream. Reading `peers://inbox` acknowledges nothing — ack only via `ack_inbox_ids`
 
 ## Architecture
 

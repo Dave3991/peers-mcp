@@ -1,10 +1,12 @@
 using System.Net;
 using System.Text;
 using System.Text.Json;
+using System.Text.RegularExpressions;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
 using ModelContextProtocol;
+using ModelContextProtocol.Server;
 using Peers.Mcp;
 using Peers.Mcp.Tools;
 using Xunit;
@@ -563,7 +565,13 @@ public class PeerWaitTests
             SchemaPropertiesOf("wait").Order().ToArray());
     }
 
-    private static string[] SchemaPropertiesOf(string toolName)
+    private static string[] SchemaPropertiesOf(string toolName) =>
+        ProductionTool(toolName).ProtocolTool.InputSchema.GetProperty("properties")
+            .EnumerateObject().Select(p => p.Name).ToArray();
+
+    /// <summary>The tool exactly as production registers it — descriptions included, so a test can hold
+    /// the advertised contract against the behaviour.</summary>
+    private static McpServerTool ProductionTool(string toolName)
     {
         var collection = new ServiceCollection();
         // Production registers logging (Program.cs); without it the SDK treats loggerFactory as a
@@ -574,9 +582,7 @@ public class PeerWaitTests
         var services = collection.BuildServiceProvider();
 
         var options = ServerOptionsFactory.Create(services);
-        var tool = Assert.Single(options.ToolCollection!, t => t.ProtocolTool.Name == toolName);
-
-        return tool.ProtocolTool.InputSchema.GetProperty("properties").EnumerateObject().Select(p => p.Name).ToArray();
+        return Assert.Single(options.ToolCollection!, t => t.ProtocolTool.Name == toolName);
     }
 
     // ---- receipt acknowledgement (the ids the caller echoes back, and nothing else) ----
@@ -616,5 +622,87 @@ public class PeerWaitTests
         var withProgress = await WaitCore(
             client, new SessionState { PeerId = "p" }, 5, ackInboxIds: null, new RecordingProgress(), TimeSpan.FromMilliseconds(5));
         Assert.Equal(noProgress, withProgress);
+    }
+
+    // ---- the advertised window, and that the tool actually enforces it ----
+
+    /// <summary>A broker that always times out, plus the wait window the tool asked it for.</summary>
+    private sealed class WindowRecorder
+    {
+        public BrokerClient Client { get; }
+        private string? _query;
+
+        public WindowRecorder()
+        {
+            var handler = new ScriptedHandler(req =>
+            {
+                if (req.RequestUri!.AbsolutePath.EndsWith("/inbox/wait")) _query = req.RequestUri.Query;
+                return Json(HttpStatusCode.OK, EmptyTimedOutBody());
+            });
+            Client = new BrokerClient(new HttpClient(handler) { BaseAddress = new Uri("http://localhost") });
+        }
+
+        public int RequestedSeconds
+        {
+            get
+            {
+                var window = Regex.Match(_query ?? "", @"timeout_seconds=(\d+)");
+                Assert.True(window.Success, $"no wait window reached the broker: '{_query}'");
+                return int.Parse(window.Groups[1].Value);
+            }
+        }
+    }
+
+    // What the caller asks for is not what the broker is told: out-of-band values are clamped, and no
+    // argument at all means the default window. Pinned at the broker boundary, the only place the
+    // effective window is observable.
+    [Theory]
+    [InlineData(null, 25)]         // no argument -> the default window
+    [InlineData(1, 1)]
+    [InlineData(0, 1)]             // below the floor
+    [InlineData(-30, 1)]
+    [InlineData(25, 25)]
+    [InlineData(120, 120)]
+    [InlineData(121, 120)]         // above the ceiling
+    [InlineData(int.MaxValue, 120)]
+    public async Task Wait_TimeoutSeconds_IsClampedIntoTheAdvertisedBand(int? requested, int expected)
+    {
+        var recorder = new WindowRecorder();
+
+        await Wait(recorder.Client, new SessionState { PeerId = "p" }, requested);
+
+        Assert.Equal(expected, recorder.RequestedSeconds);
+    }
+
+    // The defect this guards was never in the wait loop: the tool ADVERTISED a 60s default and a 120s
+    // park that no default-configured client could deliver, and the overrun surfaced as a transport
+    // error indistinguishable from peer silence. So the advertised text is held against the behaviour,
+    // and the default against the request budget clients ship with. The numbers are READ OUT of the
+    // description, so drifting either half of the pair — text or clamp — fails here.
+    [Fact]
+    public async Task Wait_EnforcesExactlyTheWindowItAdvertises()
+    {
+        var tool = ProductionTool("wait");
+        var advertised = Regex.Match(tool.ProtocolTool.Description ?? "", @"default (\d+), max (\d+)");
+        Assert.True(advertised.Success, $"the description no longer states its window: {tool.ProtocolTool.Description}");
+        var defaultSeconds = int.Parse(advertised.Groups[1].Value);
+        var maxSeconds = int.Parse(advertised.Groups[2].Value);
+
+        // The parameter description is what a model reads when it picks a value: same pair, or one of them lies.
+        var parameter = tool.ProtocolTool.InputSchema
+            .GetProperty("properties").GetProperty("timeout_seconds").GetProperty("description").GetString();
+        Assert.Contains($"default {defaultSeconds}, max {maxSeconds}", parameter);
+
+        // A client's request timeout is one-shot: omp resolves 30s by default and never extends it on the
+        // 5s progress keepalives, so a default at or above 30 is a transport error waiting to happen.
+        Assert.True(defaultSeconds < 30, $"default window {defaultSeconds}s does not fit a 30s client request budget");
+
+        var byDefault = new WindowRecorder();
+        await Wait(byDefault.Client, new SessionState { PeerId = "p" });
+        Assert.Equal(defaultSeconds, byDefault.RequestedSeconds);
+
+        var overMax = new WindowRecorder();
+        await Wait(overMax.Client, new SessionState { PeerId = "p" }, maxSeconds + 1);
+        Assert.Equal(maxSeconds, overMax.RequestedSeconds);
     }
 }

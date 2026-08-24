@@ -105,12 +105,16 @@ top; the inbox is the guarantee.
 | Resource | Payload |
 |----------|---------|
 | `peers://peers` | Same as the `peers` tool |
+| `peers://inbox` | Your unacknowledged inbox — same payload as `wait` returns |
 | `peers://channel/{id}` | A channel's messages, with your own quiet-visibility applied |
 
-Subscribing needs MCP 2026-07-28 (`subscriptions/listen`); the older `resources/subscribe` is refused
-with an error rather than silently accepted. A `notifications/resources/updated` is a hint to re-read,
-never a delta stream — delivery is best-effort and lossy, so several changes can collapse into one
-notification or into none. Quiet whispers only ever notify their own participants.
+Subscribing uses the standard `resources/subscribe` pair, so any client that speaks it (omp among
+them) can subscribe to every URI `resources/list` offers; omp injects the resulting
+`notifications/resources/updated` hints straight into the conversation when its `mcp.notifications`
+setting is on. A hint is a prompt to re-read, never a delta stream — delivery is best-effort and
+lossy, so several changes can collapse into one notification or into none. Quiet whispers only ever
+notify their own participants. Reading `peers://inbox` acknowledges nothing: items are redelivered
+by `wait` until you echo their ids back as `ack_inbox_ids`.
 
 ## MCP Tools Reference
 
@@ -122,7 +126,7 @@ notification or into none. Quiet whispers only ever notify their own participant
 | `channel_create` | Create a channel (`name`, optional `repo_root`; names unique per scope) |
 | `send` | Post to a channel: `content`, optional `to` mentions, optional `quiet` whisper |
 | `read` | Read a channel from `since_seq`; whispers addressed to others are filtered out |
-| `wait` | Long-poll for directed messages; echo `ack_inbox_ids` to acknowledge receipts |
+| `wait` | Long-poll for directed messages (default 25s, max 120s); echo `ack_inbox_ids` to acknowledge receipts |
 | `artifact_publish` | Publish a versioned, content-hashed artifact |
 | `artifact_get` | Retrieve an artifact by ID or namespace+name (latest version) |
 | `artifact_list` | List artifact metadata, filter by type/repo/namespace |
@@ -130,6 +134,13 @@ notification or into none. Quiet whispers only ever notify their own participant
 | `context_import` | Import a context packet from Codex |
 
 There is no register or heartbeat tool: the MCP server does both for you.
+
+`wait` defaults to 25s because an MCP client's request timeout is one-shot: omp resolves it as
+`OMP_MCP_TIMEOUT_MS`, then the per-server `timeout`, then 30s, and it does not extend that deadline
+when the server reports progress — so the 5s keepalives this server sends cannot save a longer park.
+Ask for more than 25s only after raising the client budget past it (`OMP_MCP_TIMEOUT_MS=130000`, or
+`"timeout": 130000` on the peers entry). Without that, a longer wait dies as a client-side transport
+error that reads exactly like broker silence — and silence is never a verdict.
 
 ## Architecture
 
@@ -142,7 +153,7 @@ src/
 │   └── Persistence/     # SQLite repositories + schema (auto-migrating)
 ├── Peers.Mcp/           # MCP stdio server (thin broker client)
 │   ├── Tools/           # Channel, artifact and context tools
-│   ├── Resources/       # peers:// resources + SEP-2575 subscription registry
+│   ├── Resources/       # peers:// resources + resources/subscribe registry
 │   └── Lifecycle/       # Auto-registration, heartbeat, discovery, resource dispatch
 ├── Peers.Shared/        # Models, contracts, broker runtime
 └── Peers.Cli/           # CLI for testing and debugging
