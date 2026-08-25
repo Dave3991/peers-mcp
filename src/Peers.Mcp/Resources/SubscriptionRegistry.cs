@@ -154,8 +154,25 @@ public sealed class SubscriptionRegistry
         var uris = new HashSet<string>(StringComparer.Ordinal);
         switch (evt.Type)
         {
-            case EventTypes.PeerRegistered or EventTypes.PeerUpdated or EventTypes.PeerExpired:
-                uris.Add(PeerResources.PeersUri);
+            // A roster change is only OUR business when it is somebody we work with. Unscoped, every
+            // presence call anywhere on the machine woke every subscribed session — and since progress
+            // reporting rides peer.updated, that turned into constant churn from unrelated pairs.
+            //
+            // peer.updated carries channel_peer_ids (peers sharing a channel with the subject);
+            // registered/expired already carry recipient_peer_ids, which the broker resolved the same
+            // way it resolves a mention. Either list absent means "no audience" — notify nobody.
+            case EventTypes.PeerUpdated:
+                if (PayloadNamesUs(evt.Payload, "channel_peer_ids"))
+                    uris.Add(PeerResources.PeersUri);
+                break;
+
+            // Registration and expiry push NOTHING here. Their recipient_peer_ids is the durable INBOX
+            // audience — every peer in the repo — so reusing it as a roster hint is repo scoping, and a
+            // stranger starting a session in your repo would keep waking you. Correspondence scoping
+            // cannot apply either: a peer that just registered has not corresponded with anyone yet.
+            // Nothing is lost — both events already deliver durably to that inbox, so `wait` returns
+            // them and the roster is one `peers` call away.
+            case EventTypes.PeerRegistered or EventTypes.PeerExpired:
                 break;
 
             case EventTypes.ChannelMessageAdded:
@@ -175,7 +192,14 @@ public sealed class SubscriptionRegistry
     }
 
     /// <summary>True when the payload names this session among its durable inbox recipients.</summary>
-    private bool IsForOurInbox(string payload)
+    private bool IsForOurInbox(string payload) => PayloadNamesUs(payload, "recipient_peer_ids");
+
+    /// <summary>
+    /// True when <paramref name="arrayProperty"/> is an array naming this session. A property that is
+    /// missing or null is NOT a broadcast here — it means the emitter resolved no audience, so nobody
+    /// is notified. (Loud undirected messages carry "recipient_peer_ids": null for exactly that reason.)
+    /// </summary>
+    private bool PayloadNamesUs(string payload, string arrayProperty)
     {
         if (_state.PeerId is not { } me)
             return false;
@@ -183,13 +207,12 @@ public sealed class SubscriptionRegistry
         try
         {
             using var doc = JsonDocument.Parse(payload);
-            // Loud undirected messages carry "recipient_peer_ids": null — present, but not an array.
-            if (!doc.RootElement.TryGetProperty("recipient_peer_ids", out var recipients)
-                || recipients.ValueKind != JsonValueKind.Array)
+            if (!doc.RootElement.TryGetProperty(arrayProperty, out var ids)
+                || ids.ValueKind != JsonValueKind.Array)
                 return false;
 
-            foreach (var r in recipients.EnumerateArray())
-                if (r.GetString() == me)
+            foreach (var id in ids.EnumerateArray())
+                if (id.GetString() == me)
                     return true;
 
             return false;

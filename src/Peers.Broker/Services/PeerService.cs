@@ -139,8 +139,18 @@ public sealed class PeerService(PeerRepository peers, EventService eventService,
         // whose cursor never advances pins the table until the 72h TTL. The real rate ceiling is LLM
         // tool-call latency. Revisit only if /status events_last_5min says otherwise.
         if (Changes(req))
+        {
+            // channel_peer_ids is the push AUDIENCE: peers this one has actually corresponded with.
+            // Absent (a progress-only update) means nobody is notified — the event still exists for the
+            // notifier's roster cache and the CLI, it just is not a wake-up. Without this every
+            // presence call on the machine woke every subscribed session, including unrelated pairs.
+            var audience = ChangesStatus(req)
+                ? await channelService.CorrespondentPeerIdsAsync(peerId, ct)
+                : null;
+
             await eventService.EmitAsync(EventTypes.PeerUpdated,
-                JsonSerializer.Serialize(new { peer_id = peerId, progress = ProgressText(req) }), ct);
+                JsonSerializer.Serialize(new { peer_id = peerId, progress = ProgressText(req), channel_peer_ids = audience }), ct);
+        }
 
         return Result.Ok();
     }
@@ -148,9 +158,13 @@ public sealed class PeerService(PeerRepository peers, EventService eventService,
     /// <summary>True when the heartbeat supplied at least one status field. RenewLeaseAsync COALESCEs nulls,
     /// so an all-null request provably cannot change a single column other than the lease.</summary>
     private static bool Changes(HeartbeatRequest req) =>
+        ChangesStatus(req) || req.ProgressCurrent is not null;
+
+    /// <summary>True when a heartbeat changed something a peer would want PUSHED. Progress is
+    /// excluded on purpose: it is pull-only, read from the roster or off a wait keepalive.</summary>
+    private static bool ChangesStatus(HeartbeatRequest req) =>
         req.Summary is not null || req.Role is not null || req.Branch is not null ||
-        req.CommitSha is not null || req.FocusPaths is not null || req.Capabilities is not null ||
-        req.ProgressCurrent is not null;
+        req.CommitSha is not null || req.FocusPaths is not null || req.Capabilities is not null;
 
     /// <summary>
     /// Rendered counts for the event payload, or null when this heartbeat carried no progress.

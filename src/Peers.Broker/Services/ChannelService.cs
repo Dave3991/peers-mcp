@@ -19,6 +19,10 @@ public sealed class ChannelService(
     EventService eventService,
     RecipientResolver resolver)
 {
+    /// <summary>Peers this one corresponds with — the audience for its presence changes.</summary>
+    public Task<List<string>> CorrespondentPeerIdsAsync(string peerId, CancellationToken ct = default)
+        => channels.GetCorrespondentPeerIdsAsync(peerId, ct);
+
     public async Task<Result<CreateChannelResponse>> CreateAsync(CreateChannelRequest req, CancellationToken ct)
     {
         if (await channels.GetByNameAsync(req.Name, req.RepoRoot, ct) is { } existing)

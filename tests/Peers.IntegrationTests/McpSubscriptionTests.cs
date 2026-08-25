@@ -459,7 +459,9 @@ public sealed class McpSubscriptionTests : IAsyncLifetime
     public async Task ChannelNotifier_StillDispatchesHints_WhenTheRosterRefreshFails()
     {
         await RegisterAsync();
-        await SubscribeAsync(PeerResources.PeersUri);
+        var channel = await CreatePadAsync("refresh-failure");
+        var channelUri = PeerResources.ChannelUri(channel);
+        await SubscribeAsync(channelUri);
         await _state.StopServicesAsync();
         _state.ResetCursorForRegistration(0);
         _notifications.Clear();
@@ -469,15 +471,16 @@ public sealed class McpSubscriptionTests : IAsyncLifetime
         await using var notifier = new ChannelNotifier(client, _state);
         notifier.Start();
 
-        // Emits peer.registered, so the batch both carries a peer event (triggering the refresh)
-        // and warrants a peers://peers hint.
+        // Registering into a repo that already has a channel emits BOTH peer.registered — which
+        // triggers the roster refresh, and so the failure under test — AND a join announcement on
+        // that channel, which must still produce its hint despite the refresh throwing.
         await _broker.RegisterAsync(new RegisterPeerRequest
         {
             Tool = "codex", MachineId = "worker-machine", RepoRoot = "/repo", Branch = "main",
         });
 
         var update = await WaitForNotificationAsync(NotificationMethods.ResourceUpdatedNotification, TimeSpan.FromSeconds(30));
-        Assert.Equal(PeerResources.PeersUri, update["uri"]!.GetValue<string>());
+        Assert.Equal(channelUri, update["uri"]!.GetValue<string>());
 
         // The refresh really did fail — otherwise this test would pass even with the ordering wrong.
         Assert.True(failing.Attempts > 0, "the roster refresh never ran, so this proves nothing");
@@ -769,81 +772,116 @@ public sealed class McpSubscriptionTests : IAsyncLifetime
     // deleted with the suite still green — and peers://peers would go permanently
     // silent, which is the whole point of the peer.updated event behind it.
     // -------------------------------------------------------------------------
+    /// <summary>Registers a peer and has it ADDRESS this session in <paramref name="channelId"/>.
+    /// The mention is what makes them correspondents — the real protocol always carries `to`, and mere
+    /// co-authorship would not qualify (a fresh peer auto-announces into every channel in its repo).</summary>
+    private async Task<string> CorrespondentAsync(string channelId, string machine)
+    {
+        var partner = await _broker.RegisterAsync(new RegisterPeerRequest
+        {
+            Tool = "codex", MachineId = machine, RepoRoot = "/repo", Branch = "main",
+        });
+        await _broker.SendMessageAsync(channelId, new SendMessageRequest
+        {
+            AuthorPeerId = partner.PeerId, Content = "reviewer here", To = [_peerId!], Quiet = false,
+        });
+        return partner.PeerId;
+    }
+
+    // -------------------------------------------------------------------------
+    // A roster hint is only OUR business when it is somebody we correspond with.
+    // Unscoped, every presence call anywhere on the machine woke every subscribed
+    // session — and since progress reporting rides peer.updated, that became
+    // constant churn from unrelated pairs working in the same repo.
+    // -------------------------------------------------------------------------
     [Fact]
-    public async Task PeerChange_NotifiesThePeersResource()
+    public async Task PeerChange_NotifiesOnlyPeersWeCorrespondWith()
     {
         await RegisterAsync();
+        var channel = await CreatePadAsync("roster-scope");
         await SubscribeAsync(PeerResources.PeersUri);
+        await AppendAsync(channel, "driver here");
 
-        // Drain what predates the subscription, so what follows is only the change under test.
+        var partner = await CorrespondentAsync(channel, "partner-machine");
+        // Same repo, never addressed us: exactly the unrelated pair whose churn used to wake us.
+        var stranger = (await _broker.RegisterAsync(new RegisterPeerRequest
+        {
+            Tool = "codex", MachineId = "stranger-machine", RepoRoot = "/repo", Branch = "main",
+        })).PeerId;
+
         await DispatchBrokerEventsAsync();
+        await Task.Delay(Settle);
         _notifications.Clear();
 
-        // A heartbeat carrying a status field is exactly what changes the peers://peers payload; the
-        // broker emits peer.updated for it (an all-null lease renewal deliberately emits nothing).
-        await _client.CallToolAsync(
-            "presence", new Dictionary<string, object?> { ["summary"] = "now reviewing" });
+        await _broker.HeartbeatAsync(stranger, new HeartbeatRequest { Summary = "unrelated work" });
+        await DispatchBrokerEventsAsync();
+        await Task.Delay(Settle);
+
+        Assert.DoesNotContain(_notifications, n => n.Method == NotificationMethods.ResourceUpdatedNotification);
+
+        // Same stream, a peer that did address us: the silence above was the scope filter, not a
+        // dead subscription.
+        await _broker.HeartbeatAsync(partner, new HeartbeatRequest { Summary = "now reviewing" });
         await DispatchBrokerEventsAsync();
 
         var update = await WaitForNotificationAsync(NotificationMethods.ResourceUpdatedNotification);
         Assert.Equal(PeerResources.PeersUri, update["uri"]!.GetValue<string>());
     }
 
-
     // -------------------------------------------------------------------------
-    // The whole progress chain in one test: tool parameter -> camelCase HTTP ->
-    // SQL discriminator -> Peer model -> snake_case tool output. Every layer in
-    // between has its own unit test; this is the one that proves they are wired
-    // to each other.
-    // -------------------------------------------------------------------------
-    [Fact]
-    public async Task Presence_Progress_ReachesThePeersTool()
-    {
-        await RegisterAsync();
-
-        await _client.CallToolAsync("presence", new Dictionary<string, object?>
-        {
-            ["summary"] = "refactoring auth",
-            ["progress_current"] = 7,
-            ["progress_total"] = 12,
-        });
-
-        var roster = JsonNode.Parse(TextOf(await _client.CallToolAsync("peers")))!.AsArray();
-        var self = roster.First(p => p!["summary"]?.GetValue<string>() == "refactoring auth")!;
-
-        Assert.Equal(7, self["progress_current"]!.GetValue<int>());
-        Assert.Equal(12, self["progress_total"]!.GetValue<int>());
-        Assert.NotNull(self["progress_updated_at"]);
-
-        // Current without total means indeterminate — it must not inherit the 12.
-        await _client.CallToolAsync("presence", new Dictionary<string, object?> { ["progress_current"] = 3 });
-
-        roster = JsonNode.Parse(TextOf(await _client.CallToolAsync("peers")))!.AsArray();
-        self = roster.First(p => p!["summary"]?.GetValue<string>() == "refactoring auth")!;
-        Assert.Equal(3, self["progress_current"]!.GetValue<int>());
-        Assert.Null(self["progress_total"]?.GetValue<int?>());
-    }
-
-    // -------------------------------------------------------------------------
-    // Progress alone must fire the peers://peers hint — that hint IS the
-    // "near-real-time" claim. Mirrors PeerChange_NotifiesThePeersResource, but
-    // with no other status field set, so it fails if progress were left out of
-    // PeerService.Changes().
+    // A stranger STARTING a session in our repo must not wake us either.
+    // peer.registered carries recipient_peer_ids, which is the durable INBOX
+    // audience (every peer in the repo) — reusing it as a roster hint would be
+    // repo scoping wearing a disguise. The inbox still delivers it.
     // -------------------------------------------------------------------------
     [Fact]
-    public async Task Progress_AloneNotifiesThePeersResource()
+    public async Task PeerRegistration_DoesNotPushARosterHint()
     {
         await RegisterAsync();
         await SubscribeAsync(PeerResources.PeersUri);
-
         await DispatchBrokerEventsAsync();
+        await Task.Delay(Settle);
         _notifications.Clear();
 
-        await _client.CallToolAsync("presence", new Dictionary<string, object?>
+        await _broker.RegisterAsync(new RegisterPeerRequest
         {
-            ["progress_current"] = 4,
-            ["progress_total"] = 9,
+            Tool = "codex", MachineId = "newcomer-machine", RepoRoot = "/repo", Branch = "main",
         });
+        await DispatchBrokerEventsAsync();
+        await Task.Delay(Settle);
+
+        Assert.DoesNotContain(_notifications, n => n.Method == NotificationMethods.ResourceUpdatedNotification);
+    }
+
+    // -------------------------------------------------------------------------
+    // Progress is PULL-only: read from the roster, or off a wait keepalive. It must
+    // never wake a subscriber, even one we correspond with — a driver reporting every
+    // few seconds would otherwise notify its reviewer on every tick. The event still
+    // exists (the notifier's roster cache and the CLI both read it); it carries no
+    // audience.
+    // -------------------------------------------------------------------------
+    [Fact]
+    public async Task Progress_AloneNotifiesNobody()
+    {
+        await RegisterAsync();
+        var channel = await CreatePadAsync("progress-quiet");
+        await SubscribeAsync(PeerResources.PeersUri);
+        await AppendAsync(channel, "driver here");
+
+        var partner = await CorrespondentAsync(channel, "partner-machine");
+
+        await DispatchBrokerEventsAsync();
+        await Task.Delay(Settle);
+        _notifications.Clear();
+
+        await _broker.HeartbeatAsync(partner, new HeartbeatRequest { ProgressCurrent = 4, ProgressTotal = 9 });
+        await DispatchBrokerEventsAsync();
+        await Task.Delay(Settle);
+
+        Assert.DoesNotContain(_notifications, n => n.Method == NotificationMethods.ResourceUpdatedNotification);
+
+        // Same peer, a status change: proves progress was what stayed quiet, not the partner.
+        await _broker.HeartbeatAsync(partner, new HeartbeatRequest { Summary = "done thinking" });
         await DispatchBrokerEventsAsync();
 
         var update = await WaitForNotificationAsync(NotificationMethods.ResourceUpdatedNotification);

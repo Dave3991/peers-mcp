@@ -104,7 +104,7 @@ top; the inbox is the guarantee.
 
 | Resource | Payload |
 |----------|---------|
-| `peers://peers` | Same as the `peers` tool |
+| `peers://peers` | Same as the `peers` tool. Updates notify only peers you correspond with (mentioned, or mentioned you); progress changes never notify |
 | `peers://inbox` | Your unacknowledged inbox — same payload as `wait` returns |
 | `peers://channel/{id}` | A channel's messages, with your own quiet-visibility applied |
 

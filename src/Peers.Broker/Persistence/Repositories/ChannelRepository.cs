@@ -132,6 +132,45 @@ public sealed class ChannelRepository(SqliteConnectionFactory db)
     /// A null viewer sees none of them — reading a whole channel never leaks whispers addressed to
     /// somebody else.
     /// </summary>
+    /// <summary>
+    /// Every peer <paramref name="peerId"/> actually corresponds with: the ones it has mentioned, and
+    /// the ones that have mentioned it. This is the audience for its presence changes.
+    ///
+    /// Mentions, not mere co-authorship in a channel. A fresh peer auto-announces itself into every
+    /// channel scoped to its repo (see PeerService.RegisterAsync), so "has posted in the same channel"
+    /// would make every new session a member of every channel in that repo — which is repo scoping
+    /// wearing a disguise, and would keep waking a driver/reviewer pair for unrelated pairs' churn.
+    /// Addressing someone is the thing that makes them your counterpart; join notices mention nobody.
+    /// </summary>
+    public async Task<List<string>> GetCorrespondentPeerIdsAsync(string peerId, CancellationToken ct = default)
+    {
+        return await db.ReadAsync(async conn =>
+        {
+            using var cmd = conn.CreateCommand();
+            cmd.CommandText = """
+                SELECT DISTINCT p FROM (
+                    -- peers this one has addressed
+                    SELECT json_each.value AS p
+                    FROM channel_messages m, json_each(m.mentions)
+                    WHERE m.author_peer_id = @peer
+                    UNION
+                    -- peers that have addressed it
+                    SELECT m.author_peer_id AS p
+                    FROM channel_messages m
+                    WHERE EXISTS (SELECT 1 FROM json_each(m.mentions) WHERE json_each.value = @peer)
+                )
+                WHERE p IS NOT NULL AND p <> @peer
+                """;
+            cmd.Parameters.AddWithValue("@peer", peerId);
+
+            var ids = new List<string>();
+            using var r = await cmd.ExecuteReaderAsync(ct);
+            while (await r.ReadAsync(ct))
+                ids.Add(r.GetString(0));
+            return ids;
+        }, ct);
+    }
+
     public async Task<List<MessageRow>> ReadMessagesAsync(
         string channelId, string? viewer, long sinceSeq, int limit, CancellationToken ct = default)
     {
