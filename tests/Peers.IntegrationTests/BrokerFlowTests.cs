@@ -6,6 +6,7 @@ using Microsoft.AspNetCore.Hosting;
 using Microsoft.AspNetCore.TestHost;
 using Peers.Broker.Hosting;
 using Peers.Broker.Persistence;
+using Peers.Shared;
 using Peers.Shared.Contracts;
 using Xunit;
 
@@ -68,6 +69,36 @@ public sealed class BrokerFlowTests : IAsyncLifetime
         Assert.NotNull(doc);
         var version = doc!.RootElement.GetProperty("version").GetInt32();
         Assert.Equal(Schema.CurrentVersion, version);
+
+        // The contract version is what makes a stale daemon replace itself; a payload change that
+        // forgets to bump it fails silently in production, so pin it here.
+        Assert.Equal(BrokerContract.Current, doc.RootElement.GetProperty("contract").GetInt32());
+    }
+
+    // The heartbeat route validated nothing until progress arrived, so these pin the whole guard,
+    // not just the progress part of it.
+    [Fact]
+    public async Task Heartbeat_InvalidPayloads_Return400()
+    {
+        var peerId = await RegisterPeerAsync("m-validate");
+
+        var negative = await _http.PatchAsJsonAsync($"/peers/{peerId}/heartbeat",
+            new HeartbeatRequest { ProgressCurrent = -1 }, JsonOpts);
+        Assert.Equal(HttpStatusCode.BadRequest, negative.StatusCode);
+
+        // Total on its own would be silently dropped by the discriminator, so it is refused loudly.
+        var totalOnly = await _http.PatchAsJsonAsync($"/peers/{peerId}/heartbeat",
+            new HeartbeatRequest { ProgressTotal = 12 }, JsonOpts);
+        Assert.Equal(HttpStatusCode.BadRequest, totalOnly.StatusCode);
+
+        var oversizedFocus = await _http.PatchAsJsonAsync($"/peers/{peerId}/heartbeat",
+            new HeartbeatRequest { FocusPaths = new string('x', 11 * 1024) }, JsonOpts);
+        Assert.Equal(HttpStatusCode.BadRequest, oversizedFocus.StatusCode);
+
+        // The valid shape still goes through.
+        var ok = await _http.PatchAsJsonAsync($"/peers/{peerId}/heartbeat",
+            new HeartbeatRequest { ProgressCurrent = 7, ProgressTotal = 12 }, JsonOpts);
+        ok.EnsureSuccessStatusCode();
     }
 
     [Fact]

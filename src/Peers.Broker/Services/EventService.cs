@@ -1,11 +1,21 @@
 using Peers.Broker.Persistence.Repositories;
 using Peers.Shared.Contracts;
+using Peers.Shared.Models;
 
 namespace Peers.Broker.Services;
 
 public sealed class EventService(EventRepository events, PeerRepository peers, InboxRepository inbox)
 {
     private static readonly TimeSpan RetentionTtl = TimeSpan.FromHours(72);
+
+    /// <summary>
+    /// How long a peer.updated row is worth keeping. It is a re-read hint, not state — nothing
+    /// reconstructs anything from it, and a missed one costs a subscriber one 5s poll of staleness.
+    /// Progress reporting writes one per update, so leaving them to the min-cursor rule lets a single
+    /// idle peer pin every one of them for 72h. Well past ChannelNotifier's 5s cadence, so a peer that
+    /// is polling at all cannot miss a hint to this.
+    /// </summary>
+    private static readonly TimeSpan PeerUpdatedRetention = TimeSpan.FromMinutes(5);
     private static readonly TimeSpan AckedInboxRetention = TimeSpan.FromHours(24);
     private const int MaxUnackedPerPeer = 500;
 
@@ -45,6 +55,9 @@ public sealed class EventService(EventRepository events, PeerRepository peers, I
 
         // Fallback: always prune events older than TTL
         await events.PruneOlderThanAsync(RetentionTtl, ct);
+
+        // Cursor-independent: see PeerUpdatedRetention.
+        await events.PruneTypeOlderThanAsync(EventTypes.PeerUpdated, PeerUpdatedRetention, ct);
     }
 
     public async Task<int> PruneInboxAsync(CancellationToken ct)

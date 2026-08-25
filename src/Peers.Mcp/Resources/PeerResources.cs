@@ -20,7 +20,7 @@ internal static class PeerResources
 
     public const string PeersDescription = """
         Live roster of peer sessions known to the local broker — same payload as the peers tool
-        (peer_id, tool, repo_root, branch, role, summary, self, lease state).
+        (peer_id, tool, repo_root, branch, role, summary, lease state, and progress_current/progress_total/progress_updated_at for peers reporting long-running work).
 
         Subscriptions: notifications/resources/updated for this URI is A HINT TO RE-READ, never a delta stream.
         Delivery is best-effort and lossy: there is no retry, an MCP process restart drops whatever was in

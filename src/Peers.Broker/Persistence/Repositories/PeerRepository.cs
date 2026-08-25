@@ -55,6 +55,11 @@ public sealed class PeerRepository(SqliteConnectionFactory db)
                     parent_peer_id = @parent,
                     lease_expires_at = @lease,
                     expired_at = NULL,
+                    -- A resumed session starts its own work; inheriting the previous session's counts
+                    -- would show a task nobody is running.
+                    progress_current = NULL,
+                    progress_total = NULL,
+                    progress_updated_at = NULL,
                     updated_at = datetime('now')
                 WHERE peer_id = @id
                 """;
@@ -75,8 +80,16 @@ public sealed class PeerRepository(SqliteConnectionFactory db)
         }, ct);
     }
 
+    /// <summary>
+    /// Renews the lease and applies whichever status fields the heartbeat carried.
+    ///
+    /// Progress does NOT use COALESCE. progressCurrent is the discriminator: supplied, and BOTH counts
+    /// are replaced — so omitting progressTotal genuinely means "indeterminate", instead of silently
+    /// inheriting a stale total from a finished task. Absent, and no progress column moves at all.
+    /// </summary>
     public async Task<int> RenewLeaseAsync(string peerId, DateTime newExpiry, string? summary, string? role,
-        string? branch, string? commitSha, string? focusPaths, string? capabilities, CancellationToken ct = default)
+        string? branch, string? commitSha, string? focusPaths, string? capabilities,
+        int? progressCurrent = null, int? progressTotal = null, CancellationToken ct = default)
     {
         return await db.WriteAsync(async conn =>
         {
@@ -91,6 +104,11 @@ public sealed class PeerRepository(SqliteConnectionFactory db)
                     commit_sha = COALESCE(@commit, commit_sha),
                     focus_paths = COALESCE(@focus, focus_paths),
                     capabilities = COALESCE(@caps, capabilities),
+                    progress_current = CASE WHEN @progressCurrent IS NULL THEN progress_current ELSE @progressCurrent END,
+                    progress_total   = CASE WHEN @progressCurrent IS NULL THEN progress_total   ELSE @progressTotal   END,
+                    -- Stamped only when this heartbeat actually carried progress, so the 30s all-null
+                    -- lease renewal cannot make stalled progress look like it is still moving.
+                    progress_updated_at = CASE WHEN @progressCurrent IS NULL THEN progress_updated_at ELSE datetime('now') END,
                     updated_at = datetime('now')
                 WHERE peer_id = @id
                 """;
@@ -102,6 +120,8 @@ public sealed class PeerRepository(SqliteConnectionFactory db)
             cmd.Parameters.AddWithValue("@commit", (object?)commitSha ?? DBNull.Value);
             cmd.Parameters.AddWithValue("@focus", (object?)focusPaths ?? DBNull.Value);
             cmd.Parameters.AddWithValue("@caps", (object?)capabilities ?? DBNull.Value);
+            cmd.Parameters.AddWithValue("@progressCurrent", (object?)progressCurrent ?? DBNull.Value);
+            cmd.Parameters.AddWithValue("@progressTotal", (object?)progressTotal ?? DBNull.Value);
             return await cmd.ExecuteNonQueryAsync(ct);
         }, ct);
     }
@@ -316,6 +336,9 @@ public sealed class PeerRepository(SqliteConnectionFactory db)
         Capabilities = r.IsDBNull(r.GetOrdinal("capabilities")) ? null : r.GetString(r.GetOrdinal("capabilities")),
         ParentPeerId = r.IsDBNull(r.GetOrdinal("parent_peer_id")) ? null : r.GetString(r.GetOrdinal("parent_peer_id")),
         LastPolledEventId = r.IsDBNull(r.GetOrdinal("last_polled_event_id")) ? null : r.GetInt64(r.GetOrdinal("last_polled_event_id")),
+        ProgressCurrent = r.IsDBNull(r.GetOrdinal("progress_current")) ? null : r.GetInt32(r.GetOrdinal("progress_current")),
+        ProgressTotal = r.IsDBNull(r.GetOrdinal("progress_total")) ? null : r.GetInt32(r.GetOrdinal("progress_total")),
+        ProgressUpdatedAt = r.GetUtcOrNull("progress_updated_at"),
         LeaseExpiresAt = r.GetUtc("lease_expires_at"),
         ExpiredAt = r.GetUtcOrNull("expired_at"),
         CreatedAt = r.GetUtc("created_at"),

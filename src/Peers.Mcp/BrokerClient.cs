@@ -37,10 +37,11 @@ public sealed class BrokerClient : IDisposable
         catch { /* best-effort on shutdown */ }
     }
 
-    public async Task<List<Peer>> ListPeersAsync(string? repoRoot = null, string? branch = null, string? tool = null, bool includeExpired = false)
+    public async Task<List<Peer>> ListPeersAsync(string? repoRoot = null, string? branch = null, string? tool = null,
+        bool includeExpired = false, CancellationToken cancellationToken = default)
     {
         var query = BuildQuery(("repo_root", repoRoot), ("branch", branch), ("tool", tool), ("include_expired", includeExpired ? "true" : null));
-        return (await GetAsync<List<Peer>>($"/peers{query}"))!;
+        return (await GetAsync<List<Peer>>($"/peers{query}", cancellationToken))!;
     }
 
     // Channels

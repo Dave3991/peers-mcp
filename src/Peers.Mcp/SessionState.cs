@@ -2,6 +2,7 @@ using ModelContextProtocol.Server;
 using Peers.Mcp.Lifecycle;
 using Peers.Mcp.Resources;
 using Peers.Shared.Contracts;
+using Peers.Shared.Models;
 
 namespace Peers.Mcp;
 
@@ -54,6 +55,22 @@ public sealed class SessionState : IDisposable, IAsyncDisposable
 
     private readonly Lock _cursorGate = new();
     private long _lastCursor;
+
+    /// <summary>
+    /// Last roster the channel notifier fetched, or an empty list before the first refresh. Read by the
+    /// wait ticker so a keepalive can say what other peers are doing WITHOUT doing I/O of its own: the
+    /// notifier is already polling every 5s and already sees the peer events that make this stale, so a
+    /// second fetch on the ticker's path would duplicate that loop inside a cancellation-sensitive
+    /// request. Always replaced wholesale, never mutated, so a reader needs no lock beyond the swap.
+    /// </summary>
+    public IReadOnlyList<Peer> PeerRoster
+    {
+        get { lock (_rosterGate) return _peerRoster; }
+        set { lock (_rosterGate) _peerRoster = value; }
+    }
+
+    private readonly Lock _rosterGate = new();
+    private IReadOnlyList<Peer> _peerRoster = [];
 
     /// <summary>
     /// Broker head at registration. Resource dispatch starts strictly after this so a subscription only

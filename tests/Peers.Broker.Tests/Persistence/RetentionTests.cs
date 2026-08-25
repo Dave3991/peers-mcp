@@ -4,6 +4,7 @@ using Peers.Broker.Persistence.Repositories;
 using Peers.Broker.Services;
 using Peers.Broker.Tests.Helpers;
 using Peers.Shared.Contracts;
+using Peers.Shared.Models;
 using Xunit;
 
 namespace Peers.Broker.Tests.Persistence;
@@ -368,6 +369,91 @@ public sealed class RetentionTests : IDisposable
 
         // Exactly 1 unacked row remains (row 3)
         Assert.Equal(1, await CountUnackedInboxRowsAsync(peerId));
+    }
+
+    // The min-cursor rule in the raw: one live peer that never polls pins events for everyone. Kept as
+    // the tripwire for the no-throttle decision on progress updates — peer.updated now has its own
+    // short TTL (see PruneAsync_DropsAgedPeerUpdated_EvenWithAPinnedCursor), so what this pins is that
+    // RECENT progress events still survive a prune while a cursor is stuck.
+    [Fact]
+    public async Task PruneAsync_KeepsEvents_WhenOneActivePeerCursorNeverAdvances()
+    {
+        var (peers, _, events, peerSvc, eventSvc) = CreateRepos();
+
+        // A peer that registers and then never polls: last_polled_event_id stays at 0.
+        var idle = await peerSvc.RegisterAsync(new RegisterPeerRequest
+        {
+            Tool = "claude-code", MachineId = "m", RepoRoot = "/r",
+        }, CancellationToken.None);
+
+        // A second peer reports progress repeatedly, emitting a peer.updated each time.
+        var worker = await peerSvc.RegisterAsync(new RegisterPeerRequest
+        {
+            Tool = "claude-code", MachineId = "m2", RepoRoot = "/r",
+        }, CancellationToken.None);
+
+        for (var i = 1; i <= 5; i++)
+            await peerSvc.HeartbeatAsync(worker.PeerId,
+                new HeartbeatRequest { ProgressCurrent = i, ProgressTotal = 5 }, CancellationToken.None);
+
+        var before = (await events.GetSinceAsync(0, 500, CancellationToken.None)).Count;
+        Assert.True(before >= 5, $"expected the progress events to be stored, saw {before}");
+
+        Assert.Equal(0L, await peers.GetMinActiveCursorAsync(CancellationToken.None) ?? 0L);
+
+        await eventSvc.PruneAsync(CancellationToken.None);
+
+        // Nothing went away: the idle peer's cursor is the floor, and the TTL is 72h.
+        Assert.Equal(before, (await events.GetSinceAsync(0, 500, CancellationToken.None)).Count);
+        Assert.NotNull(idle.PeerId);
+    }
+
+    /// <summary>Backdates every event of a type so the short-TTL prune can see it as aged.</summary>
+    private Task BackdateEventsAsync(string type, TimeSpan age)
+        => _db.Factory.WriteAsync(async conn =>
+        {
+            using var cmd = conn.CreateCommand();
+            cmd.CommandText = "UPDATE events SET created_at = datetime('now', @age) WHERE type = @type";
+            cmd.Parameters.AddWithValue("@age", $"-{(int)age.TotalSeconds} seconds");
+            cmd.Parameters.AddWithValue("@type", type);
+            await cmd.ExecuteNonQueryAsync();
+        }, CancellationToken.None);
+
+    // peer.updated is a re-read hint, not state, so it does NOT wait for every cursor to pass it.
+    // Without this, progress reporting grows the events table for 72h behind any one idle peer.
+    [Fact]
+    public async Task PruneAsync_DropsAgedPeerUpdated_EvenWithAPinnedCursor()
+    {
+        var (peers, _, events, peerSvc, eventSvc) = CreateRepos();
+
+        // Registers and never polls: the minimum active cursor stays 0 and pins everything.
+        await peerSvc.RegisterAsync(new RegisterPeerRequest
+        {
+            Tool = "claude-code", MachineId = "m", RepoRoot = "/r",
+        }, CancellationToken.None);
+
+        var worker = await peerSvc.RegisterAsync(new RegisterPeerRequest
+        {
+            Tool = "claude-code", MachineId = "m2", RepoRoot = "/r",
+        }, CancellationToken.None);
+
+        for (var i = 1; i <= 5; i++)
+            await peerSvc.HeartbeatAsync(worker.PeerId,
+                new HeartbeatRequest { ProgressCurrent = i, ProgressTotal = 5 }, CancellationToken.None);
+
+        var all = await events.GetSinceAsync(0, 500, CancellationToken.None);
+        Assert.Equal(5, all.Count(e => e.Type == EventTypes.PeerUpdated));
+        var others = all.Count(e => e.Type != EventTypes.PeerUpdated);
+
+        await BackdateEventsAsync(EventTypes.PeerUpdated, TimeSpan.FromMinutes(30));
+        Assert.Equal(0L, await peers.GetMinActiveCursorAsync(CancellationToken.None) ?? 0L);
+
+        await eventSvc.PruneAsync(CancellationToken.None);
+
+        var left = await events.GetSinceAsync(0, 500, CancellationToken.None);
+        Assert.Empty(left.Where(e => e.Type == EventTypes.PeerUpdated));
+        // Everything else still respects the cursor rule.
+        Assert.Equal(others, left.Count(e => e.Type != EventTypes.PeerUpdated));
     }
 
     public void Dispose() => _db.Dispose();

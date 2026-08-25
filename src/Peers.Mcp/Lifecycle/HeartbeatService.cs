@@ -97,6 +97,10 @@ public sealed class HeartbeatService : IDisposable, IAsyncDisposable
             };
             var resp = await _client.RegisterAsync(clone);
             _state.PeerId = resp.PeerId;
+            // Same reason as SessionRegistration.ApplyRegistrationAsync: the cached roster belongs to
+            // the OLD id, so our own dead row — still carrying fresh progress — would stop matching
+            // the wait ticker's self-filter and read as another peer working.
+            _state.PeerRoster = [];
             _state.AdvanceCursor(resp.LastCursor); // don't rewind the poll cursor
             _logger.LogInformation("Broker lost peer; self-healed by re-registering as {PeerId} (resumed={Resumed}) — new identity", resp.PeerId, resp.Resumed);
         }

@@ -15,6 +15,16 @@ public sealed class Peer
     public string? Capabilities { get; init; } // JSON array
     public string? ParentPeerId { get; init; }
     public long? LastPolledEventId { get; init; }
+
+    /// <summary>Units of the current long-running task completed so far; null when nothing is being tracked.</summary>
+    public int? ProgressCurrent { get; init; }
+
+    /// <summary>Total units in the current task, or null for an indeterminate count.</summary>
+    public int? ProgressTotal { get; init; }
+
+    /// <summary>When progress last actually moved. Distinct from <see cref="UpdatedAt"/>, which the 30s
+    /// lease renewal bumps for every live peer and so cannot tell moving progress from stalled progress.</summary>
+    public DateTime? ProgressUpdatedAt { get; init; }
     public required DateTime LeaseExpiresAt { get; init; }
     public DateTime? ExpiredAt { get; init; }
     public required DateTime CreatedAt { get; init; }

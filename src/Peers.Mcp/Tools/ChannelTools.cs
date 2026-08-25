@@ -5,6 +5,7 @@ using Microsoft.Extensions.Logging;
 using ModelContextProtocol;
 using ModelContextProtocol.Server;
 using Peers.Mcp.Lifecycle;
+using Peers.Shared;
 using Peers.Shared.Contracts;
 
 namespace Peers.Mcp.Tools;
@@ -28,7 +29,7 @@ public sealed class ChannelTools
 
     [McpServerTool(Name = "peers"), Description(
         "Live roster of peer sessions known to the local broker — who is working where, on what branch, doing what.\n" +
-        "Returns: array of peers with peer_id, tool, repo_root, branch, role, summary, self flag.")]
+        "Returns: array of peers with peer_id, tool, repo_root, branch, role, summary, and progress_current/progress_total/progress_updated_at for peers reporting long-running work.")]
     public static async Task<string> Peers(
         BrokerClient client,
         SessionState state,
@@ -47,7 +48,8 @@ public sealed class ChannelTools
 
     [McpServerTool(Name = "presence"), Description(
         "Update how this session appears to other peers: role (implementing/reviewing/debugging/spec), summary of current work, capability tags, focus paths.\n" +
-        "Identity (tool, repo, branch) is derived automatically; presence is for the human-meaningful fields. Renewed automatically by heartbeat.")]
+        "Identity (tool, repo, branch) is derived automatically; presence is for the human-meaningful fields. Renewed automatically by heartbeat.\n" +
+        "Long-running work: call again with progress_current (and progress_total when you know it) as you go. Last value wins, one task at a time, and `summary` says what is being counted. Other peers see it in the roster, on peers://peers, and on their wait keepalives.")]
     public static async Task<string> Presence(
         BrokerClient client,
         SessionState state,
@@ -57,6 +59,8 @@ public sealed class ChannelTools
         [Description("Brief summary of current work")] string? summary = null,
         [Description("File paths this session focuses on")] string[]? focus_paths = null,
         [Description("Capability tags this session advertises, e.g. [\"build\",\"test\",\"review\"]")] string[]? capabilities = null,
+        [Description("Units of the current long-running task done so far, e.g. 7 of 12 files")] int? progress_current = null,
+        [Description("Total units in the current task; omit for an open-ended count. Requires progress_current")] int? progress_total = null,
         CancellationToken cancellationToken = default)
     {
         await SessionRegistration.EnsureRegisteredAsync(client, state, server, loggerFactory, cancellationToken);
@@ -68,6 +72,8 @@ public sealed class ChannelTools
                 Summary = summary,
                 FocusPaths = focus_paths is null ? null : JsonSerializer.Serialize(focus_paths),
                 Capabilities = capabilities is null ? null : JsonSerializer.Serialize(capabilities),
+                ProgressCurrent = progress_current,
+                ProgressTotal = progress_total,
             });
             return JsonSerializer.Serialize(new { ok = true, peer_id = state.PeerId }, JsonOpts);
         }
@@ -228,7 +234,7 @@ public sealed class ChannelTools
             var completed = false;
             // Linked, so a client cancellation stops the ticker as well as the broker call.
             using var cts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
-            var ticker = TickAsync(progress, t, tickInterval, () => completed, cts.Token);
+            var ticker = TickAsync(progress, state, t, tickInterval, () => completed, cts.Token);
             InboxResponse? resp;
             try
             {
@@ -250,6 +256,7 @@ public sealed class ChannelTools
 
     private static async Task TickAsync(
         IProgress<ProgressNotificationValue>? progress,
+        SessionState state,
         int totalSeconds,
         TimeSpan tickInterval,
         Func<bool> completed,
@@ -270,13 +277,41 @@ public sealed class ChannelTools
                     {
                         Progress = elapsedSeconds,
                         Total = totalSeconds,
-                        Message = $"Waiting for peer messages… {elapsedSeconds}s/{totalSeconds}s",
+                        Message = $"Waiting for peer messages… {elapsedSeconds}s/{totalSeconds}s{PeerProgress(state)}",
                     });
                 }
                 catch { return; }
             }
         }
         catch (OperationCanceledException) { }
+    }
+
+    /// <summary>
+    /// What the other peers are doing, as a message suffix, or "" when nobody is reporting.
+    ///
+    /// Reads the notifier's cached roster — no I/O, no await. Progress/Total stay the elapsed-seconds
+    /// countdown; only this text changes, so the keepalive's numeric contract is untouched.
+    ///
+    /// Stale progress is SHOWN with its age, not hidden. The question a parked peer actually has is
+    /// "stalled or still thinking?", and "7/12 (14m ago)" answers it where "" answers nothing — a
+    /// driver inside one long tool call reports nothing for many minutes, and silence there reads
+    /// exactly like nobody working. It also keeps this agreeing with the CLI, which already annotates
+    /// age. No upper bound is needed: the roster only ever holds peers whose lease is still live.
+    ///
+    /// ponytail: two peers, 40 chars of summary each. A keepalive is a status line, not the roster —
+    /// the peers tool has the full text. Widen only if a real wait ever needs more.
+    /// </summary>
+    private static string PeerProgress(SessionState state)
+    {
+        var now = DateTime.UtcNow;
+        var line = string.Join("; ", state.PeerRoster
+            .Where(p => p.PeerId != state.PeerId && p.ProgressCurrent is not null)
+            .OrderByDescending(p => p.ProgressUpdatedAt)
+            .Take(2)
+            .Select(p => $"{(p.PeerId.Length <= 8 ? p.PeerId : p.PeerId[..8])} {ProgressFormat.CountsWithAge(p.ProgressCurrent, p.ProgressTotal, p.ProgressUpdatedAt, now)}"
+                         + (p.Summary is { Length: > 0 } s ? $" {(s.Length <= 40 ? s : s[..40] + "…")}" : "")));
+
+        return line.Length == 0 ? "" : $" · {line}";
     }
 
     private static string Shape(SessionState state, InboxResponse? resp, bool? timedOut)

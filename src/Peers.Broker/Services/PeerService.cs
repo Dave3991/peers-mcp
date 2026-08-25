@@ -3,6 +3,7 @@ using FluentResults;
 using Microsoft.Extensions.Logging;
 using Peers.Broker.Errors;
 using Peers.Broker.Persistence.Repositories;
+using Peers.Shared;
 using Peers.Shared.Contracts;
 using Peers.Shared.Ids;
 using Peers.Shared.Models;
@@ -117,7 +118,8 @@ public sealed class PeerService(PeerRepository peers, EventService eventService,
     public async Task<Result> HeartbeatAsync(string peerId, HeartbeatRequest req, CancellationToken ct)
     {
         var rows = await peers.RenewLeaseAsync(peerId, DateTime.UtcNow.Add(LeaseDuration),
-            req.Summary, req.Role, req.Branch, req.CommitSha, req.FocusPaths, req.Capabilities, ct);
+            req.Summary, req.Role, req.Branch, req.CommitSha, req.FocusPaths, req.Capabilities,
+            req.ProgressCurrent, req.ProgressTotal, ct);
         if (rows == 0)
             return Result.Fail(new NotFoundError($"Peer '{peerId}' not found. Re-register before sending heartbeats."));
 
@@ -128,9 +130,17 @@ public sealed class PeerService(PeerRepository peers, EventService eventService,
         //
         // No recipients: this is a resource-change signal, not a directed message. Recipients would put a
         // row in every peer's durable inbox and surface as unread traffic in peer_inbox.
+        //
+        // ponytail: no rate gate on progress. The PUSH side is already coalesced — ChannelNotifier polls
+        // at 5s and SubscriptionRegistry unions a batch into one hint per URI — so a gate here would be a
+        // second copy of that in the wrong process, and PeerService is scoped so it would need static
+        // state. What stays uncapped is one small events row per progress call, and note these are NOT
+        // "pruned within seconds": PruneAsync prunes below the MINIMUM active cursor, so one live peer
+        // whose cursor never advances pins the table until the 72h TTL. The real rate ceiling is LLM
+        // tool-call latency. Revisit only if /status events_last_5min says otherwise.
         if (Changes(req))
             await eventService.EmitAsync(EventTypes.PeerUpdated,
-                JsonSerializer.Serialize(new { peer_id = peerId }), ct);
+                JsonSerializer.Serialize(new { peer_id = peerId, progress = ProgressText(req) }), ct);
 
         return Result.Ok();
     }
@@ -139,7 +149,19 @@ public sealed class PeerService(PeerRepository peers, EventService eventService,
     /// so an all-null request provably cannot change a single column other than the lease.</summary>
     private static bool Changes(HeartbeatRequest req) =>
         req.Summary is not null || req.Role is not null || req.Branch is not null ||
-        req.CommitSha is not null || req.FocusPaths is not null || req.Capabilities is not null;
+        req.CommitSha is not null || req.FocusPaths is not null || req.Capabilities is not null ||
+        req.ProgressCurrent is not null;
+
+    /// <summary>
+    /// Rendered counts for the event payload, or null when this heartbeat carried no progress.
+    ///
+    /// This exists for ONE consumer: the CLI's `events --follow`, whose SummarizePayload cherry-picks
+    /// string keys and would otherwise print a bare peer_id for every progress tick. Nothing
+    /// reconstructs state from here — the resource hint still means "re-read peers://peers". A null
+    /// serialises as "progress": null, which that renderer skips.
+    /// </summary>
+    private static string? ProgressText(HeartbeatRequest req) =>
+        req.ProgressCurrent is null ? null : ProgressFormat.Counts(req.ProgressCurrent, req.ProgressTotal);
 
     public async Task<List<Peer>> ListAsync(ListPeersRequest req, CancellationToken ct)
     {

@@ -50,4 +50,29 @@ public static class RequestLimits
             return Results.BadRequest(new { error = $"Capabilities JSON exceeds {MaxJsonArrayBytes} bytes." });
         return null;
     }
+
+    /// <summary>
+    /// Mirrors the register limits, because a heartbeat writes the same mutable columns — until this
+    /// existed the route validated nothing at all, so summary length and the JSON array caps were
+    /// enforced on register and then freely exceeded on every update.
+    ///
+    /// An over-count (current > total) is deliberately NOT rejected: a run that discovers more work
+    /// mid-flight would get a 400 in the middle of its task, which is worse than an odd-looking number.
+    /// ProgressFormat clamps the display instead.
+    /// </summary>
+    public static IResult? ValidateHeartbeat(Shared.Contracts.HeartbeatRequest req)
+    {
+        if (req.Summary?.Length > MaxSummaryLength)
+            return Results.BadRequest(new { error = $"Summary exceeds {MaxSummaryLength} characters." });
+        if (Utf8Bytes(req.FocusPaths) > MaxJsonArrayBytes)
+            return Results.BadRequest(new { error = $"Focus paths JSON exceeds {MaxJsonArrayBytes} bytes." });
+        if (Utf8Bytes(req.Capabilities) > MaxJsonArrayBytes)
+            return Results.BadRequest(new { error = $"Capabilities JSON exceeds {MaxJsonArrayBytes} bytes." });
+        // null < 0 is false, so both guards are null-safe.
+        if (req.ProgressCurrent < 0 || req.ProgressTotal < 0)
+            return Results.BadRequest(new { error = "Progress counts must be zero or greater." });
+        if (req.ProgressTotal is not null && req.ProgressCurrent is null)
+            return Results.BadRequest(new { error = "progress_total requires progress_current; on its own it would be silently ignored." });
+        return null;
+    }
 }

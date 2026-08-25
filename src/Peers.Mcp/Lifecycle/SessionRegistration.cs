@@ -98,6 +98,10 @@ internal static class SessionRegistration
         state.ResetCursorForRegistration(resp.LastCursor);
         state.PeerId = resp.PeerId;
         state.ResourceBaseline = resp.LatestEventId;
+        // The cached roster belongs to the OLD peer id. Keeping it would let this session's own
+        // previous row — still carrying fresh progress — slip past the wait ticker's self-filter and
+        // read as another peer working. The next poll refills it.
+        state.PeerRoster = [];
 
         state.Heartbeat = new HeartbeatService(client, state, loggerFactory.CreateLogger<HeartbeatService>());
         state.Heartbeat.Start();

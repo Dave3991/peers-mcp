@@ -121,7 +121,7 @@ by `wait` until you echo their ids back as `ack_inbox_ids`.
 | Tool | Purpose |
 |------|---------|
 | `peers` | Live roster of sessions: who is working where, on what, with which role |
-| `presence` | Update this session's role, summary, capabilities, focus paths |
+| `presence` | Update this session's role, summary, capabilities, focus paths, and progress on long-running work |
 | `channels` | List channels and their repo scope + message counts |
 | `channel_create` | Create a channel (`name`, optional `repo_root`; names unique per scope) |
 | `send` | Post to a channel: `content`, optional `to` mentions, optional `quiet` whisper |
@@ -161,7 +161,7 @@ tests/
 └── Peers.Broker.Tests/  # xunit integration tests
 ```
 
-**Broker** (`localhost:7856`) manages all state in SQLite at `~/.peers/peers.db` (schema v3).
+**Broker** (`localhost:7856`) manages all state in SQLite at `~/.peers/peers.db` (schema v4).
 `/health` reports both the schema version and an HTTP **contract version**; an MCP server that finds a
 broker older than its own contract stops it and starts a current one, so a long-lived daemon can never
 silently break freshly-spawned sessions. It exposes a REST API, handles peer leases (2-minute TTL, auto-renewed), persistent inbox delivery, event fan-out, request validation, and cleanup.
@@ -193,7 +193,7 @@ Check its health:
 
 ```bash
 curl http://localhost:7856/health
-# {"status":"ok","version":1}
+# {"status":"ok","version":4,"contract":3}
 ```
 
 Or use the CLI:

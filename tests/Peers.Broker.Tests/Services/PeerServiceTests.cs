@@ -490,6 +490,62 @@ public sealed class PeerServiceTests : IDisposable
             return (string)(await cmd.ExecuteScalarAsync())!;
         }, CancellationToken.None);
 
+    [Fact]
+    public async Task Heartbeat_ProgressOnly_EmitsPeerUpdated_AndCarriesTheCounts()
+    {
+        var eventRepo = new EventRepository(_db.Factory);
+        var peerRepo = new PeerRepository(_db.Factory);
+        var inboxRepo = new InboxRepository(_db.Factory);
+        var eventService = new EventService(eventRepo, peerRepo, inboxRepo);
+        var svc = new PeerService(peerRepo, eventService,
+            new ChannelService(new ChannelRepository(_db.Factory), peerRepo, eventService, new RecipientResolver(peerRepo)));
+
+        var resp = await svc.RegisterAsync(new RegisterPeerRequest
+        {
+            Tool = "claude-code", MachineId = "m", RepoRoot = "/r",
+        }, CancellationToken.None);
+        var cursor = resp.LatestEventId;
+
+        Assert.True((await svc.HeartbeatAsync(resp.PeerId,
+            new HeartbeatRequest { ProgressCurrent = 7, ProgressTotal = 12 }, CancellationToken.None)).IsSuccess);
+
+        var evt = Assert.Single(await eventRepo.GetSinceAsync(cursor, 100, CancellationToken.None));
+        Assert.Equal(EventTypes.PeerUpdated, evt.Type);
+        // The rendered string exists for the CLI's events --follow, which only prints string values.
+        Assert.Equal("7/12", JsonDocument.Parse(evt.Payload).RootElement.GetProperty("progress").GetString());
+
+        var peer = await peerRepo.GetAsync(resp.PeerId, CancellationToken.None);
+        Assert.Equal(7, peer!.ProgressCurrent);
+        Assert.Equal(12, peer.ProgressTotal);
+
+        // Still a resource-change signal, not a directed message.
+        Assert.Empty(await inboxRepo.GetUnackedAsync(resp.PeerId, 100, CancellationToken.None));
+    }
+
+    // Re-pins the idle floor against the widened Changes(): adding progress must not make the 30s
+    // all-null background heartbeat start emitting.
+    [Fact]
+    public async Task Heartbeat_AllNull_StillEmitsNothing_WithProgressInChanges()
+    {
+        var eventRepo = new EventRepository(_db.Factory);
+        var peerRepo = new PeerRepository(_db.Factory);
+        var inboxRepo = new InboxRepository(_db.Factory);
+        var eventService = new EventService(eventRepo, peerRepo, inboxRepo);
+        var svc = new PeerService(peerRepo, eventService,
+            new ChannelService(new ChannelRepository(_db.Factory), peerRepo, eventService, new RecipientResolver(peerRepo)));
+
+        var resp = await svc.RegisterAsync(new RegisterPeerRequest
+        {
+            Tool = "claude-code", MachineId = "m", RepoRoot = "/r",
+        }, CancellationToken.None);
+        var cursor = resp.LatestEventId;
+
+        await svc.HeartbeatAsync(resp.PeerId, new HeartbeatRequest(), CancellationToken.None);
+        await svc.HeartbeatAsync(resp.PeerId, new HeartbeatRequest(), CancellationToken.None);
+
+        Assert.Empty(await eventRepo.GetSinceAsync(cursor, 100, CancellationToken.None));
+    }
+
     public void Dispose() => _db.Dispose();
 
 }

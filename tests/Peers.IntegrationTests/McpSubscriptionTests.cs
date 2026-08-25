@@ -402,6 +402,109 @@ public sealed class McpSubscriptionTests : IAsyncLifetime
         Assert.Equal(uri, update["uri"]!.GetValue<string>());
     }
 
+
+    // -------------------------------------------------------------------------
+    // The notifier is what POPULATES the roster the wait ticker reads. Nothing else
+    // writes SessionState.PeerRoster, so if this refresh regresses, peer progress
+    // silently never appears on a keepalive and every ticker unit test still passes
+    // (they seed the roster directly). This is the link between the two halves.
+    // -------------------------------------------------------------------------
+    [Fact]
+    public async Task ChannelNotifier_RefreshesThePeerRoster_WhenAPeerReportsProgress()
+    {
+        await RegisterAsync();
+        // Replaced by the notifier under test.
+        await _state.StopServicesAsync();
+        _state.ResetCursorForRegistration(0);
+
+        using var client = new BrokerClient(new HttpClient(_app.GetTestServer().CreateHandler())
+        {
+            BaseAddress = new Uri("http://localhost"),
+        });
+        await using var notifier = new ChannelNotifier(client, _state);
+        notifier.Start();
+
+        // Same repo as the test session: the refresh is scoped to state.RepoRoot.
+        var worker = await _broker.RegisterAsync(new RegisterPeerRequest
+        {
+            Tool = "codex", MachineId = "worker-machine", RepoRoot = "/repo", Branch = "main",
+        });
+        await _broker.HeartbeatAsync(worker.PeerId, new HeartbeatRequest
+        {
+            Summary = "running the suite", ProgressCurrent = 340, ProgressTotal = 1200,
+        });
+
+        // 5s poll cadence, same as ChannelNotifier_SurvivesABrokerStall.
+        await WaitForAsync(
+            () => _state.PeerRoster.Any(p => p.PeerId == worker.PeerId && p.ProgressCurrent == 340),
+            TimeSpan.FromSeconds(30),
+            "the notifier never refreshed the peer roster after a progress report");
+
+        var seen = _state.PeerRoster.First(p => p.PeerId == worker.PeerId);
+        Assert.Equal(1200, seen.ProgressTotal);
+        Assert.NotNull(seen.ProgressUpdatedAt);
+    }
+
+
+    // -------------------------------------------------------------------------
+    // The roster refresh must never cost a hint. It runs in the same loop body as
+    // resources/updated dispatch, AFTER the cursor has already advanced — so if it
+    // throws before dispatch, that batch's hints are gone permanently and the
+    // cursor has moved past them. An HttpClient timeout arrives as
+    // TaskCanceledException with our token untouched, which a
+    // `is not OperationCanceledException` filter would let escape, so this drives
+    // a hard failure through the same path.
+    // -------------------------------------------------------------------------
+    [Fact]
+    public async Task ChannelNotifier_StillDispatchesHints_WhenTheRosterRefreshFails()
+    {
+        await RegisterAsync();
+        await SubscribeAsync(PeerResources.PeersUri);
+        await _state.StopServicesAsync();
+        _state.ResetCursorForRegistration(0);
+        _notifications.Clear();
+
+        var failing = new FailPathHandler(_app.GetTestServer().CreateHandler(), "/peers");
+        using var client = new BrokerClient(new HttpClient(failing) { BaseAddress = new Uri("http://localhost") });
+        await using var notifier = new ChannelNotifier(client, _state);
+        notifier.Start();
+
+        // Emits peer.registered, so the batch both carries a peer event (triggering the refresh)
+        // and warrants a peers://peers hint.
+        await _broker.RegisterAsync(new RegisterPeerRequest
+        {
+            Tool = "codex", MachineId = "worker-machine", RepoRoot = "/repo", Branch = "main",
+        });
+
+        var update = await WaitForNotificationAsync(NotificationMethods.ResourceUpdatedNotification, TimeSpan.FromSeconds(30));
+        Assert.Equal(PeerResources.PeersUri, update["uri"]!.GetValue<string>());
+
+        // The refresh really did fail — otherwise this test would pass even with the ordering wrong.
+        Assert.True(failing.Attempts > 0, "the roster refresh never ran, so this proves nothing");
+        Assert.Empty(_state.PeerRoster);
+    }
+
+    /// <summary>Fails every GET to exactly <paramref name="path"/> the way a broker hiccup does, and
+    /// forwards everything else. Raises TaskCanceledException with the caller's token NOT cancelled,
+    /// which is how HttpClient.Timeout presents.</summary>
+    private sealed class FailPathHandler(HttpMessageHandler inner, string path) : DelegatingHandler(inner)
+    {
+        public int Attempts => Volatile.Read(ref _attempts);
+        private int _attempts;
+
+        protected override Task<HttpResponseMessage> SendAsync(
+            HttpRequestMessage request, CancellationToken cancellationToken)
+        {
+            if (request.Method == HttpMethod.Get && request.RequestUri?.AbsolutePath == path)
+            {
+                Interlocked.Increment(ref _attempts);
+                return Task.FromException<HttpResponseMessage>(new TaskCanceledException("simulated request timeout"));
+            }
+
+            return base.SendAsync(request, cancellationToken);
+        }
+    }
+
     // -------------------------------------------------------------------------
     // A broker stall must cost one tick, not the session. HttpClient.Timeout surfaces as
     // TaskCanceledException — an OperationCanceledException — so the poll loop's unfiltered
@@ -680,6 +783,67 @@ public sealed class McpSubscriptionTests : IAsyncLifetime
         // broker emits peer.updated for it (an all-null lease renewal deliberately emits nothing).
         await _client.CallToolAsync(
             "presence", new Dictionary<string, object?> { ["summary"] = "now reviewing" });
+        await DispatchBrokerEventsAsync();
+
+        var update = await WaitForNotificationAsync(NotificationMethods.ResourceUpdatedNotification);
+        Assert.Equal(PeerResources.PeersUri, update["uri"]!.GetValue<string>());
+    }
+
+
+    // -------------------------------------------------------------------------
+    // The whole progress chain in one test: tool parameter -> camelCase HTTP ->
+    // SQL discriminator -> Peer model -> snake_case tool output. Every layer in
+    // between has its own unit test; this is the one that proves they are wired
+    // to each other.
+    // -------------------------------------------------------------------------
+    [Fact]
+    public async Task Presence_Progress_ReachesThePeersTool()
+    {
+        await RegisterAsync();
+
+        await _client.CallToolAsync("presence", new Dictionary<string, object?>
+        {
+            ["summary"] = "refactoring auth",
+            ["progress_current"] = 7,
+            ["progress_total"] = 12,
+        });
+
+        var roster = JsonNode.Parse(TextOf(await _client.CallToolAsync("peers")))!.AsArray();
+        var self = roster.First(p => p!["summary"]?.GetValue<string>() == "refactoring auth")!;
+
+        Assert.Equal(7, self["progress_current"]!.GetValue<int>());
+        Assert.Equal(12, self["progress_total"]!.GetValue<int>());
+        Assert.NotNull(self["progress_updated_at"]);
+
+        // Current without total means indeterminate — it must not inherit the 12.
+        await _client.CallToolAsync("presence", new Dictionary<string, object?> { ["progress_current"] = 3 });
+
+        roster = JsonNode.Parse(TextOf(await _client.CallToolAsync("peers")))!.AsArray();
+        self = roster.First(p => p!["summary"]?.GetValue<string>() == "refactoring auth")!;
+        Assert.Equal(3, self["progress_current"]!.GetValue<int>());
+        Assert.Null(self["progress_total"]?.GetValue<int?>());
+    }
+
+    // -------------------------------------------------------------------------
+    // Progress alone must fire the peers://peers hint — that hint IS the
+    // "near-real-time" claim. Mirrors PeerChange_NotifiesThePeersResource, but
+    // with no other status field set, so it fails if progress were left out of
+    // PeerService.Changes().
+    // -------------------------------------------------------------------------
+    [Fact]
+    public async Task Progress_AloneNotifiesThePeersResource()
+    {
+        await RegisterAsync();
+        await SubscribeAsync(PeerResources.PeersUri);
+
+        await DispatchBrokerEventsAsync();
+        _notifications.Clear();
+
+        await _client.CallToolAsync("presence", new Dictionary<string, object?>
+        {
+            ["progress_current"] = 4,
+            ["progress_total"] = 9,
+        });
         await DispatchBrokerEventsAsync();
 
         var update = await WaitForNotificationAsync(NotificationMethods.ResourceUpdatedNotification);

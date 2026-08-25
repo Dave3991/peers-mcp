@@ -4,7 +4,7 @@ namespace Peers.Broker.Persistence;
 
 public static class Schema
 {
-    public const int CurrentVersion = 3;
+    public const int CurrentVersion = 4;
 
     public static void Migrate(SqliteConnection conn)
     {
@@ -15,6 +15,13 @@ public static class Schema
         if (version < 1) ApplyV1(conn);
         if (version < 2) ApplyV2(conn);
         if (version < 3) ApplyV3(conn);
+        if (version < 4) ApplyV4(conn);
+
+        // Forward only. An older binary opening a newer database must not stamp its own version over
+        // the real one: the columns would stay, the version would lie, and the next new-binary start
+        // would re-run a migration whose work is already there.
+        if (version >= CurrentVersion)
+            return;
 
         using var setVersion = conn.CreateCommand();
         setVersion.CommandText = $"PRAGMA user_version = {CurrentVersion};";
@@ -176,5 +183,48 @@ public static class Schema
         using var cmd = conn.CreateCommand();
         cmd.CommandText = sql;
         cmd.ExecuteNonQuery();
+    }
+
+    /// <summary>
+    /// Long-running work reports progress on the peer row itself, through the presence heartbeat:
+    /// last value wins, one current task per peer, no lifecycle. progress_updated_at is separate from
+    /// updated_at because the 30s all-null lease renewal bumps updated_at for every live peer — it
+    /// cannot distinguish "at 7/12 and moving" from "stalled at 7/12". The units being counted live in
+    /// summary; a second note column would be one more string with exactly the same lifetime.
+    ///
+    /// Transactional and column-by-column idempotent, unlike V1-V3: SQLite has no
+    /// ADD COLUMN IF NOT EXISTS, so three bare ALTERs interrupted midway leave a half-migrated table
+    /// at user_version 3, and every later start then dies on "duplicate column name".
+    /// </summary>
+    private static void ApplyV4(SqliteConnection conn)
+    {
+        var existing = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        using (var info = conn.CreateCommand())
+        {
+            info.CommandText = "PRAGMA table_info(peers);";
+            using var reader = info.ExecuteReader();
+            while (reader.Read())
+                existing.Add(reader.GetString(reader.GetOrdinal("name")));
+        }
+
+        var columns = new (string Name, string Type)[]
+        {
+            ("progress_current", "INTEGER"),
+            ("progress_total", "INTEGER"),      // NULL = indeterminate: counting up with no known end
+            ("progress_updated_at", "TEXT"),
+        };
+
+        using var txn = conn.BeginTransaction();
+        foreach (var (name, type) in columns)
+        {
+            if (existing.Contains(name))
+                continue;
+
+            using var cmd = conn.CreateCommand();
+            cmd.Transaction = txn;
+            cmd.CommandText = $"ALTER TABLE peers ADD COLUMN {name} {type};";
+            cmd.ExecuteNonQuery();
+        }
+        txn.Commit();
     }
 }

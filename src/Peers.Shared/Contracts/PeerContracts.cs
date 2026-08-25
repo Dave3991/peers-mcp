@@ -39,6 +39,17 @@ public sealed class HeartbeatRequest
     public string? CommitSha { get; init; }
     public string? FocusPaths { get; init; }
     public string? Capabilities { get; init; }
+
+    /// <summary>
+    /// Units done so far on the current long-running task. This is the DISCRIMINATOR for a progress
+    /// update: when it is supplied, both counts are replaced (so omitting ProgressTotal genuinely means
+    /// indeterminate); when it is absent, no progress column is touched. A COALESCE on both would make
+    /// the indeterminate state unreachable once a total had ever been set.
+    /// </summary>
+    public int? ProgressCurrent { get; init; }
+
+    /// <summary>Total units, or null for an indeterminate count. Ignored unless ProgressCurrent is supplied.</summary>
+    public int? ProgressTotal { get; init; }
 }
 
 public sealed class ListPeersRequest

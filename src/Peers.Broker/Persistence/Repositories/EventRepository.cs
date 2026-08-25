@@ -69,6 +69,31 @@ public sealed class EventRepository(SqliteConnectionFactory db)
         }, ct);
     }
 
+    /// <summary>
+    /// Drops events of one type past a short age, WITHOUT waiting for every peer's cursor to pass them.
+    /// For a type whose rows carry no durable value — a hint to re-read a resource — the min-cursor rule
+    /// is pure cost: one live peer that never polls pins the whole table until the 72h TTL.
+    ///
+    /// Keeps the inbox guard anyway. Undirected types have no inbox rows today, but the guard is what
+    /// makes this safe to point at a directed type later.
+    /// </summary>
+    public async Task<int> PruneTypeOlderThanAsync(string type, TimeSpan age, CancellationToken ct = default)
+    {
+        return await db.WriteAsync(async conn =>
+        {
+            using var cmd = conn.CreateCommand();
+            cmd.CommandText = """
+                DELETE FROM events
+                WHERE type = @type
+                  AND created_at < datetime('now', @age)
+                  AND event_id NOT IN (SELECT event_id FROM peer_inbox WHERE acked_at IS NULL)
+                """;
+            cmd.Parameters.AddWithValue("@type", type);
+            cmd.Parameters.AddWithValue("@age", $"-{(int)age.TotalSeconds} seconds");
+            return await cmd.ExecuteNonQueryAsync(ct);
+        }, ct);
+    }
+
     public async Task<int> PruneOlderThanAsync(TimeSpan age, CancellationToken ct = default)
     {
         return await db.WriteAsync(async conn =>

@@ -52,7 +52,10 @@ try
             Console.WriteLine($"\nPeers ({peers?.Count ?? 0}):");
             if (peers is not null)
                 foreach (var p in peers)
-                    Console.WriteLine($"  {p.PeerId}  {p.Tool,-12} {p.RepoRoot ?? "?",-30} {p.Branch ?? "?",-20} {p.Summary ?? ""}");
+                {
+                    var progress = ProgressFormat.CountsWithAge(p.ProgressCurrent, p.ProgressTotal, p.ProgressUpdatedAt, DateTime.UtcNow);
+                    Console.WriteLine($"  {p.PeerId}  {p.Tool,-12} {p.RepoRoot ?? "?",-30} {p.Branch ?? "?",-20} {progress,-16} {p.Summary ?? ""}");
+                }
             break;
         }
 
@@ -215,7 +218,7 @@ static string SummarizePayload(string payload)
         using var doc = JsonDocument.Parse(payload);
         if (doc.RootElement.ValueKind == JsonValueKind.Object)
         {
-            foreach (var keyName in new[] { "peer_id", "channel_id", "artifact_id", "title", "type" })
+            foreach (var keyName in new[] { "peer_id", "channel_id", "artifact_id", "title", "type", "progress" })
             {
                 if (doc.RootElement.TryGetProperty(keyName, out var v) && v.ValueKind == JsonValueKind.String)
                     parts.Add($"{keyName}={v.GetString()}");

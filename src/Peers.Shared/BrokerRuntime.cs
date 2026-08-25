@@ -27,10 +27,16 @@ public sealed record BrokerStatus
 ///
 /// 2: channels replace scratchpads — /scratchpads* routes are gone and /channels* are new, so a
 /// pre-channel daemon cannot serve a current MCP server at all.
+///
+/// 3: peers carry progress_current/progress_total. Nothing throws without it — System.Text.Json drops
+/// unknown members — so a pre-progress daemon would swallow every heartbeat's progress fields and the
+/// feature would simply never appear, with no error to read. That silent-daemon case is the whole
+/// reason this number exists. Replacing the old broker kills it mid-flight, so an in-flight wait or
+/// notifier poll can see one transport error or 504 while the replacement comes up; both retry.
 /// </summary>
 public static class BrokerContract
 {
-    public const int Current = 2;
+    public const int Current = 3;
 }
 
 public static class BrokerRuntime

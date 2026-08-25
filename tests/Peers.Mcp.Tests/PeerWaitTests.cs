@@ -9,6 +9,7 @@ using ModelContextProtocol;
 using ModelContextProtocol.Server;
 using Peers.Mcp;
 using Peers.Mcp.Tools;
+using Peers.Shared.Models;
 using Xunit;
 
 namespace Peers.Mcp.Tests;
@@ -329,6 +330,81 @@ public class PeerWaitTests
                 throw;
             }
         }
+    }
+
+
+    // ---- peer progress on the keepalive ----
+    //
+    // The roster is the notifier's cached snapshot, so the ticker does NO I/O: these seed
+    // SessionState directly and no fake handler ever sees a /peers request.
+
+    private static Peer PeerWithProgress(string peerId, int? current, int? total, string? summary, TimeSpan age) => new()
+    {
+        PeerId = peerId,
+        Tool = "claude-code",
+        MachineId = "m",
+        RepoRoot = "/r",
+        Summary = summary,
+        ProgressCurrent = current,
+        ProgressTotal = total,
+        ProgressUpdatedAt = DateTime.UtcNow - age,
+        LeaseExpiresAt = DateTime.UtcNow.AddMinutes(2),
+        CreatedAt = DateTime.UtcNow,
+        UpdatedAt = DateTime.UtcNow,
+    };
+
+    [Fact]
+    public async Task Wait_Ticker_AppendsFreshPeerProgressToTheMessage()
+    {
+        var gate = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var handler = new GatedHandler(gate.Task, () => Json(HttpStatusCode.OK, EmptyTimedOutBody()));
+        var client = new BrokerClient(new HttpClient(handler) { BaseAddress = new Uri("http://localhost") });
+        var state = new SessionState
+        {
+            PeerId = "p",
+            PeerRoster =
+            [
+                PeerWithProgress("abcdef0123456789", 7, 12, "refactoring auth", TimeSpan.FromSeconds(5)),
+                // Self is never reported back to us.
+                PeerWithProgress("p", 1, 2, "mine", TimeSpan.Zero),
+            ],
+        };
+        var recorder = new RecordingProgress();
+
+        var call = WaitCore(client, state, 120, ackInboxIds: null, recorder, TimeSpan.FromMilliseconds(1));
+        await WaitUntilAsync(() => recorder.Count >= 1, "at least one tick should have landed");
+        gate.SetResult();
+        await call;
+
+        var message = recorder.Snapshot()[0].Message;
+        Assert.StartsWith("Waiting for peer messages… 5s/120s", message);
+        Assert.Contains("abcdef01 7/12 refactoring auth", message);
+        Assert.DoesNotContain("mine", message);
+    }
+
+    // "Stalled or still thinking?" is the question a parked peer has, and an age answers it where
+    // silence does not — a driver inside one long tool call reports nothing for many minutes.
+    [Fact]
+    public async Task Wait_Ticker_ShowsStaleProgressWithItsAge()
+    {
+        var gate = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var handler = new GatedHandler(gate.Task, () => Json(HttpStatusCode.OK, EmptyTimedOutBody()));
+        var client = new BrokerClient(new HttpClient(handler) { BaseAddress = new Uri("http://localhost") });
+        var state = new SessionState
+        {
+            PeerId = "p",
+            PeerRoster = [PeerWithProgress("abcdef0123456789", 7, 12, "stalled out", TimeSpan.FromMinutes(10))],
+        };
+        var recorder = new RecordingProgress();
+
+        var call = WaitCore(client, state, 120, ackInboxIds: null, recorder, TimeSpan.FromMilliseconds(1));
+        await WaitUntilAsync(() => recorder.Count >= 1, "at least one tick should have landed");
+        gate.SetResult();
+        await call;
+
+        var message = recorder.Snapshot()[0].Message;
+        Assert.StartsWith("Waiting for peer messages… 5s/120s", message);
+        Assert.Contains("abcdef01 7/12 (10m ago) stalled out", message);
     }
 
     private static async Task WaitUntilAsync(Func<bool> condition, string because)

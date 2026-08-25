@@ -2,7 +2,7 @@
 
 ## What this is
 
-A local MCP server that lets multiple Claude Code (and Codex) sessions discover each other, share context, exchange artifacts, and review each other's work via shared scratchpads.
+A local MCP server that lets multiple Claude Code (and Codex) sessions discover each other, share context, exchange artifacts, and review each other's work on shared channels.
 
 ## Build & Run
 
@@ -24,19 +24,24 @@ For visible push-style channel messages in Claude Code, start Claude with:
 claude --dangerously-load-development-channels server:peers
 ```
 
-If you start Claude normally, directed peer messages are still available through the `peer_inbox` tool.
+If you start Claude normally, directed peer messages are still available through the `wait` tool.
 
 ## Peer Workflow Contract
 
+The whole agent-facing surface, and the only tools that exist:
+
+`peers` · `presence` · `channels` · `channel_create` · `send` · `read` · `wait` ·
+`artifact_publish` / `artifact_get` / `artifact_list` · `context_export` / `context_import`
+
 When participating in a multi-session workflow with this MCP server:
 
-1. **On startup**: Call `peer_register` with your repo, branch, role, and summary, and worktree_root if working in a linked git worktree
-2. **Check inbox regularly**: Call `peer_inbox` at startup, after completing a task chunk, before starting new work, and before finishing. Acknowledge what you have handled by passing the previous result's `inbox_id`s as `ack_inbox_ids` — anything you do not echo is delivered again. Use `peer_poll` only when you need raw event payloads or cursor debugging.
-3. **Review requests**: If a review scratchpad targets your repo, prioritize reading and responding
-4. **Share artifacts**: Publish meaningful outputs (types, specs, diffs) as artifacts instead of pasting large blobs into scratchpads
-5. **Update status**: Call `peer_heartbeat` when your role or focus changes
+1. **There is no registration step**: your first tool call registers this session automatically, deriving identity from the client name and the git repo/branch. Shape how you appear to others with `presence` (role, summary, capabilities, focus paths, and progress on long-running work)
+2. **Check for directed messages**: `wait` blocks until a mention lands (default 25s) and returns immediately when one does. Acknowledge what you handled by passing the previous result's `inbox_id`s as `ack_inbox_ids` — anything you do not echo is delivered again
+3. **Review requests**: a review thread is a channel — `channel_create` one per thread, then `send` each round with `to` naming the reviewer. If a channel scoped to your repo mentions you, prioritize reading and responding
+4. **Share artifacts**: Publish meaningful outputs (types, specs, diffs) as artifacts instead of pasting large blobs into channel messages
+5. **Report long work**: call `presence` with `progress_current` / `progress_total` as you go; other peers see it in the roster, on `peers://peers`, and on their `wait` keepalives. Omit `progress_total` for an open-ended count. There is no clear step — signal completion with `progress_current = progress_total`, otherwise a finished task keeps reading as its last count (annotated with its age once stale)
 6. **Context bridge**: Use `context_export` before handing off to Codex, and `context_import` when receiving from Codex
-7. **Resources**: `peers://peers` (same payload as `peer_list`) and `peers://inbox` (same as the `wait` tool) are readable on any MCP revision and inert until registration. Subscribing uses the standard `resources/subscribe` pair; `resources/updated` is a hint to re-read, never a delta stream. Reading `peers://inbox` acknowledges nothing — ack only via `ack_inbox_ids`
+7. **Resources**: `peers://peers` (same payload as `peers`) and `peers://inbox` (same as the `wait` tool) are readable on any MCP revision and inert until registration. Subscribing uses the standard `resources/subscribe` pair; `resources/updated` is a hint to re-read, never a delta stream. Reading `peers://inbox` acknowledges nothing — ack only via `ack_inbox_ids`
 
 ## Architecture
 

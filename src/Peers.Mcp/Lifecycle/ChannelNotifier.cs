@@ -77,6 +77,34 @@ public sealed class ChannelNotifier : IDisposable, IAsyncDisposable
                     _logger.LogWarning(ex, "Resource-updated dispatch failed for batch ({FromCursor} -> {ToCursor})",
                         fromCursor, _channelCursor);
                 }
+
+                // Peer events are exactly the ones that make the cached roster wrong — including the
+                // peer.updated a progress report emits — so the refresh rides the poll we already did
+                // instead of the wait ticker doing its own.
+                //
+                // STRICTLY AFTER dispatch, and it swallows everything short of our own shutdown. The
+                // cursor has already advanced by this point, so anything that throws between here and
+                // NotifyEventsAsync would drop that batch's hints forever. And the filter is
+                // !ct.IsCancellationRequested, not `is not OperationCanceledException`: an HttpClient
+                // timeout arrives as TaskCanceledException with OUR token untouched (same trap the
+                // outer handler documents), which the narrower filter would let escape. A failed
+                // refresh just keeps the previous snapshot — slightly stale peer progress on a
+                // keepalive is never worth a dropped hint.
+                if (resp.Events.Any(evt => evt.Type.StartsWith("peer.", StringComparison.Ordinal)))
+                {
+                    try
+                    {
+                        // Unscoped, because the `peers` tool is unscoped: scoping this to RepoRoot
+                        // would hide a cross-repo partner's progress from the keepalive while the
+                        // roster the agent can read still shows it — two surfaces disagreeing about
+                        // who is working. A driver/reviewer pair is not required to share a repo.
+                        _state.PeerRoster = await _client.ListPeersAsync(cancellationToken: ct);
+                    }
+                    catch (Exception ex) when (!ct.IsCancellationRequested)
+                    {
+                        _logger.LogDebug(ex, "Peer roster refresh failed; keeping the previous snapshot");
+                    }
+                }
             }
             // ONLY our own shutdown ends the loop. An unfiltered catch here cannot tell that from an
             // HttpClient timeout, which surfaces as TaskCanceledException — an OperationCanceledException —

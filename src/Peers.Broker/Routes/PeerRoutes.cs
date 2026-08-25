@@ -17,7 +17,11 @@ public static class PeerRoutes
         });
 
         app.MapPatch("/peers/{peerId}/heartbeat", async (string peerId, HeartbeatRequest req, PeerService svc, CancellationToken ct) =>
-            (await svc.HeartbeatAsync(peerId, req, ct)).ToHttp(Results.Ok(new { ok = true })));
+        {
+            var err = RequestLimits.ValidateHeartbeat(req);
+            if (err is not null) return err;
+            return (await svc.HeartbeatAsync(peerId, req, ct)).ToHttp(Results.Ok(new { ok = true }));
+        });
 
         app.MapGet("/peers", async (string? repo_root, string? branch, string? tool, bool? include_expired, PeerService svc, CancellationToken ct) =>
             Results.Ok(await svc.ListAsync(new ListPeersRequest { RepoRoot = repo_root, Branch = branch, Tool = tool, IncludeExpired = include_expired ?? false }, ct)));
