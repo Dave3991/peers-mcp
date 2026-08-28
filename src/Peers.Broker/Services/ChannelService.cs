@@ -74,6 +74,25 @@ public sealed class ChannelService(
             return Result.Fail(new BadRequestError(
                 "A quiet message requires at least one mention in 'to' — otherwise no one could ever see it."));
 
+        // A retried send is one message. The caller's key is checked after resolution (which the
+        // response needs either way) and before the write, so a transport retry re-reads its own prior
+        // message instead of posting a second review round. Mentions come from the stored row — the
+        // message is immutable — while delivery is resolved now, because "did it reach anyone" is a
+        // question about the present, not about the call that happened to win.
+        if (req.IdempotencyKey is { Length: > 0 } key
+            && await channels.GetByIdempotencyKeyAsync(channelId, key, ct) is { } existing)
+        {
+            return Result.Ok<SendMessageResponse?>(new SendMessageResponse
+            {
+                MessageId = existing.MessageId,
+                ChannelId = channelId,
+                Seq = existing.Seq,
+                Mentions = existing.Mentions,
+                Delivery = resolved.ToStatus(),
+                Deduplicated = true,
+            });
+        }
+
         var messageId = Guid.NewGuid().ToString("N")[..16];
         var row = await channels.AppendMessageAsync(new MessageRow
         {
@@ -83,6 +102,7 @@ public sealed class ChannelService(
             Content = req.Content,
             Mentions = mentions,
             Quiet = req.Quiet,
+            IdempotencyKey = req.IdempotencyKey,
             CreatedAt = DateTime.UtcNow.ToString("O"),
         }, ct);
 
@@ -100,7 +120,7 @@ public sealed class ChannelService(
             recipient_peer_ids = mentions,
         }), ct, mentions.Length == 0 ? null : mentions);
 
-        return Result.Ok(new SendMessageResponse
+        return Result.Ok<SendMessageResponse?>(new SendMessageResponse
         {
             MessageId = messageId,
             ChannelId = channelId,

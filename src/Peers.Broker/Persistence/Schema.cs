@@ -4,7 +4,7 @@ namespace Peers.Broker.Persistence;
 
 public static class Schema
 {
-    public const int CurrentVersion = 4;
+    public const int CurrentVersion = 5;
 
     public static void Migrate(SqliteConnection conn)
     {
@@ -16,6 +16,7 @@ public static class Schema
         if (version < 2) ApplyV2(conn);
         if (version < 3) ApplyV3(conn);
         if (version < 4) ApplyV4(conn);
+        if (version < 5) ApplyV5(conn);
 
         // Forward only. An older binary opening a newer database must not stamp its own version over
         // the real one: the columns would stay, the version would lie, and the next new-binary start
@@ -225,6 +226,69 @@ public static class Schema
             cmd.CommandText = $"ALTER TABLE peers ADD COLUMN {name} {type};";
             cmd.ExecuteNonQuery();
         }
+        txn.Commit();
+    }
+
+    /// <summary>
+    /// Two coordination gaps close here.
+    ///
+    /// claims: which peer is working on which path. presence.focus_paths was advisory metadata nobody
+    /// could act on — two sessions in one repo learned they were editing the same file by reading prose
+    /// in a channel, if at all. A claim is (repo_root, path, peer) with a TTL; overlap is a fact the
+    /// broker reports at claim time. Holder liveness comes from the peer lease, so a dead session's
+    /// claims stop blocking anyone the moment its lease lapses — no release handshake required.
+    ///
+    /// channel_messages.idempotency_key: a retried send is one message, not two. SendMessageRequest has
+    /// carried the field since the scratchpad era, but nothing read it and the only unique index lived
+    /// on scratchpad_entries, which V3 dropped — so a provider that retries a tool call (seen doing it
+    /// seven times on one call id) double-posted review rounds. Partial index: NULL keys stay unbounded.
+    ///
+    /// Column-by-column idempotent and transactional, for the reason V4 spells out.
+    /// </summary>
+    private static void ApplyV5(SqliteConnection conn)
+    {
+        var messageColumns = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        using (var info = conn.CreateCommand())
+        {
+            info.CommandText = "PRAGMA table_info(channel_messages);";
+            using var reader = info.ExecuteReader();
+            while (reader.Read())
+                messageColumns.Add(reader.GetString(reader.GetOrdinal("name")));
+        }
+
+        using var txn = conn.BeginTransaction();
+
+        if (!messageColumns.Contains("idempotency_key"))
+        {
+            using var alter = conn.CreateCommand();
+            alter.Transaction = txn;
+            alter.CommandText = "ALTER TABLE channel_messages ADD COLUMN idempotency_key TEXT;";
+            alter.ExecuteNonQuery();
+        }
+
+        using (var cmd = conn.CreateCommand())
+        {
+            cmd.Transaction = txn;
+            cmd.CommandText = """
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_channel_messages_idempotency
+                    ON channel_messages(channel_id, idempotency_key)
+                    WHERE idempotency_key IS NOT NULL;
+
+                CREATE TABLE IF NOT EXISTS claims (
+                    claim_id    TEXT PRIMARY KEY,
+                    peer_id     TEXT NOT NULL REFERENCES peers(peer_id) ON DELETE CASCADE,
+                    repo_root   TEXT NOT NULL,
+                    path        TEXT NOT NULL,
+                    expires_at  TEXT NOT NULL,
+                    created_at  TEXT NOT NULL DEFAULT (datetime('now'))
+                );
+
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_claims_owner ON claims(repo_root, path, peer_id);
+                CREATE INDEX IF NOT EXISTS idx_claims_scope ON claims(repo_root);
+                """;
+            cmd.ExecuteNonQuery();
+        }
+
         txn.Commit();
     }
 }

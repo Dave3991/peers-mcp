@@ -1,3 +1,4 @@
+using Peers.Broker.Persistence.Repositories;
 using Peers.Broker.Services;
 
 namespace Peers.Broker.Hosting;
@@ -32,6 +33,13 @@ public sealed class CleanupBackgroundService(
                     var capped = await eventService.PruneInboxAsync(stoppingToken);
                     if (capped > 0)
                         logger.LogWarning("Capped {Count} unacked inbox rows for over-quota peer(s)", capped);
+
+                    // Lapsed claims are already invisible to readers (the lease join drops them); this
+                    // only keeps the table from carrying a day of dead rows.
+                    var claims = scope.ServiceProvider.GetRequiredService<ClaimRepository>();
+                    var dropped = await claims.PruneExpiredAsync(stoppingToken);
+                    if (dropped > 0)
+                        logger.LogInformation("Pruned {Count} lapsed path claims", dropped);
                 }
 
                 await eventService.PruneAsync(stoppingToken);

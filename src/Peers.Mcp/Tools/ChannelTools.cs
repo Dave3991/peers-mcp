@@ -24,8 +24,8 @@ public sealed class ChannelTools
 {
     private static readonly JsonSerializerOptions JsonOpts = new() { PropertyNamingPolicy = JsonNamingPolicy.SnakeCaseLower };
 
-    private static string BrokerError(BrokerApiException ex) =>
-        JsonSerializer.Serialize(new { error = ex.Message, status_code = (int)ex.StatusCode }, JsonOpts);
+    /// <summary>Broker failures are tool errors, not payloads: the SDK turns this into isError=true.</summary>
+    private static McpException BrokerError(BrokerApiException ex) => new(ex.Message, ex);
 
     [McpServerTool(Name = "peers"), Description(
         "Live roster of peer sessions known to the local broker — who is working where, on what branch, doing what.\n" +
@@ -43,7 +43,7 @@ public sealed class ChannelTools
             var peers = await client.ListPeersAsync();
             return JsonSerializer.Serialize(peers, JsonOpts);
         }
-        catch (BrokerApiException ex) { return BrokerError(ex); }
+        catch (BrokerApiException ex) { throw BrokerError(ex); }
     }
 
     [McpServerTool(Name = "presence"), Description(
@@ -77,7 +77,7 @@ public sealed class ChannelTools
             });
             return JsonSerializer.Serialize(new { ok = true, peer_id = state.PeerId }, JsonOpts);
         }
-        catch (BrokerApiException ex) { return BrokerError(ex); }
+        catch (BrokerApiException ex) { throw BrokerError(ex); }
     }
 
     [McpServerTool(Name = "channels"), Description(
@@ -96,7 +96,7 @@ public sealed class ChannelTools
             var resp = await client.ListChannelsAsync();
             return JsonSerializer.Serialize(resp, JsonOpts);
         }
-        catch (BrokerApiException ex) { return BrokerError(ex); }
+        catch (BrokerApiException ex) { throw BrokerError(ex); }
     }
 
     [McpServerTool(Name = "channel_create"), Description(
@@ -122,7 +122,7 @@ public sealed class ChannelTools
             });
             return JsonSerializer.Serialize(resp, JsonOpts);
         }
-        catch (BrokerApiException ex) { return BrokerError(ex); }
+        catch (BrokerApiException ex) { throw BrokerError(ex); }
     }
 
     [McpServerTool(Name = "send"), Description(
@@ -139,6 +139,7 @@ public sealed class ChannelTools
         [Description("Markdown content to post")] string content,
         [Description("Peer IDs (or ID prefixes) to mention")] string[]? to = null,
         [Description("Deliver only to mentions; hide from all other readers")] bool quiet = false,
+        [Description("Retry-safe key: a second send with this key in this channel returns the first message instead of posting twice")] string? idempotency_key = null,
         CancellationToken cancellationToken = default)
     {
         await SessionRegistration.EnsureRegisteredAsync(client, state, server, loggerFactory, cancellationToken);
@@ -147,7 +148,7 @@ public sealed class ChannelTools
             var ch = await ResolveChannelAsync(client, channel, state.RepoRoot, cancellationToken)
                      ?? await ResolveChannelAsync(client, channel, null, cancellationToken);
             if (ch is null)
-                return JsonSerializer.Serialize(new { error = $"Channel '{channel}' not found." }, JsonOpts);
+                throw new McpException($"Channel '{channel}' not found.");
 
             var resp = await client.SendMessageAsync(ch.ChannelId, new SendMessageRequest
             {
@@ -155,10 +156,11 @@ public sealed class ChannelTools
                 Content = content,
                 To = to,
                 Quiet = quiet,
+                IdempotencyKey = idempotency_key,
             });
             return JsonSerializer.Serialize(resp, JsonOpts);
         }
-        catch (BrokerApiException ex) { return BrokerError(ex); }
+        catch (BrokerApiException ex) { throw BrokerError(ex); }
     }
 
     [McpServerTool(Name = "read"), Description(
@@ -180,12 +182,12 @@ public sealed class ChannelTools
             var ch = await ResolveChannelAsync(client, channel, state.RepoRoot, cancellationToken)
                      ?? await ResolveChannelAsync(client, channel, null, cancellationToken);
             if (ch is null)
-                return JsonSerializer.Serialize(new { error = $"Channel '{channel}' not found." }, JsonOpts);
+                throw new McpException($"Channel '{channel}' not found.");
 
             var resp = await client.ReadChannelMessagesAsync(ch.ChannelId, viewer: state.PeerId, since_seq ?? 0, limit ?? 200);
             return JsonSerializer.Serialize(resp, JsonOpts);
         }
-        catch (BrokerApiException ex) { return BrokerError(ex); }
+        catch (BrokerApiException ex) { throw BrokerError(ex); }
     }
 
     [McpServerTool(Name = "wait"), Description(
@@ -248,7 +250,7 @@ public sealed class ChannelTools
             }
             return Shape(state, resp, resp?.TimedOut ?? true);
         }
-        catch (BrokerApiException ex) { return BrokerError(ex); }
+        catch (BrokerApiException ex) { throw BrokerError(ex); }
         // No catch for OperationCanceledException: MCP 2026-07-28 says a server SHOULD NOT respond to a
         // cancelled request, and SDK 2.2.0 delivers that by suppressing the response when the handler
         // propagates.

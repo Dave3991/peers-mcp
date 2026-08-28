@@ -25,6 +25,7 @@ public static class BrokerHost
         builder.Services.AddScoped<ChannelRepository>();
         builder.Services.AddScoped<ArtifactRepository>();
         builder.Services.AddScoped<InboxRepository>();
+        builder.Services.AddScoped<ClaimRepository>();
 
         // Services (Scoped)
         builder.Services.AddScoped<PeerService>();
@@ -32,6 +33,7 @@ public static class BrokerHost
         builder.Services.AddScoped<ChannelService>();
         builder.Services.AddScoped<ArtifactService>();
         builder.Services.AddScoped<EventService>();
+        builder.Services.AddScoped<ClaimService>();
 
         // Background / status
         builder.Services.AddSingleton<BrokerStatus>();
@@ -48,6 +50,7 @@ public static class BrokerHost
         app.MapChannelRoutes();
         app.MapArtifactRoutes();
         app.MapPollRoutes();
+        app.MapClaimRoutes();
         app.MapStatusRoutes();
     }
 }

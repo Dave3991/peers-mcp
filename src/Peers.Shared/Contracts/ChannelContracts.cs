@@ -42,6 +42,12 @@ public sealed class SendMessageRequest
     /// <summary>Explicit mentions: peer IDs (prefix match) or repo paths. Mentions are what makes a quiet message visible.</summary>
     public string[]? To { get; init; }
     public bool Quiet { get; init; }
+
+    /// <summary>
+    /// Caller-chosen key making the send retry-safe: a second send with the same key in the same
+    /// channel returns the first message instead of posting again. Unique per channel; omit for
+    /// messages where a duplicate is harmless.
+    /// </summary>
     public string? IdempotencyKey { get; init; }
     public required string Content { get; init; }
 }
@@ -53,6 +59,12 @@ public sealed class SendMessageResponse
     public long Seq { get; init; }
     public required string[] Mentions { get; init; }
     public RecipientDeliveryStatus? Delivery { get; init; }
+
+    /// <summary>
+    /// True when an idempotency key matched an earlier send: this response describes the message that
+    /// already exists and nothing was written. Delivery is still current — the retry's real question.
+    /// </summary>
+    public bool Deduplicated { get; init; }
 }
 
 public sealed class ReadMessagesResponse

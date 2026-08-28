@@ -1,5 +1,6 @@
 using System.ComponentModel;
 using System.Text.Json;
+using ModelContextProtocol;
 using ModelContextProtocol.Server;
 using Peers.Mcp;
 using Peers.Mcp.Lifecycle;
@@ -42,11 +43,11 @@ public sealed class ArtifactTools
                 RepoRoot = repo_root, Branch = branch, CommitSha = commit_sha,
                 ContentType = content_type,
                 Tags = tags is null ? null : JsonSerializer.Serialize(tags),
-                PublishedByPeerId = state.PeerId,
+                PublishedByPeerId = state.PeerId!,
             });
             return JsonSerializer.Serialize(resp, JsonOpts);
         }
-        catch (BrokerApiException ex) { return BrokerError(ex); }
+        catch (BrokerApiException ex) { throw BrokerError(ex); }
     }
 
     [McpServerTool(Name = "artifact_get"), Description(
@@ -64,9 +65,9 @@ public sealed class ArtifactTools
         [Description("Max chars of content to return (default fits the 30 KB cap)")] int? max_chars = null)
     {
         if (artifact_id is null && (@namespace is null || name is null))
-            return """{"error":"Missing parameters. Provide either artifact_id, or both namespace and name."}""";
+            throw new McpException("Missing parameters. Provide either artifact_id, or both namespace and name.");
         if (artifact_id is not null && (@namespace is not null || name is not null))
-            return """{"error":"Conflicting parameters. Provide either artifact_id or namespace+name, not both."}""";
+            throw new McpException("Conflicting parameters. Provide either artifact_id or namespace+name, not both.");
 
         try
         {
@@ -75,11 +76,11 @@ public sealed class ArtifactTools
                 : await client.GetArtifactByNameAsync(@namespace!, name!);
 
             if (result is null)
-                return """{"error":"Artifact not found."}""";
+                throw new McpException("Artifact not found.");
 
             return OutputShaper.ShapeArtifactGet(result, offset, max_chars, Limits.MaxToolResultChars, JsonOpts);
         }
-        catch (BrokerApiException ex) { return BrokerError(ex); }
+        catch (BrokerApiException ex) { throw BrokerError(ex); }
     }
 
     [McpServerTool(Name = "artifact_list"), Description(
@@ -99,9 +100,9 @@ public sealed class ArtifactTools
             var list = await client.ListArtifactsAsync(type, repo_root, @namespace, limit ?? 50, offset ?? 0);
             return JsonSerializer.Serialize(list, JsonOpts);
         }
-        catch (BrokerApiException ex) { return BrokerError(ex); }
+        catch (BrokerApiException ex) { throw BrokerError(ex); }
     }
 
-    private static string BrokerError(BrokerApiException ex) =>
-        JsonSerializer.Serialize(new { error = ex.Message, status_code = (int)ex.StatusCode }, JsonOpts);
+    /// <summary>Broker failures are tool errors, not payloads: the SDK turns this into isError=true.</summary>
+    private static McpException BrokerError(BrokerApiException ex) => new(ex.Message, ex);
 }

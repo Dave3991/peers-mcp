@@ -94,7 +94,8 @@ public sealed class ChannelServiceTests : IDisposable
             Quiet = true,
         }, CancellationToken.None);
         Assert.True(sent.IsSuccess);
-        Assert.Equal([mentioned], sent.Value.Mentions);
+        var response = Assert.IsType<SendMessageResponse>(sent.Value);
+        Assert.Equal([mentioned], response.Mentions);
 
         // Author and mentioned see it; outsider does not. Anonymous sees neither.
         Assert.Single((await channels.ReadAsync(chan.ChannelId, author, 0, 100, CancellationToken.None))!.Messages);
@@ -150,6 +151,72 @@ public sealed class ChannelServiceTests : IDisposable
         var page2 = await channels.ReadAsync(chan.ChannelId, author, lastSeq, 2, CancellationToken.None);
         var msg = Assert.Single(page2!.Messages);
         Assert.Equal("m2", msg.Content);
+    }
+
+    // A retried send is one message. The key had existed on the request since the scratchpad era while
+    // nothing read it, so a provider retry posted a second review round nobody asked for.
+    [Fact]
+    public async Task Send_SameIdempotencyKey_ReturnsTheFirstMessage_AndDeliversOnce()
+    {
+        var (peerRepo, peerSvc, events, channels) = Create();
+        var author = await RegisterAsync(peerSvc, "m-idem");
+        var reviewer = await RegisterAsync(peerSvc, "m-idem-reviewer");
+        var chan = (await channels.CreateAsync(new CreateChannelRequest { Name = "review", RepoRoot = "/repo", CreatedByPeerId = author }, CancellationToken.None)).Value;
+
+        SendMessageRequest Round() => new()
+        {
+            AuthorPeerId = author,
+            Content = "PLAN round 1",
+            To = [reviewer],
+            IdempotencyKey = "round-1",
+        };
+
+        var first = (await channels.SendAsync(chan.ChannelId, Round(), CancellationToken.None)).Value!;
+        var retry = (await channels.SendAsync(chan.ChannelId, Round(), CancellationToken.None)).Value!;
+
+        Assert.False(first.Deduplicated);
+        Assert.True(retry.Deduplicated);
+        Assert.Equal(first.MessageId, retry.MessageId);
+        Assert.Equal(first.Seq, retry.Seq);
+        // Delivery still answers the retry's real question — who is live now.
+        Assert.Equal([reviewer], retry.Delivery!.OnlinePeerIds);
+
+        // One row, one inbox item: the reviewer must not see the same round twice.
+        var read = await channels.ReadAsync(chan.ChannelId, author, 0, 100, CancellationToken.None);
+        Assert.Single(read!.Messages);
+        Assert.Single(await MessagesFor(new InboxRepository(_db.Factory), reviewer));
+    }
+
+    [Fact]
+    public async Task Send_DifferentKeys_AndNoKeyAtAll_StillPostEveryMessage()
+    {
+        var (_, peerSvc, _, channels) = Create();
+        var author = await RegisterAsync(peerSvc, "m-keys");
+        var chan = (await channels.CreateAsync(new CreateChannelRequest { Name = "rounds", RepoRoot = "/repo", CreatedByPeerId = author }, CancellationToken.None)).Value;
+
+        await channels.SendAsync(chan.ChannelId, new SendMessageRequest { AuthorPeerId = author, Content = "r1", IdempotencyKey = "round-1" }, CancellationToken.None);
+        await channels.SendAsync(chan.ChannelId, new SendMessageRequest { AuthorPeerId = author, Content = "r2", IdempotencyKey = "round-2" }, CancellationToken.None);
+        await channels.SendAsync(chan.ChannelId, new SendMessageRequest { AuthorPeerId = author, Content = "chatter" }, CancellationToken.None);
+        await channels.SendAsync(chan.ChannelId, new SendMessageRequest { AuthorPeerId = author, Content = "chatter" }, CancellationToken.None);
+
+        var read = await channels.ReadAsync(chan.ChannelId, author, 0, 100, CancellationToken.None);
+        Assert.Equal(["r1", "r2", "chatter", "chatter"], read!.Messages.Select(m => m.Content).ToArray());
+    }
+
+    // The key is per channel: the same round id in two review threads is two messages.
+    [Fact]
+    public async Task Send_SameKeyInAnotherChannel_IsItsOwnMessage()
+    {
+        var (_, peerSvc, _, channels) = Create();
+        var author = await RegisterAsync(peerSvc, "m-scope");
+        var left = (await channels.CreateAsync(new CreateChannelRequest { Name = "left", RepoRoot = "/repo", CreatedByPeerId = author }, CancellationToken.None)).Value;
+        var right = (await channels.CreateAsync(new CreateChannelRequest { Name = "right", RepoRoot = "/repo", CreatedByPeerId = author }, CancellationToken.None)).Value;
+
+        var here = (await channels.SendAsync(left.ChannelId, new SendMessageRequest { AuthorPeerId = author, Content = "r1", IdempotencyKey = "round-1" }, CancellationToken.None)).Value!;
+        var there = (await channels.SendAsync(right.ChannelId, new SendMessageRequest { AuthorPeerId = author, Content = "r1", IdempotencyKey = "round-1" }, CancellationToken.None)).Value!;
+
+        Assert.False(there.Deduplicated);
+        Assert.NotEqual(here.MessageId, there.MessageId);
     }
 
     public void Dispose() => _db.Dispose();

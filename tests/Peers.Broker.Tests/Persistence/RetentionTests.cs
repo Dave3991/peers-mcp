@@ -451,7 +451,7 @@ public sealed class RetentionTests : IDisposable
         await eventSvc.PruneAsync(CancellationToken.None);
 
         var left = await events.GetSinceAsync(0, 500, CancellationToken.None);
-        Assert.Empty(left.Where(e => e.Type == EventTypes.PeerUpdated));
+        Assert.DoesNotContain(left, e => e.Type == EventTypes.PeerUpdated);
         // Everything else still respects the cursor rule.
         Assert.Equal(others, left.Count(e => e.Type != EventTypes.PeerUpdated));
     }

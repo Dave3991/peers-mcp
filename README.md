@@ -84,6 +84,26 @@ everyone else — absent from their reads and from their notifications, not mere
 author and the mentioned peers see it; nobody else ever does. A quiet message with no mentions is
 rejected, because nothing could ever see it.
 
+### Claim the paths you are editing
+
+`claim` tells the broker which paths this session is working on and answers the question that matters
+before an edit: is another live session already on them? A directory claims everything under it, and
+overlap is reported both ways — claiming `src/` collides with a held `src/foo.ts`, and vice versa.
+Grants are per path, so one contested file never blocks the three nobody is contesting.
+
+A claim informs; it never blocks a write. A conflict names the holder (peer id, role, summary) so the
+two sessions can split the work — that is the whole mechanism. Claims lapse with their TTL (default 30
+minutes, max 4 hours) or with the holder's 2-minute lease, so a crashed session never holds a path
+hostage and `release` is a courtesy rather than a requirement. Scope is server-derived: a session
+claims inside the repository it registered from, under its own peer id.
+
+### Retry a send without double-posting
+
+Pass `idempotency_key` on `send` and the second call with that key in that channel returns the first
+message with `deduplicated: true` instead of posting again. Nothing is written and nothing is delivered
+twice — which is what makes a transport retry safe on a review round, where a duplicate reads as a new
+request.
+
 ### Share artifacts
 
 Publish versioned artifacts — diffs, type definitions, API specs, test reports — that other sessions
@@ -127,6 +147,9 @@ by `wait` until you echo their ids back as `ack_inbox_ids`.
 | `send` | Post to a channel: `content`, optional `to` mentions, optional `quiet` whisper |
 | `read` | Read a channel from `since_seq`; whispers addressed to others are filtered out |
 | `wait` | Long-poll for directed messages (default 25s, max 120s); echo `ack_inbox_ids` to acknowledge receipts |
+| `claim` | Announce the paths this session is editing; reports any live peer already holding them |
+| `claims` | The whole claim map for this repository, with holders |
+| `release` | Give back claims (named paths, or all of them) |
 | `artifact_publish` | Publish a versioned, content-hashed artifact |
 | `artifact_get` | Retrieve an artifact by ID or namespace+name (latest version) |
 | `artifact_list` | List artifact metadata, filter by type/repo/namespace |
@@ -134,6 +157,15 @@ by `wait` until you echo their ids back as `ack_inbox_ids`.
 | `context_import` | Import a context packet from Codex |
 
 There is no register or heartbeat tool: the MCP server does both for you.
+
+Failures are MCP errors, not payloads. A missing channel, an unknown artifact, a conflicting lookup, or
+a broker fault comes back with `isError: true` and the reason in the text — never as a successful
+result whose body happens to contain an `error` key, which a client can only find by string-matching a
+success.
+
+`initialize` reports the server version as `2.0.0+<git sha>`: a stdio server serves the assembly it
+loaded at launch for the whole client session, so the sha is how a session tells a fresh build from one
+still answering with pre-change tools.
 
 `wait` defaults to 25s because an MCP client's request timeout is one-shot: omp resolves it as
 `OMP_MCP_TIMEOUT_MS`, then the per-server `timeout`, then 30s, and it does not extend that deadline
@@ -161,7 +193,7 @@ tests/
 └── Peers.Broker.Tests/  # xunit integration tests
 ```
 
-**Broker** (`localhost:7856`) manages all state in SQLite at `~/.peers/peers.db` (schema v4).
+**Broker** (`localhost:7856`) manages all state in SQLite at `~/.peers/peers.db` (schema v5).
 `/health` reports both the schema version and an HTTP **contract version**; an MCP server that finds a
 broker older than its own contract stops it and starts a current one, so a long-lived daemon can never
 silently break freshly-spawned sessions. It exposes a REST API, handles peer leases (2-minute TTL, auto-renewed), persistent inbox delivery, event fan-out, request validation, and cleanup.
@@ -193,7 +225,7 @@ Check its health:
 
 ```bash
 curl http://localhost:7856/health
-# {"status":"ok","version":4,"contract":3}
+# {"status":"ok","version":5,"contract":4}
 ```
 
 Or use the CLI:

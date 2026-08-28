@@ -1061,11 +1061,100 @@ public sealed class McpSubscriptionTests : IAsyncLifetime
             new[]
             {
                 "artifact_get", "artifact_list", "artifact_publish",
-                "channel_create", "channels",
+                "channel_create", "channels", "claim", "claims",
                 "context_export", "context_import",
-                "peers", "presence", "read", "send", "wait",
+                "peers", "presence", "read", "release", "send", "wait",
             },
             listed);
+    }
+
+    [Fact]
+    public async Task ToolFailures_AreMarkedAsMcpErrors()
+    {
+        var missingLookup = await _client.CallToolAsync("artifact_get");
+        Assert.True(missingLookup.IsError is true, TextOf(missingLookup));
+        Assert.Contains("Missing parameters", TextOf(missingLookup));
+
+        var missingChannel = await _client.CallToolAsync(
+            "read",
+            new Dictionary<string, object?> { ["channel"] = $"missing-{Guid.NewGuid():N}" });
+        Assert.True(missingChannel.IsError is true, TextOf(missingChannel));
+        Assert.Contains("not found", TextOf(missingChannel));
+    }
+
+    // End-to-end wiring for the claim surface: tool → HTTP → service → SQLite → back. The overlap and
+    // liveness rules are pinned in ClaimServiceTests; what can only break here is the plumbing —
+    // the peer's repo scope reaching the service, and the roster of held paths coming back.
+    //
+    // RegisterAsync first, like every other test that needs a live session: the shared session state
+    // carries whichever peer a previously-run test left behind, and a claim by a stale peer id is a
+    // legitimate NotFound the harness would report as a JSON parse error four lines later.
+    [Fact]
+    public async Task ClaimTools_GrantAPath_ThenListAndReleaseIt()
+    {
+        await RegisterAsync();
+        var path = "src/Peers.Mcp/Tools/ClaimTools.cs";
+        var claimArgs = new Dictionary<string, object?> { ["paths"] = new[] { path } };
+
+        var granted = await CallOkAsync("claim", claimArgs);
+        Assert.Empty(granted["conflicts"]!.AsArray());
+        Assert.Equal(path, Str(granted["granted"]![0]!["path"]));
+
+        var listed = await CallOkAsync("claims");
+        Assert.Contains(listed["claims"]!.AsArray(), claim => Str(claim!["path"]) == path);
+
+        // Re-claiming my own path renews rather than conflicting, and release empties the map.
+        Assert.Empty((await CallOkAsync("claim", claimArgs))["conflicts"]!.AsArray());
+
+        var released = await CallOkAsync("release");
+        Assert.Equal(1, released["released"]!.GetValue<int>());
+        Assert.Empty((await CallOkAsync("claims"))["claims"]!.AsArray());
+    }
+
+    // The retry contract on the wire: same key, same message, and the second call says so.
+    [Fact]
+    public async Task SendWithAnIdempotencyKey_IsPostedOnce()
+    {
+        await RegisterAsync();
+        var channel = $"idem-{Guid.NewGuid():N}";
+        await CallOkAsync("channel_create", new Dictionary<string, object?> { ["name"] = channel });
+
+        var args = new Dictionary<string, object?>
+        {
+            ["channel"] = channel,
+            ["content"] = "PLAN round 1",
+            ["idempotency_key"] = "round-1",
+        };
+        var first = await CallOkAsync("send", args);
+        var retry = await CallOkAsync("send", args);
+
+        Assert.False(first["deduplicated"]!.GetValue<bool>());
+        Assert.True(retry["deduplicated"]!.GetValue<bool>());
+        Assert.Equal(Str(first["message_id"]), Str(retry["message_id"]));
+
+        var read = await CallOkAsync("read", new Dictionary<string, object?> { ["channel"] = channel });
+        Assert.Single(read["messages"]!.AsArray());
+    }
+
+    /// <summary>Calls a tool, fails with the server's own message when it errored, and parses the result.</summary>
+    private async Task<JsonNode> CallOkAsync(string tool, Dictionary<string, object?>? args = null)
+    {
+        var result = await _client.CallToolAsync(tool, args);
+        Assert.True(result.IsError is not true, $"{tool} failed: {TextOf(result)}");
+        return JsonNode.Parse(TextOf(result))!;
+    }
+
+    // A stdio server serves the assembly it loaded at launch for the whole client session, so "which
+    // build am I talking to" has to be answerable from the wire. A literal version string cannot answer
+    // it: five stale servers advertising deleted tools all reported the same "2.0.0".
+    [Fact]
+    public void InitializeResult_ReportsTheBuildIdentity()
+    {
+        var stamped = typeof(ChannelTools).Assembly
+            .GetCustomAttribute<AssemblyInformationalVersionAttribute>()?.InformationalVersion;
+
+        Assert.Equal(stamped, _client.ServerInfo.Version);
+        Assert.Contains('+', stamped!);
     }
 
     /// <summary>Every [McpServerTool] in the Peers.Mcp assembly, registered or not.</summary>

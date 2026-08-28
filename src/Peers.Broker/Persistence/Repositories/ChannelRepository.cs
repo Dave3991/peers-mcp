@@ -100,6 +100,10 @@ public sealed class ChannelRepository(SqliteConnectionFactory db)
     /// nothing else. Inbox delivery and the event row happen through <see cref="Services.EventService"/>
     /// afterwards — they are already atomic together, and the message must exist before any reader can
     /// be told about it.
+    ///
+    /// An idempotency key is stored with the row and unique per channel, so a retried send collides in
+    /// the index instead of double-posting. <see cref="Services.ChannelService"/> checks for the prior
+    /// row first; the index is what makes the check safe against two retries racing.
     /// </summary>
     public async Task<MessageRow> AppendMessageAsync(MessageRow message, CancellationToken ct = default)
     {
@@ -107,11 +111,11 @@ public sealed class ChannelRepository(SqliteConnectionFactory db)
         {
             using var cmd = conn.CreateCommand();
             cmd.CommandText = """
-                INSERT INTO channel_messages (message_id, channel_id, seq, author_peer_id, content, mentions, quiet, created_at)
+                INSERT INTO channel_messages (message_id, channel_id, seq, author_peer_id, content, mentions, quiet, idempotency_key, created_at)
                 VALUES (
                     @id, @channel,
                     (SELECT COALESCE(MAX(seq), 0) + 1 FROM channel_messages WHERE channel_id = @channel),
-                    @author, @content, @mentions, @quiet, datetime('now'))
+                    @author, @content, @mentions, @quiet, @key, datetime('now'))
                 RETURNING seq, created_at
                 """;
             cmd.Parameters.AddWithValue("@id", message.MessageId);
@@ -120,10 +124,44 @@ public sealed class ChannelRepository(SqliteConnectionFactory db)
             cmd.Parameters.AddWithValue("@content", message.Content);
             cmd.Parameters.AddWithValue("@mentions", JsonSerializer.Serialize(message.Mentions));
             cmd.Parameters.AddWithValue("@quiet", message.Quiet ? 1 : 0);
+            cmd.Parameters.AddWithValue("@key", (object?)message.IdempotencyKey ?? DBNull.Value);
 
             await using var r = await cmd.ExecuteReaderAsync(ct);
             await r.ReadAsync(ct);
             return message with { Seq = r.GetInt64(0), CreatedAt = r.GetString(1) };
+        }, ct);
+    }
+
+    /// <summary>The message a previous send with this key already wrote, or null.</summary>
+    public async Task<MessageRow?> GetByIdempotencyKeyAsync(string channelId, string key, CancellationToken ct = default)
+    {
+        return await db.ReadAsync(async conn =>
+        {
+            using var cmd = conn.CreateCommand();
+            cmd.CommandText = """
+                SELECT message_id, channel_id, seq, author_peer_id, content, mentions, quiet, idempotency_key, created_at
+                FROM channel_messages
+                WHERE channel_id = @channel AND idempotency_key = @key
+                """;
+            cmd.Parameters.AddWithValue("@channel", channelId);
+            cmd.Parameters.AddWithValue("@key", key);
+
+            await using var reader = await cmd.ExecuteReaderAsync(ct);
+            if (!await reader.ReadAsync(ct))
+                return null;
+
+            return new MessageRow
+            {
+                MessageId = reader.GetString(0),
+                ChannelId = reader.GetString(1),
+                Seq = reader.GetInt64(2),
+                AuthorPeerId = reader.GetString(3),
+                Content = reader.GetString(4),
+                Mentions = JsonSerializer.Deserialize<string[]>(reader.GetString(5)) ?? [],
+                Quiet = reader.GetInt64(6) != 0,
+                IdempotencyKey = reader.IsDBNull(7) ? null : reader.GetString(7),
+                CreatedAt = reader.GetString(8),
+            };
         }, ct);
     }
 
@@ -246,5 +284,6 @@ public sealed record MessageRow
     public required string Content { get; init; }
     public string[] Mentions { get; init; } = [];
     public bool Quiet { get; init; }
+    public string? IdempotencyKey { get; init; }
     public required string CreatedAt { get; init; }
 }

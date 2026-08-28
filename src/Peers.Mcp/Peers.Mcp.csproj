@@ -14,7 +14,26 @@
     <TargetFramework>net10.0</TargetFramework>
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
+    <Version>2.0.0</Version>
   </PropertyGroup>
+
+  <!--
+    Stamp HEAD into InformationalVersion so a session can tell WHICH build answered it. An MCP server
+    process serves the assembly it loaded at launch for the life of the client session: in August 2026
+    five servers predating the channels rewrite were still alive and still advertising tools that had
+    been deleted, and nothing on the wire said so. ContinueOnError: a source drop without git still builds,
+    it just reports the bare version.
+  -->
+  <Target Name="StampSourceRevision" BeforeTargets="GetAssemblyVersion" Condition="'$(SourceRevisionId)' == ''">
+    <Exec Command="git -C $(MSBuildProjectDirectory) rev-parse --short HEAD"
+          ConsoleToMsBuild="true" StandardOutputImportance="low"
+          ContinueOnError="true" IgnoreExitCode="true">
+      <Output TaskParameter="ConsoleOutput" PropertyName="PeersHeadSha" />
+    </Exec>
+    <PropertyGroup Condition="'$(PeersHeadSha)' != ''">
+      <SourceRevisionId>$(PeersHeadSha.Trim())</SourceRevisionId>
+    </PropertyGroup>
+  </Target>
 
   <ItemGroup>
     <InternalsVisibleTo Include="Peers.Mcp.Tests" />

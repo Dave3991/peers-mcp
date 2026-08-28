@@ -33,10 +33,15 @@ public sealed record BrokerStatus
 /// feature would simply never appear, with no error to read. That silent-daemon case is the whole
 /// reason this number exists. Replacing the old broker kills it mid-flight, so an in-flight wait or
 /// notifier poll can see one transport error or 504 while the replacement comes up; both retry.
+///
+/// 4: /claims* routes are new and send honours idempotency_key. A pre-claims daemon 404s every claim
+/// (visible, but reads as "claims are broken" rather than "your broker is old") and silently drops the
+/// idempotency key, which turns a retried send back into a duplicate review round — the exact bug the
+/// key exists to prevent, reappearing with no error to read.
 /// </summary>
 public static class BrokerContract
 {
-    public const int Current = 3;
+    public const int Current = 4;
 }
 
 public static class BrokerRuntime

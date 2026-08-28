@@ -159,9 +159,10 @@ public class PeerWaitTests
         Assert.DoesNotContain(handler.Requests, r => r.Path.EndsWith("/inbox/ack"));
     }
 
-    // Test 4: broker hangs / CTS fires → TaskCanceledException must be caught and returned as error JSON
+    // Test 4: broker hangs / CTS fires → TaskCanceledException becomes a tool error the model can read,
+    // never an unhandled crash and never a silent hang.
     [Fact]
-    public async Task Wait_BrokerHang_ReturnsGracefulError()
+    public async Task Wait_BrokerHang_SurfacesAToolError()
     {
         var handler = new ScriptedHandler(req =>
         {
@@ -173,12 +174,9 @@ public class PeerWaitTests
         var client = new BrokerClient(new HttpClient(handler) { BaseAddress = new Uri("http://localhost") });
         var state = new SessionState { PeerId = "p" };
 
-        // Must not throw — wait catches BrokerApiException and returns error JSON
-        var json = await Wait(client, state, 1);
+        var ex = await Assert.ThrowsAsync<McpException>(() => Wait(client, state, 1));
 
-        using var doc = JsonDocument.Parse(json);
-        var root = doc.RootElement;
-        Assert.True(root.TryGetProperty("error", out _), $"Expected 'error' field in response, got: {json}");
+        Assert.Equal(HttpStatusCode.GatewayTimeout, Assert.IsType<BrokerApiException>(ex.InnerException).StatusCode);
     }
 
     // Test 3: 20 large items → result stays under cap even after timed_out injection
@@ -488,7 +486,8 @@ public class PeerWaitTests
         Assert.Equal(1, doc.RootElement.GetProperty("items").GetArrayLength());
     }
 
-    // Same MUST, on the exception path — and the shaped BrokerError must survive the finally that awaits the ticker.
+    // Same MUST, on the failure path — and the broker's error must survive the finally that awaits the
+    // ticker instead of being displaced by it.
     [Fact]
     public async Task Wait_StopsProgressAndKeepsBrokerErrorWhenBrokerFails()
     {
@@ -503,15 +502,11 @@ public class PeerWaitTests
 
         await WaitUntilAsync(() => recorder.Count >= 3, "the ticker should tick while the broker is parked");
         gate.SetResult();
-        var json = await call;
+        var ex = await Assert.ThrowsAsync<McpException>(() => call);
 
+        Assert.Equal(HttpStatusCode.InternalServerError, Assert.IsType<BrokerApiException>(ex.InnerException).StatusCode);
         Assert.True(recorder.Count >= 3, "expected progress ticks before the broker failed");
         Assert.Equal(0, recorder.LateReports);
-
-        // Shaped BrokerError JSON, not a raw tool error leaking out of the finally.
-        using var doc = JsonDocument.Parse(json);
-        Assert.True(doc.RootElement.TryGetProperty("error", out _), $"expected shaped broker error, got: {json}");
-        Assert.Equal(500, doc.RootElement.GetProperty("status_code").GetInt32());
     }
 
     // The `completed = true; cts.Cancel();` in WaitCore's finally is what RELEASES the ticker before the
@@ -558,9 +553,9 @@ public class PeerWaitTests
     }
 
     // The half that actually bit: a faulted ticker replaced the in-flight BrokerApiException in the finally,
-    // so the caller got a tool error instead of the shaped {"error":…,"status_code":…} JSON.
+    // so the caller saw the progress bug instead of the broker failure that actually ended the call.
     [Fact]
-    public async Task Wait_ThrowingProgress_StillReturnsTheShapedBrokerError()
+    public async Task Wait_ThrowingProgress_StillSurfacesTheBrokerError()
     {
         var gate = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         var handler = new GatedHandler(gate.Task, () => Json(HttpStatusCode.InternalServerError, """{"detail":"boom"}"""));
@@ -571,11 +566,9 @@ public class PeerWaitTests
         var call = WaitCore(client, state, 120, ackInboxIds: null, progress, TimeSpan.FromMilliseconds(5));
         await WaitUntilAsync(() => progress.Calls >= 1, "the ticker should have attempted one report");
         gate.SetResult();
-        var json = await call;
+        var ex = await Assert.ThrowsAsync<McpException>(() => call);
 
-        using var doc = JsonDocument.Parse(json);
-        Assert.True(doc.RootElement.TryGetProperty("error", out _), $"expected shaped broker error, got: {json}");
-        Assert.Equal(500, doc.RootElement.GetProperty("status_code").GetInt32());
+        Assert.Equal(HttpStatusCode.InternalServerError, Assert.IsType<BrokerApiException>(ex.InnerException).StatusCode);
         Assert.Equal(1, progress.Calls);
     }
 
@@ -611,7 +604,7 @@ public class PeerWaitTests
     }
 
     // The other branch of the same guard: a broker that never answers is a 504, NOT a cancellation, and
-    // must not be laundered into timed_out either.
+    // must not be laundered into timed_out either — the exception type IS that distinction.
     [Fact]
     public async Task Wait_BrokerHang_WithLiveRequestToken_IsAGatewayTimeoutNotACancellation()
     {
@@ -620,13 +613,10 @@ public class PeerWaitTests
         var state = new SessionState { PeerId = "p" };
         using var cts = new CancellationTokenSource();   // deliberately never cancelled
 
-        var json = await WaitCore(client, state, 1, ackInboxIds: null, progress: null, TimeSpan.FromSeconds(5), cts.Token);
+        var ex = await Assert.ThrowsAsync<McpException>(
+            () => WaitCore(client, state, 1, ackInboxIds: null, progress: null, TimeSpan.FromSeconds(5), cts.Token));
 
-        using var doc = JsonDocument.Parse(json);
-        var root = doc.RootElement;
-        Assert.Equal(504, root.GetProperty("status_code").GetInt32());
-        Assert.False(root.TryGetProperty("timed_out", out _),
-            $"a broker hang is an error, not a long-poll timeout: {json}");
+        Assert.Equal(HttpStatusCode.GatewayTimeout, Assert.IsType<BrokerApiException>(ex.InnerException).StatusCode);
     }
 
     // The tool's JSON schema is the contract the model sees. Both the IProgress and the CancellationToken

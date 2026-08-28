@@ -2,6 +2,7 @@ using System.ComponentModel;
 using System.Text.Json;
 using System.Text.RegularExpressions;
 using Microsoft.Extensions.Logging;
+using ModelContextProtocol;
 using ModelContextProtocol.Server;
 using Peers.Mcp.Lifecycle;
 
@@ -87,10 +88,8 @@ public sealed partial class ContextTools
             var json = JsonSerializer.Serialize(doc, JsonOptsIndented);
             return $"<!-- peers-context:v1 -->\n```json\n{json}\n```\n";
         }
-        catch (BrokerApiException ex)
-        {
-            return JsonSerializer.Serialize(new { error = ex.Message, status_code = (int)ex.StatusCode }, JsonOpts);
-        }
+        // A broker failure is a tool error, not an exported packet: the SDK turns this into isError=true.
+        catch (BrokerApiException ex) { throw new McpException(ex.Message, ex); }
     }
 
     [McpServerTool(Name = "context_import"), Description(

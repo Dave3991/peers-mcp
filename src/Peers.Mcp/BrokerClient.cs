@@ -80,6 +80,16 @@ public sealed class BrokerClient : IDisposable
         return (await GetAsync<List<ArtifactMetadata>>($"/artifacts{query}"))!;
     }
 
+    // Claims
+    public async Task<ClaimPathsResponse> ClaimPathsAsync(ClaimPathsRequest req, CancellationToken cancellationToken = default) =>
+        (await PostAsync<ClaimPathsResponse>("/claims", req, cancellationToken))!;
+
+    public async Task<ReleaseClaimsResponse> ReleaseClaimsAsync(ReleaseClaimsRequest req, CancellationToken cancellationToken = default) =>
+        (await PostAsync<ReleaseClaimsResponse>("/claims/release", req, cancellationToken))!;
+
+    public async Task<ListClaimsResponse> ListClaimsAsync(string peerId, CancellationToken cancellationToken = default) =>
+        (await GetAsync<ListClaimsResponse>($"/claims{BuildQuery(("peer_id", peerId))}", cancellationToken))!;
+
     // Poll
     /// <param name="cancellationToken">The caller's cancellation. The background notifier passes its
     /// shutdown token so a broker that has stopped answering cannot hold process exit for the whole

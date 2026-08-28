@@ -14,6 +14,17 @@ namespace Peers.Mcp;
 /// </summary>
 internal static class ServerOptionsFactory
 {
+    /// <summary>
+    /// What this build actually is: <c>Version</c> plus the HEAD sha the csproj stamps into
+    /// InformationalVersion. Reported as the server version so a client can tell a freshly spawned
+    /// session from one still serving a pre-change assembly — the failure mode that had five servers
+    /// advertising deleted tools in August 2026.
+    /// </summary>
+    private static readonly string BuildVersion =
+        typeof(ServerOptionsFactory).Assembly.GetCustomAttribute<AssemblyInformationalVersionAttribute>()?.InformationalVersion
+        ?? typeof(ServerOptionsFactory).Assembly.GetName().Version?.ToString()
+        ?? "0.0.0";
+
     public static McpServerOptions Create(IServiceProvider services)
     {
         // Pinned to 2025-11-25 — the revision every shipping client negotiates. Downgrade audit (recorded
@@ -24,7 +35,7 @@ internal static class ServerOptionsFactory
         var options = new McpServerOptions
         {
             ProtocolVersion = "2025-11-25",
-            ServerInfo = new() { Name = "peers", Version = "2.0.0" },
+            ServerInfo = new() { Name = "peers", Version = BuildVersion },
             ServerInstructions = """
                 Peers coordinates multiple AI coding sessions through a shared local broker.
 
@@ -36,6 +47,11 @@ internal static class ServerOptionsFactory
                 Channels:
                 - A channel is a named board scoped to a repository (`channels`, `channel_create`, `send`, `read`). Names are agent-chosen; repo metadata says whose code it serves.
                 - Mention peers with `to`; quiet=true makes the message a whisper — delivered only to mentions, invisible to everyone else's reads.
+                - Pass idempotency_key on `send` when a retry must not double-post; the second call returns the first message with deduplicated=true.
+
+                Paths:
+                - `claim` before editing when another session is live in this repo: it grants your paths and names the peer already holding any that overlap (a directory covers its contents). `claims` is the whole map, `release` gives yours back.
+                - A claim informs, it never blocks — a conflict means coordinate with the holder, not stop. Claims lapse with their TTL or with this session's lease, so a crashed peer never holds a path hostage.
                 """,
             ToolCollection = [],
             Capabilities = new ServerCapabilities
@@ -48,6 +64,7 @@ internal static class ServerOptionsFactory
         };
 
         RegisterTools<ChannelTools>(options, services);
+        RegisterTools<ClaimTools>(options, services);
         RegisterTools<ArtifactTools>(options, services);
         RegisterTools<ContextTools>(options, services);
 

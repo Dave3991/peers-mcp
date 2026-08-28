@@ -14,6 +14,9 @@ public static class RequestLimits
 
     public const int MaxChannelNameLength = 100;
     public const int MaxMentionCount = 50;
+    public const int MaxIdempotencyKeyLength = 128;
+    public const int MaxClaimPathCount = 100;
+    public const int MaxClaimPathLength = 1024;
 
     public static IResult? ValidateChannelCreate(Shared.Contracts.CreateChannelRequest req)
     {
@@ -28,6 +31,19 @@ public static class RequestLimits
             return Results.Json(new { error = $"Message content exceeds {MaxEntryContentBytes / 1024} KB." }, statusCode: 413);
         if (req.To is { Length: > MaxMentionCount })
             return Results.BadRequest(new { error = $"A message can mention at most {MaxMentionCount} peers." });
+        if (req.IdempotencyKey?.Length > MaxIdempotencyKeyLength)
+            return Results.BadRequest(new { error = $"Idempotency key exceeds {MaxIdempotencyKeyLength} characters." });
+        return null;
+    }
+
+    public static IResult? ValidateClaim(Shared.Contracts.ClaimPathsRequest req)
+    {
+        if (req.Paths.Length == 0)
+            return Results.BadRequest(new { error = "Claim at least one path." });
+        if (req.Paths.Length > MaxClaimPathCount)
+            return Results.BadRequest(new { error = $"A claim covers at most {MaxClaimPathCount} paths; claim the directory instead." });
+        if (req.Paths.Any(path => path?.Length > MaxClaimPathLength))
+            return Results.BadRequest(new { error = $"A claimed path exceeds {MaxClaimPathLength} characters." });
         return null;
     }
 
