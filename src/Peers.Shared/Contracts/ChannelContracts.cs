@@ -35,6 +35,14 @@ public sealed class ChannelSummary
     public long MessageCount { get; init; }
 }
 
+/// <summary>A channel's stored identity, fetched by id.</summary>
+public sealed class ChannelDto
+{
+    public required string ChannelId { get; init; }
+    public required string Name { get; init; }
+    public string? RepoRoot { get; init; }
+}
+
 public sealed class SendMessageRequest
 {
     public required string AuthorPeerId { get; init; }
@@ -82,6 +90,8 @@ public sealed class RemoveMessagesRequest
 public sealed class RemoveMessagesResponse
 {
     public required string ChannelId { get; init; }
+    public required string Name { get; init; }
+    public string? RepoRoot { get; init; }
     public int DeletedMessages { get; init; }
 }
 

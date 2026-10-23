@@ -19,6 +19,11 @@ public static class ChannelRoutes
         app.MapGet("/channels", async (string? repo_root, int? limit, ChannelService svc, CancellationToken ct) =>
             Results.Ok(await svc.ListAsync(repo_root, limit ?? 100, ct)));
 
+        app.MapGet("/channels/{id}", async (string id, ChannelService svc, CancellationToken ct) =>
+            await svc.GetAsync(id, ct) is { } channel
+                ? Results.Ok(channel)
+                : Results.NotFound(new { error = $"Channel '{id}' not found." }));
+
         app.MapPost("/channels/{id}/messages", async (string id, SendMessageRequest req, ChannelService svc, CancellationToken ct) =>
         {
             if (RequestLimits.ValidateSendMessage(req) is { } err) return err;

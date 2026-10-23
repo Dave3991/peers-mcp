@@ -44,10 +44,13 @@ public sealed record BrokerStatus
 ///
 /// 6: NotifyPeers=false suppresses internal review artifact notifications without changing storage.
 /// Older brokers silently ignore the flag and fan out every evidence chunk/checkpoint.
+///
+/// 7: GET /channels/{id} is new; channel_clear and messages_remove by channel_id read it to confirm the
+/// channel's stored name. A pre-7 daemon 404s it, so every by-id deletion would report the channel missing.
 /// </summary>
 public static class BrokerContract
 {
-    public const int Current = 6;
+    public const int Current = 7;
 }
 
 public static class BrokerRuntime

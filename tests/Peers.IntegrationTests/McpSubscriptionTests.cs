@@ -1192,6 +1192,8 @@ public sealed class McpSubscriptionTests : IAsyncLifetime
         _notifications.Clear();
         var cleared = await CallOkAsync("channel_clear", new() { ["channel"] = name });
         Assert.Equal(1, cleared["deleted_messages"]!.GetValue<int>());
+        Assert.Equal(name, Str(cleared["name"]));
+        Assert.Equal("/repo", Str(cleared["repo_root"]));
         await DispatchBrokerEventsAsync();
         var hint = await WaitForNotificationAsync(NotificationMethods.ResourceUpdatedNotification);
         Assert.Equal(PeerResources.ChannelUri(id), hint["uri"]!.GetValue<string>());
@@ -1256,6 +1258,59 @@ public sealed class McpSubscriptionTests : IAsyncLifetime
             Assert.Contains("Pass exactly one of `channel` (name) or `channel_id`.", TextOf(rejected));
         }
         Assert.Single((await _broker.ReadChannelMessagesAsync(foreign.ChannelId, _peerId))!.Messages);
+    }
+
+    // An id reaches any repo, so deleting by id must also name the channel: confirm_channel is checked
+    // against the name stored for that id. Here no channel of that name exists in this session's repo,
+    // so a confirmation resolved locally could never match.
+    [Fact]
+    public async Task DeletionById_RequiresTheStoredName_AndDeletesNothingWithoutIt()
+    {
+        await RegisterAsync();
+        _state.RepoRoot = "/repo";
+        var name = $"confirm-{Guid.NewGuid():N}";
+        var foreign = await _broker.CreateChannelAsync(new CreateChannelRequest
+            { Name = name, RepoRoot = "/api-worktree", CreatedByPeerId = _peerId! });
+        async Task<string> PostAsync(string content) => (await _broker.SendMessageAsync(foreign.ChannelId,
+            new SendMessageRequest { AuthorPeerId = _peerId!, Content = content }))!.MessageId;
+        var first = await PostAsync("first");
+        await PostAsync("second");
+        var actual = $"channel_id '{foreign.ChannelId}' is '{name}' in repo_root '/api-worktree'";
+
+        foreach (var (tool, args, expected) in new (string, Dictionary<string, object?>, string)[]
+        {
+            ("channel_clear", new() { ["channel_id"] = foreign.ChannelId }, "requires confirm_channel"),
+            ("channel_clear", new() { ["channel_id"] = foreign.ChannelId, ["confirm_channel"] = name.ToUpperInvariant() },
+                $"confirm_channel '{name.ToUpperInvariant()}' does not match"),
+            ("messages_remove", new() { ["channel_id"] = foreign.ChannelId, ["message_ids"] = new[] { first } },
+                "requires confirm_channel"),
+            ("messages_remove", new() { ["channel_id"] = foreign.ChannelId, ["message_ids"] = new[] { first }, ["confirm_channel"] = "wrong" },
+                "confirm_channel 'wrong' does not match"),
+        })
+        {
+            var rejected = await _client.CallToolAsync(tool, args);
+            Assert.True(rejected.IsError is true, $"{tool} accepted {string.Join(",", args.Keys)}");
+            Assert.Contains(expected, TextOf(rejected));
+            Assert.Contains($"{actual}. Nothing was deleted.", TextOf(rejected));
+        }
+        Assert.Equal(new[] { "first", "second" },
+            (await _broker.ReadChannelMessagesAsync(foreign.ChannelId, _peerId))!.Messages.Select(m => m.Content));
+
+        var removed = await CallOkAsync("messages_remove", new()
+            { ["channel_id"] = foreign.ChannelId, ["confirm_channel"] = name, ["message_ids"] = new[] { first } });
+        Assert.Equal(foreign.ChannelId, Str(removed["channel_id"]));
+        Assert.Equal(name, Str(removed["name"]));
+        Assert.Equal("/api-worktree", Str(removed["repo_root"]));
+        Assert.Equal(1, removed["deleted_messages"]!.GetValue<int>());
+        Assert.Equal("second", Assert.Single((await _broker.ReadChannelMessagesAsync(foreign.ChannelId, _peerId))!.Messages).Content);
+
+        var cleared = await CallOkAsync("channel_clear", new()
+            { ["channel_id"] = foreign.ChannelId, ["confirm_channel"] = name });
+        Assert.Equal(foreign.ChannelId, Str(cleared["channel_id"]));
+        Assert.Equal(name, Str(cleared["name"]));
+        Assert.Equal("/api-worktree", Str(cleared["repo_root"]));
+        Assert.Equal(1, cleared["deleted_messages"]!.GetValue<int>());
+        Assert.Empty((await _broker.ReadChannelMessagesAsync(foreign.ChannelId, _peerId))!.Messages);
     }
 
     /// <summary>Calls a tool, fails with the server's own message when it errored, and parses the result.</summary>

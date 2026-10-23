@@ -158,9 +158,14 @@ public sealed class ChannelService(
         return new ListChannelsResponse { Channels = list.ToArray() };
     }
 
+    public async Task<ChannelDto?> GetAsync(string channelId, CancellationToken ct) =>
+        await channels.GetAsync(channelId, ct) is { } row
+            ? new ChannelDto { ChannelId = row.ChannelId, Name = row.Name, RepoRoot = row.RepoRoot }
+            : null;
+
     public async Task<Result<RemoveMessagesResponse>> ClearAsync(string channelId, CancellationToken ct)
     {
-        if (await channels.GetAsync(channelId, ct) is null)
+        if (await channels.GetAsync(channelId, ct) is not { } channel)
             return Result.Fail(new NotFoundError($"Channel '{channelId}' not found."));
 
         var count = await channels.Database.WriteAsync(async conn =>
@@ -177,13 +182,14 @@ public sealed class ChannelService(
             txn.Commit();
             return deleted;
         }, ct);
-        return Result.Ok(new RemoveMessagesResponse { ChannelId = channelId, DeletedMessages = count });
+        return Result.Ok(new RemoveMessagesResponse
+            { ChannelId = channelId, Name = channel.Name, RepoRoot = channel.RepoRoot, DeletedMessages = count });
     }
 
     public async Task<Result<RemoveMessagesResponse>> RemoveMessagesAsync(
         string channelId, RemoveMessagesRequest req, CancellationToken ct)
     {
-        if (await channels.GetAsync(channelId, ct) is null)
+        if (await channels.GetAsync(channelId, ct) is not { } channel)
             return Result.Fail(new NotFoundError($"Channel '{channelId}' not found."));
 
         var ids = JsonSerializer.Serialize(req.MessageIds);
@@ -204,7 +210,8 @@ public sealed class ChannelService(
             txn.Commit();
             return deleted;
         }, ct);
-        return Result.Ok(new RemoveMessagesResponse { ChannelId = channelId, DeletedMessages = count });
+        return Result.Ok(new RemoveMessagesResponse
+            { ChannelId = channelId, Name = channel.Name, RepoRoot = channel.RepoRoot, DeletedMessages = count });
     }
 
     private static MessageDto ToDto(MessageRow row) => new()

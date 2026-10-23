@@ -238,6 +238,7 @@ public sealed class BrokerFlowTests : IAsyncLifetime
         Assert.Equal(HttpStatusCode.NotFound, (await _http.DeleteAsync("/channels/missing/messages")).StatusCode);
         Assert.Equal(HttpStatusCode.NotFound, (await _http.PostAsJsonAsync("/channels/missing/messages/remove",
             new RemoveMessagesRequest { MessageIds = ["id"] }, JsonOpts)).StatusCode);
+        Assert.Equal(HttpStatusCode.NotFound, (await _http.GetAsync("/channels/missing")).StatusCode);
     }
 
     // -------------------------------------------------------------------------

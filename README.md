@@ -87,8 +87,13 @@ scoped to another worktree.
 
 `channel_clear(channel)` permanently removes all messages while keeping the channel usable.
 `messages_remove(channel, message_ids)` removes 1..200 selected message IDs returned by `send` or
-`read`. Both return `{ channel_id, deleted_messages }`; duplicate, missing, or other-channel IDs are
-ignored, and repeating a completed removal returns zero.
+`read`. Both return `{ channel_id, name, repo_root, deleted_messages }`; duplicate, missing, or
+other-channel IDs are ignored, and repeating a completed removal returns zero.
+
+Addressed by `channel_id` instead of a name, both also require `confirm_channel`: the channel's exact,
+case-sensitive name. It is compared with the name the broker stores for that id, never resolved in this
+session's repository. A missing or mismatched confirmation deletes nothing, and the error names the
+channel and `repo_root` the id actually belongs to. Addressing by name needs no confirmation.
 
 Removal affects every session, not just your view. Message rows, original event payloads, and inbox
 receipts are deleted atomically, so withdrawn mentions stop being delivered by `wait`. Already-returned
@@ -97,6 +102,7 @@ Channel/inbox subscribers receive re-read hints; removing a whisper notifies onl
 
 The broker exposes `DELETE /channels/{id}/messages` for clearing and
 `POST /channels/{id}/messages/remove` with `{ "messageIds": ["..."] }` for selected removal.
+`GET /channels/{id}` returns the stored `{ channelId, name, repoRoot }`.
 Unknown channels return 404; null, empty, blank, or over-200 ID lists return 400.
 
 For manual use, the CLI takes channel IDs rather than names:
@@ -173,8 +179,8 @@ by `wait` until you echo their ids back as `ack_inbox_ids`.
 | `presence` | Update this session's role, summary, capabilities, focus paths, and progress on long-running work |
 | `channels` | List channels and their repo scope + message counts |
 | `channel_create` | Create a channel (`name`, optional `repo_root`; names unique per scope) |
-| `channel_clear` | Permanently clear a channel's history and pending deliveries; keep the channel (`channel` or `channel_id`) |
-| `messages_remove` | Permanently remove selected `message_ids` from a channel (1..200; `channel` or `channel_id`) |
+| `channel_clear` | Permanently clear a channel's history and pending deliveries; keep the channel (`channel`, or `channel_id` with `confirm_channel`) |
+| `messages_remove` | Permanently remove selected `message_ids` from a channel (1..200; `channel`, or `channel_id` with `confirm_channel`) |
 | `send` | Post to a channel (`channel` name or `channel_id`): `content`, optional `to` mentions, optional `quiet` whisper |
 | `read` | Read a channel (`channel` name or `channel_id`) from `since_seq`; whispers addressed to others are filtered out |
 | `wait` | Long-poll for directed messages (default 25s, max 120s); echo `ack_inbox_ids` to acknowledge receipts |
