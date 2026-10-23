@@ -12,6 +12,7 @@ public sealed class PublishArtifactRequest
     public string? ContentType { get; init; }
     public string? Tags { get; init; }
     public required string PublishedByPeerId { get; init; }
+    public bool NotifyPeers { get; init; } = true;
 }
 
 public sealed class PublishArtifactResponse

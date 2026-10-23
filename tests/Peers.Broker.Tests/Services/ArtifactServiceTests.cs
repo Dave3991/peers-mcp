@@ -103,5 +103,20 @@ public sealed class ArtifactServiceTests : IDisposable
         Assert.Equal("v1", fetched.Content);
     }
 
+    [Fact]
+    public async Task Silent_publication_stores_content_without_notification_and_normal_artifacts_still_notify()
+    {
+        var (svc, events) = CreateService();
+        var silent = await svc.PublishAsync(new PublishArtifactRequest
+        {
+            Namespace = "review", Name = "blob", Type = "other", Content = "raw evidence",
+            RepoRoot = "/fixture", PublishedByPeerId = "driver", NotifyPeers = false,
+        }, CancellationToken.None);
+        Assert.Equal("raw evidence", (await svc.GetAsync(silent.ArtifactId, null, null, CancellationToken.None))!.Content);
+        Assert.DoesNotContain(await events.GetSinceAsync(0, 1000, CancellationToken.None), e => e.Type == EventTypes.ArtifactPublished);
+        await svc.PublishAsync(MakeRequest("normal", "log", "ordinary output"), CancellationToken.None);
+        Assert.Single(await events.GetSinceAsync(0, 1000, CancellationToken.None), e => e.Type == EventTypes.ArtifactPublished);
+    }
+
     public void Dispose() => _db.Dispose();
 }

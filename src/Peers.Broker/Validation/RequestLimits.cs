@@ -17,6 +17,7 @@ public static class RequestLimits
     public const int MaxIdempotencyKeyLength = 128;
     public const int MaxClaimPathCount = 100;
     public const int MaxClaimPathLength = 1024;
+    public const int MaxRemoveMessageCount = 200;
 
     public static IResult? ValidateChannelCreate(Shared.Contracts.CreateChannelRequest req)
     {
@@ -33,6 +34,14 @@ public static class RequestLimits
             return Results.BadRequest(new { error = $"A message can mention at most {MaxMentionCount} peers." });
         if (req.IdempotencyKey?.Length > MaxIdempotencyKeyLength)
             return Results.BadRequest(new { error = $"Idempotency key exceeds {MaxIdempotencyKeyLength} characters." });
+        return null;
+    }
+
+    public static IResult? ValidateRemoveMessages(Shared.Contracts.RemoveMessagesRequest req)
+    {
+        if (req.MessageIds is not { Length: > 0 and <= MaxRemoveMessageCount }
+            || req.MessageIds.Any(string.IsNullOrWhiteSpace))
+            return Results.BadRequest(new { error = $"Provide 1..{MaxRemoveMessageCount} nonblank message IDs." });
         return null;
     }
 

@@ -645,6 +645,7 @@ public class PeerWaitTests
         collection.AddLogging();
         collection.AddSingleton(new BrokerClient(new HttpClient { BaseAddress = new Uri("http://localhost") }));
         collection.AddSingleton(new SessionState());
+        collection.AddSingleton(new Peers.Mcp.Reviews.ReviewStorageOptions(Path.Combine(Path.GetTempPath(), "peers-review-wait-" + Guid.NewGuid().ToString("N"))));
         var services = collection.BuildServiceProvider();
 
         var options = ServerOptionsFactory.Create(services);

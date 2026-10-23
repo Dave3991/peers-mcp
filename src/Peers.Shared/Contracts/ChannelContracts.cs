@@ -74,6 +74,17 @@ public sealed class ReadMessagesResponse
     public bool Truncated { get; init; }
 }
 
+public sealed class RemoveMessagesRequest
+{
+    public required string[] MessageIds { get; init; }
+}
+
+public sealed class RemoveMessagesResponse
+{
+    public required string ChannelId { get; init; }
+    public int DeletedMessages { get; init; }
+}
+
 public sealed class MessageDto
 {
     public required string MessageId { get; init; }

@@ -219,5 +219,106 @@ public sealed class ChannelServiceTests : IDisposable
         Assert.NotEqual(here.MessageId, there.MessageId);
     }
 
+    [Fact]
+    public async Task RemoveMessages_DeletesOnlyMatchingRowsAndDeliveries_WithoutReusingSequenceOrKey()
+    {
+        var (_, peers, _, channels) = Create();
+        var author = await RegisterAsync(peers, "remove-author");
+        var recipient = await RegisterAsync(peers, "remove-recipient");
+        var left = (await channels.CreateAsync(new CreateChannelRequest
+            { Name = "left", CreatedByPeerId = author }, CancellationToken.None)).Value;
+        var right = (await channels.CreateAsync(new CreateChannelRequest
+            { Name = "right", CreatedByPeerId = author }, CancellationToken.None)).Value;
+        var kept = (await channels.SendAsync(left.ChannelId, new SendMessageRequest
+            { AuthorPeerId = author, Content = "keep", To = [recipient] }, CancellationToken.None)).Value!;
+        var removed = (await channels.SendAsync(left.ChannelId, new SendMessageRequest
+            { AuthorPeerId = author, Content = "remove", Quiet = true, To = [recipient], IdempotencyKey = "key" },
+            CancellationToken.None)).Value!;
+        var foreign = (await channels.SendAsync(right.ChannelId, new SendMessageRequest
+            { AuthorPeerId = author, Content = "other channel", To = [recipient] }, CancellationToken.None)).Value!;
+        var request = new RemoveMessagesRequest
+            { MessageIds = [removed.MessageId, removed.MessageId, foreign.MessageId, "missing"] };
+
+        Assert.Equal(1, (await channels.RemoveMessagesAsync(left.ChannelId, request, CancellationToken.None)).Value.DeletedMessages);
+        Assert.Equal(0, (await channels.RemoveMessagesAsync(left.ChannelId, request, CancellationToken.None)).Value.DeletedMessages);
+        Assert.Equal(kept.MessageId, Assert.Single((await channels.ReadAsync(left.ChannelId, author, 0, 100, CancellationToken.None))!.Messages).MessageId);
+        Assert.Equal(foreign.MessageId, Assert.Single((await channels.ReadAsync(right.ChannelId, author, 0, 100, CancellationToken.None))!.Messages).MessageId);
+
+        var inbox = await MessagesFor(new InboxRepository(_db.Factory), recipient);
+        Assert.Equal(2, inbox.Count);
+        Assert.DoesNotContain(inbox, item => item.Event.Payload.Contains(removed.MessageId));
+        var events = await new EventRepository(_db.Factory).GetSinceAsync(0);
+        Assert.DoesNotContain(events, evt => evt.Type == Peers.Shared.Models.EventTypes.ChannelMessageAdded
+            && evt.Payload.Contains(removed.MessageId));
+
+        var next = (await channels.SendAsync(left.ChannelId, new SendMessageRequest
+            { AuthorPeerId = author, Content = "replacement", IdempotencyKey = "key" }, CancellationToken.None)).Value!;
+        Assert.False(next.Deduplicated);
+        Assert.True(next.Seq > removed.Seq);
+        Assert.Equal(next.MessageId, Assert.Single((await channels.ReadAsync(left.ChannelId, author, removed.Seq, 100, CancellationToken.None))!.Messages).MessageId);
+    }
+
+    [Fact]
+    public async Task Clear_KeepsChannel_RemovesHistoryAndInbox_AndPreservesCursor()
+    {
+        var (_, peers, _, channels) = Create();
+        var author = await RegisterAsync(peers, "clear-author");
+        var recipient = await RegisterAsync(peers, "clear-recipient");
+        var channel = (await channels.CreateAsync(new CreateChannelRequest
+            { Name = "clear", CreatedByPeerId = author }, CancellationToken.None)).Value;
+        await channels.SendAsync(channel.ChannelId, new SendMessageRequest
+            { AuthorPeerId = author, Content = "loud", To = [recipient] }, CancellationToken.None);
+        var last = (await channels.SendAsync(channel.ChannelId, new SendMessageRequest
+            { AuthorPeerId = author, Content = "quiet", Quiet = true, To = [recipient] }, CancellationToken.None)).Value!;
+
+        Assert.Equal(2, (await channels.ClearAsync(channel.ChannelId, CancellationToken.None)).Value.DeletedMessages);
+        Assert.Equal(0, (await channels.ClearAsync(channel.ChannelId, CancellationToken.None)).Value.DeletedMessages);
+        Assert.Empty((await channels.ReadAsync(channel.ChannelId, recipient, 0, 100, CancellationToken.None))!.Messages);
+        Assert.Equal(0, Assert.Single((await channels.ListAsync(null, 100, CancellationToken.None)).Channels).MessageCount);
+        Assert.Empty(await MessagesFor(new InboxRepository(_db.Factory), recipient));
+        Assert.DoesNotContain(await new EventRepository(_db.Factory).GetSinceAsync(0),
+            evt => evt.Type == Peers.Shared.Models.EventTypes.ChannelMessageAdded);
+
+        var next = (await channels.SendAsync(channel.ChannelId, new SendMessageRequest
+            { AuthorPeerId = author, Content = "after clear" }, CancellationToken.None)).Value!;
+        Assert.True(next.Seq > last.Seq);
+        Assert.Equal("after clear", Assert.Single((await channels.ReadAsync(channel.ChannelId, author, last.Seq, 100, CancellationToken.None))!.Messages).Content);
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task Removal_FailedCommit_RetainsMessageAndInbox(bool clear)
+    {
+        var (_, peers, _, channels) = Create();
+        var author = await RegisterAsync(peers, "rollback-author");
+        var recipient = await RegisterAsync(peers, "rollback-recipient");
+        var channel = (await channels.CreateAsync(new CreateChannelRequest
+            { Name = "rollback", CreatedByPeerId = author }, CancellationToken.None)).Value;
+        var sent = (await channels.SendAsync(channel.ChannelId, new SendMessageRequest
+            { AuthorPeerId = author, Content = "retain on failure", To = [recipient] }, CancellationToken.None)).Value!;
+        await _db.Factory.WriteAsync(async conn =>
+        {
+            using var cmd = conn.CreateCommand();
+            var type = clear ? Peers.Shared.Models.EventTypes.ChannelCleared : Peers.Shared.Models.EventTypes.ChannelMessageRemoved;
+            cmd.CommandText = $"""
+                CREATE TRIGGER fail_removal BEFORE INSERT ON events WHEN NEW.type = '{type}'
+                BEGIN SELECT RAISE(ABORT, 'injected failure'); END;
+                """;
+            await cmd.ExecuteNonQueryAsync();
+        });
+
+        await Assert.ThrowsAsync<Microsoft.Data.Sqlite.SqliteException>(async () =>
+        {
+            if (clear)
+                await channels.ClearAsync(channel.ChannelId, CancellationToken.None);
+            else
+                await channels.RemoveMessagesAsync(channel.ChannelId,
+                    new RemoveMessagesRequest { MessageIds = [sent.MessageId] }, CancellationToken.None);
+        });
+        Assert.Equal(sent.MessageId, Assert.Single((await channels.ReadAsync(channel.ChannelId, author, 0, 100, CancellationToken.None))!.Messages).MessageId);
+        Assert.Contains(sent.MessageId, Assert.Single(await MessagesFor(new InboxRepository(_db.Factory), recipient)).Event.Payload);
+    }
+
     public void Dispose() => _db.Dispose();
 }

@@ -4,7 +4,7 @@ namespace Peers.Broker.Persistence;
 
 public static class Schema
 {
-    public const int CurrentVersion = 5;
+    public const int CurrentVersion = 6;
 
     public static void Migrate(SqliteConnection conn)
     {
@@ -17,6 +17,7 @@ public static class Schema
         if (version < 3) ApplyV3(conn);
         if (version < 4) ApplyV4(conn);
         if (version < 5) ApplyV5(conn);
+        if (version < 6) ApplyV6(conn);
 
         // Forward only. An older binary opening a newer database must not stamp its own version over
         // the real one: the columns would stay, the version would lie, and the next new-binary start
@@ -289,6 +290,35 @@ public static class Schema
             cmd.ExecuteNonQuery();
         }
 
+        txn.Commit();
+    }
+
+    /// <summary>Keep sequence cursors valid when the newest message or all history is removed.</summary>
+    private static void ApplyV6(SqliteConnection conn)
+    {
+        var hasLastSeq = false;
+        using (var info = conn.CreateCommand())
+        {
+            info.CommandText = "PRAGMA table_info(channels);";
+            using var reader = info.ExecuteReader();
+            while (reader.Read())
+                hasLastSeq |= reader.GetString(reader.GetOrdinal("name")) == "last_seq";
+        }
+
+        using var txn = conn.BeginTransaction();
+        using var cmd = conn.CreateCommand();
+        cmd.Transaction = txn;
+        if (!hasLastSeq)
+        {
+            cmd.CommandText = "ALTER TABLE channels ADD COLUMN last_seq INTEGER NOT NULL DEFAULT 0;";
+            cmd.ExecuteNonQuery();
+        }
+        cmd.CommandText = """
+            UPDATE channels SET last_seq = MAX(last_seq,
+                COALESCE((SELECT MAX(seq) FROM channel_messages
+                          WHERE channel_id = channels.channel_id), 0));
+            """;
+        cmd.ExecuteNonQuery();
         txn.Commit();
     }
 }

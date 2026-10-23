@@ -71,6 +71,37 @@ try
             break;
         }
 
+        case "channel-clear":
+        case "messages-remove":
+        {
+            var clear = args[0] == "channel-clear";
+            if ((clear && args.Length != 2) || (!clear && args.Length < 3))
+            {
+                Console.Error.WriteLine(clear
+                    ? "Usage: channel-clear <channel-id>"
+                    : "Usage: messages-remove <channel-id> <message-id> [message-id ...]");
+                return 1;
+            }
+            var brokerStatus = await RequireHealthyBrokerAsync();
+            if (brokerStatus is null)
+                return 1;
+
+            using var http = CreateHttpClient(brokerStatus.Port);
+            var path = $"/channels/{Uri.EscapeDataString(args[1])}/messages";
+            using var response = clear
+                ? await http.DeleteAsync(path)
+                : await http.PostAsJsonAsync($"{path}/remove",
+                    new RemoveMessagesRequest { MessageIds = args[2..] }, jsonOpts);
+            if (!response.IsSuccessStatusCode)
+            {
+                Console.Error.WriteLine($"Broker request failed ({(int)response.StatusCode}): {await response.Content.ReadAsStringAsync()}");
+                return 1;
+            }
+            var result = await response.Content.ReadFromJsonAsync<RemoveMessagesResponse>(jsonOpts);
+            Console.WriteLine(JsonSerializer.Serialize(result, jsonOpts));
+            break;
+        }
+
 
         case "artifacts":
         {
@@ -271,6 +302,8 @@ static void PrintUsage()
           broker-start            Launch the broker if needed and wait until healthy
           status                  Show broker status and connected peers
           channels                List all channels
+          channel-clear <id>      Permanently clear a channel's messages and pending deliveries
+          messages-remove <id> <message-id> ...  Permanently remove selected messages
           artifacts               List all artifacts
           events --follow         Stream events for a peer (--peer <id> [--interval N])
         """);

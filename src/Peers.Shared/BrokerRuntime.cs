@@ -38,10 +38,16 @@ public sealed record BrokerStatus
 /// (visible, but reads as "claims are broken" rather than "your broker is old") and silently drops the
 /// idempotency key, which turns a retried send back into a duplicate review round — the exact bug the
 /// key exists to prevent, reappearing with no error to read.
+///
+/// 5: channel clearing and targeted message removal require new routes, durable delivery cleanup,
+/// and sequence numbers that survive deletion.
+///
+/// 6: NotifyPeers=false suppresses internal review artifact notifications without changing storage.
+/// Older brokers silently ignore the flag and fan out every evidence chunk/checkpoint.
 /// </summary>
 public static class BrokerContract
 {
-    public const int Current = 4;
+    public const int Current = 6;
 }
 
 public static class BrokerRuntime
@@ -131,7 +137,8 @@ public static class BrokerRuntime
             if (brokerProject is null)
                 throw new InvalidOperationException("Cannot find Peers.Broker project");
 
-            using var process = Process.Start(CreateBrokerStartInfo(brokerProject));
+            var launch = CreateBrokerStartInfo(brokerProject);
+            using var process = Process.Start(launch);
             if (process is null)
                 throw new InvalidOperationException("Failed to start broker process");
 
@@ -140,10 +147,22 @@ public static class BrokerRuntime
             process.BeginOutputReadLine();
             process.BeginErrorReadLine();
 
-            return await WaitForBrokerReadyAsync(status.Port, process, ct);
+            var ready = await WaitForBrokerReadyAsync(status.Port, process, ct);
+            await RequireCurrentContractAsync(ready, $"{launch.FileName} {launch.Arguments}".TrimEnd(), ct);
+            return ready;
         }
 
-        return await WaitForBrokerReadyAsync(status.Port, launchedProcess: null, ct);
+        var concurrent = await WaitForBrokerReadyAsync(status.Port, launchedProcess: null, ct);
+        await RequireCurrentContractAsync(concurrent, $"concurrently started broker port {concurrent.Port}/PID {concurrent.Pid}", ct);
+        return concurrent;
+    }
+
+    private static async Task RequireCurrentContractAsync(BrokerInfo broker, string launchPath, CancellationToken ct)
+    {
+        var actual = await ReportedContractAsync(broker.Port, ct);
+        if (actual < BrokerContract.Current)
+            throw new InvalidOperationException(
+                $"Stale broker build: actual contract {actual}, required {BrokerContract.Current}; selected launch path: {launchPath}. Build Peers.Broker and Peers.Mcp before retrying.");
     }
 
     public static async Task<bool> IsHealthyAsync(int port, CancellationToken ct = default)

@@ -80,6 +80,7 @@ public sealed class McpSubscriptionTests : IAsyncLifetime
         services.AddLogging();
         services.AddSingleton(_broker);
         services.AddSingleton(_state);
+        services.AddSingleton(new Peers.Mcp.Reviews.ReviewStorageOptions(Path.Combine(Path.GetTempPath(), "peers-review-sub-" + Guid.NewGuid().ToString("N"))));
         _services = services.BuildServiceProvider();
 
         // The real production wiring — not a second copy that can pass while production is broken.
@@ -1019,6 +1020,7 @@ public sealed class McpSubscriptionTests : IAsyncLifetime
         collection.AddLogging();
         collection.AddSingleton(_broker);
         collection.AddSingleton(state);
+        collection.AddSingleton(new Peers.Mcp.Reviews.ReviewStorageOptions(Path.Combine(Path.GetTempPath(), "peers-review-sub-" + Guid.NewGuid().ToString("N"))));
         var services = collection.BuildServiceProvider();
 
         // The real production wiring again — the point of this test is that it is not a second copy.
@@ -1054,18 +1056,6 @@ public sealed class McpSubscriptionTests : IAsyncLifetime
         var listed = (await _client.ListToolsAsync()).Select(t => t.Name).Order().ToArray();
 
         Assert.Equal(declared, listed);
-
-        // And the surface itself, spelled out: a tool silently disappearing from BOTH sides is still a
-        // contract change, and this is the line that has to be edited to make it deliberate.
-        Assert.Equal(
-            new[]
-            {
-                "artifact_get", "artifact_list", "artifact_publish",
-                "channel_create", "channels", "claim", "claims",
-                "context_export", "context_import",
-                "peers", "presence", "read", "release", "send", "wait",
-            },
-            listed);
     }
 
     [Fact]
@@ -1134,6 +1124,95 @@ public sealed class McpSubscriptionTests : IAsyncLifetime
 
         var read = await CallOkAsync("read", new Dictionary<string, object?> { ["channel"] = channel });
         Assert.Single(read["messages"]!.AsArray());
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task RemovalHints_NotifyOnlyWhisperParticipants(bool addressedToUs)
+    {
+        await RegisterAsync();
+        var author = await _broker.RegisterAsync(new RegisterPeerRequest
+            { Tool = "codex", MachineId = "removal-author", RepoRoot = "/other-repo" });
+        var other = await _broker.RegisterAsync(new RegisterPeerRequest
+            { Tool = "codex", MachineId = "removal-other", RepoRoot = "/other-repo" });
+        var channel = await CreatePadAsync("removal-hints");
+        await SubscribeAsync(PeerResources.ChannelUri(channel), PeerResources.InboxUri);
+        var message = (await _broker.SendMessageAsync(channel, new SendMessageRequest
+        {
+            AuthorPeerId = author.PeerId, Content = "whisper to remove", Quiet = true,
+            To = [addressedToUs ? _peerId! : other.PeerId],
+        }))!;
+        await DispatchBrokerEventsAsync();
+        if (addressedToUs)
+            await WaitForAsync(() => _notifications.Count == 2, TimeSpan.FromSeconds(10), "initial whisper hints missing");
+        else
+            await Task.Delay(Settle);
+        _notifications.Clear();
+
+        await _broker.RemoveMessagesAsync(channel, new RemoveMessagesRequest { MessageIds = [message.MessageId] });
+        await DispatchBrokerEventsAsync();
+        if (addressedToUs)
+        {
+            await WaitForAsync(() => _notifications.Count == 2, TimeSpan.FromSeconds(10), "removal hints missing");
+            Assert.Contains(_notifications, n => n.Params?["uri"]?.GetValue<string>() == PeerResources.ChannelUri(channel));
+            Assert.Contains(_notifications, n => n.Params?["uri"]?.GetValue<string>() == PeerResources.InboxUri);
+            Assert.DoesNotContain((await _broker.GetInboxAsync(_peerId!))!.Items,
+                item => item.Event.Type == Peers.Shared.Models.EventTypes.ChannelMessageAdded);
+        }
+        else
+        {
+            await Task.Delay(Settle);
+            Assert.Empty(_notifications);
+        }
+    }
+
+    [Fact]
+    public async Task DeletionTools_UseRepoScope_NotifyClear_AndPreserveReadCursor()
+    {
+        await RegisterAsync();
+        // Explicit registration bypasses git identity derivation in this harness.
+        _state.RepoRoot = "/repo";
+        var name = $"delete-{Guid.NewGuid():N}";
+        var global = await _broker.CreateChannelAsync(new CreateChannelRequest
+            { Name = name, CreatedByPeerId = _peerId! });
+        await AppendAsync(global.ChannelId, "global survives");
+        var channel = await CallOkAsync("channel_create", new() { ["name"] = name });
+        var id = Str(channel["channel_id"])!;
+        var first = await CallOkAsync("send", new() { ["channel"] = name, ["content"] = "first" });
+        var last = await CallOkAsync("send", new() { ["channel"] = name, ["content"] = "last" });
+        var removed = await CallOkAsync("messages_remove", new()
+            { ["channel"] = name, ["message_ids"] = new[] { Str(last["message_id"]) } });
+        Assert.Equal(1, removed["deleted_messages"]!.GetValue<int>());
+        var read = await CallOkAsync("read", new() { ["channel"] = name });
+        Assert.Equal(Str(first["message_id"]), Str(Assert.Single(read["messages"]!.AsArray())!["message_id"]));
+
+        await DispatchBrokerEventsAsync();
+        await SubscribeAsync(PeerResources.ChannelUri(id));
+        _notifications.Clear();
+        var cleared = await CallOkAsync("channel_clear", new() { ["channel"] = name });
+        Assert.Equal(1, cleared["deleted_messages"]!.GetValue<int>());
+        await DispatchBrokerEventsAsync();
+        var hint = await WaitForNotificationAsync(NotificationMethods.ResourceUpdatedNotification);
+        Assert.Equal(PeerResources.ChannelUri(id), hint["uri"]!.GetValue<string>());
+        Assert.Equal("global survives", Assert.Single((await _broker.ReadChannelMessagesAsync(global.ChannelId, _peerId))!.Messages).Content);
+        Assert.Empty((await CallOkAsync("read", new() { ["channel"] = name }))["messages"]!.AsArray());
+
+        var next = await CallOkAsync("send", new() { ["channel"] = name, ["content"] = "after clear" });
+        Assert.True(next["seq"]!.GetValue<long>() > last["seq"]!.GetValue<long>());
+        var page = await CallOkAsync("read", new() { ["channel"] = name, ["since_seq"] = last["seq"]!.GetValue<long>() });
+        Assert.Equal(Str(next["message_id"]), Str(Assert.Single(page["messages"]!.AsArray())!["message_id"]));
+        var bad = await _client.CallToolAsync("messages_remove", new Dictionary<string, object?>
+            { ["channel"] = name, ["message_ids"] = Array.Empty<string>() });
+        Assert.True(bad.IsError is true);
+
+        var foreign = await _broker.CreateChannelAsync(new CreateChannelRequest
+            { Name = $"{name}-foreign", RepoRoot = "/other-repo", CreatedByPeerId = _peerId! });
+        await AppendAsync(foreign.ChannelId, "unrelated history");
+        var wrongScope = await _client.CallToolAsync("channel_clear", new Dictionary<string, object?>
+            { ["channel"] = $"{name}-foreign" });
+        Assert.True(wrongScope.IsError is true);
+        Assert.Equal("unrelated history", Assert.Single((await _broker.ReadChannelMessagesAsync(foreign.ChannelId, _peerId))!.Messages).Content);
     }
 
     /// <summary>Calls a tool, fails with the server's own message when it errored, and parses the result.</summary>

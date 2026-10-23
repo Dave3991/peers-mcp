@@ -64,6 +64,25 @@ public sealed class BrokerClient : IDisposable
         return await GetAsync<ReadMessagesResponse>($"/channels/{Uri.EscapeDataString(channelId)}/messages{query}");
     }
 
+    public async Task<RemoveMessagesResponse> ClearChannelAsync(
+        string channelId, CancellationToken cancellationToken = default)
+    {
+        try
+        {
+            using var resp = await _http.DeleteAsync(
+                $"/channels/{Uri.EscapeDataString(channelId)}/messages", cancellationToken);
+            if (!resp.IsSuccessStatusCode)
+                throw new BrokerApiException(resp.StatusCode, await resp.Content.ReadAsStringAsync(cancellationToken));
+            return (await resp.Content.ReadFromJsonAsync<RemoveMessagesResponse>(JsonOpts, cancellationToken))!;
+        }
+        catch (HttpRequestException ex) { throw BrokerApiException.FromTransport(ex); }
+    }
+
+    public async Task<RemoveMessagesResponse> RemoveMessagesAsync(
+        string channelId, RemoveMessagesRequest req, CancellationToken cancellationToken = default) =>
+        (await PostAsync<RemoveMessagesResponse>(
+            $"/channels/{Uri.EscapeDataString(channelId)}/messages/remove", req, cancellationToken))!;
+
     // Artifacts
     public async Task<PublishArtifactResponse> PublishArtifactAsync(PublishArtifactRequest req) =>
         (await PostAsync<PublishArtifactResponse>("/artifacts", req))!;

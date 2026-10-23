@@ -175,7 +175,7 @@ public sealed class SubscriptionRegistry
             case EventTypes.PeerRegistered or EventTypes.PeerExpired:
                 break;
 
-            case EventTypes.ChannelMessageAdded:
+            case EventTypes.ChannelMessageAdded or EventTypes.ChannelMessageRemoved:
                 // Loud messages notify everyone watching the channel; quiet whispers only their own
                 // participants (which includes us when we authored them).
                 if (ChannelIdOf(evt) is { } id && !IsWhisperNotForUs(evt.Payload))
@@ -183,6 +183,13 @@ public sealed class SubscriptionRegistry
 
                 // recipient_peer_ids rides loud AND quiet sends alike (ChannelService) and equals the
                 // broker's durable inbox set, so the hint and the inbox can never disagree.
+                if (IsForOurInbox(evt.Payload))
+                    uris.Add(PeerResources.InboxUri);
+                break;
+
+            case EventTypes.ChannelCleared:
+                if (ChannelIdOf(evt) is { } clearedId)
+                    uris.Add(PeerResources.ChannelUri(clearedId));
                 if (IsForOurInbox(evt.Payload))
                     uris.Add(PeerResources.InboxUri);
                 break;

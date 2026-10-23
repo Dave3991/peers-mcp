@@ -216,6 +216,30 @@ public sealed class BrokerFlowTests : IAsyncLifetime
         Assert.Equal(HttpStatusCode.BadRequest, (await _http.PostAsJsonAsync("/channels", createReq, JsonOpts)).StatusCode);
     }
 
+    [Fact]
+    public async Task Removal_InvalidIdsAreRejected_AndMissingChannelsReturn404()
+    {
+        var peer = await RegisterPeerAsync("removal-validation");
+        var created = await _http.PostAsJsonAsync("/channels",
+            new CreateChannelRequest { Name = "validation", CreatedByPeerId = peer }, JsonOpts);
+        var channel = (await created.Content.ReadFromJsonAsync<CreateChannelResponse>(JsonOpts))!;
+        var sent = await _http.PostAsJsonAsync($"/channels/{channel.ChannelId}/messages",
+            new SendMessageRequest { AuthorPeerId = peer, Content = "must survive bad requests" }, JsonOpts);
+        sent.EnsureSuccessStatusCode();
+        string[]?[] invalid = [null, [], [""], [" "], [null!], Enumerable.Repeat("id", 201).ToArray()];
+        foreach (var ids in invalid)
+        {
+            var response = await _http.PostAsJsonAsync($"/channels/{channel.ChannelId}/messages/remove",
+                new { MessageIds = ids }, JsonOpts);
+            Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
+        }
+        var read = await _http.GetFromJsonAsync<ReadMessagesResponse>($"/channels/{channel.ChannelId}/messages", JsonOpts);
+        Assert.Equal("must survive bad requests", Assert.Single(read!.Messages).Content);
+        Assert.Equal(HttpStatusCode.NotFound, (await _http.DeleteAsync("/channels/missing/messages")).StatusCode);
+        Assert.Equal(HttpStatusCode.NotFound, (await _http.PostAsJsonAsync("/channels/missing/messages/remove",
+            new RemoveMessagesRequest { MessageIds = ["id"] }, JsonOpts)).StatusCode);
+    }
+
     // -------------------------------------------------------------------------
     // Helpers
     // -------------------------------------------------------------------------

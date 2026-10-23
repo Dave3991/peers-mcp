@@ -33,5 +33,15 @@ public static class ChannelRoutes
             var result = await svc.ReadAsync(id, viewer, since_seq ?? 0, limit ?? 200, ct);
             return result is not null ? Results.Ok(result) : Results.NotFound(new { error = $"Channel '{id}' not found." });
         });
+
+        app.MapDelete("/channels/{id}/messages", async (string id, ChannelService svc, CancellationToken ct) =>
+            (await svc.ClearAsync(id, ct)).ToHttp());
+
+        app.MapPost("/channels/{id}/messages/remove", async (string id, RemoveMessagesRequest req,
+            ChannelService svc, CancellationToken ct) =>
+        {
+            if (RequestLimits.ValidateRemoveMessages(req) is { } err) return err;
+            return (await svc.RemoveMessagesAsync(id, req, ct)).ToHttp();
+        });
     }
 }

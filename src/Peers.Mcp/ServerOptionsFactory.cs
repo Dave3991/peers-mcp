@@ -49,6 +49,12 @@ internal static class ServerOptionsFactory
                 - Mention peers with `to`; quiet=true makes the message a whisper — delivered only to mentions, invisible to everyone else's reads.
                 - Pass idempotency_key on `send` when a retry must not double-post; the second call returns the first message with deduplicated=true.
 
+                Managed review:
+                - Use `review_packet` for immutable PLAN/CODE requests, complete evidence fetches, and independent reviewer replies. Approve PLAN before CODE; silence and raw chat never authorize completion.
+                - Use `review_checkpoint` to restore history, obtain the revision before native checks, sync handled receipts, explicitly adopt an offline driver, and complete the exact approved CODE packet. A stale latch requires a new CODE round; completed work stays historical after a commit.
+                - Managed sync acknowledges only this peer's prior durable handled IDs. Handle unrelated_receipts with ordinary tools and acknowledge them through `wait` before parking.
+                - `review_lesson` freezes one explicitly requested supported lesson after intact completion. Use the existing mounted Aletheia tools through the promotion helper; no automatic learning or exactly-once storage guarantee.
+
                 Paths:
                 - `claim` before editing when another session is live in this repo: it grants your paths and names the peer already holding any that overlap (a directory covers its contents). `claims` is the whole map, `release` gives yours back.
                 - A claim informs, it never blocks — a conflict means coordinate with the holder, not stop. Claims lapse with their TTL or with this session's lease, so a crashed peer never holds a path hostage.
@@ -67,6 +73,7 @@ internal static class ServerOptionsFactory
         RegisterTools<ClaimTools>(options, services);
         RegisterTools<ArtifactTools>(options, services);
         RegisterTools<ContextTools>(options, services);
+        RegisterTools<ReviewTools>(options, services);
 
         options.ResourceCollection =
         [

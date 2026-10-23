@@ -71,11 +71,35 @@ shutdown.
 ### Talk in channels
 
 A channel is a named board, optionally scoped to a repository. Names belong to the agents; the repo
-metadata says whose code the channel is about. Messages are append-only and read oldest-first with a
-`since_seq` cursor.
+metadata says whose code the channel is about. Messages are read oldest-first with a stable `since_seq`
+cursor; deleting history never resets sequence numbers.
 
 Mention peers with `to` (peer IDs or ID prefixes): a mention lands in the recipient's durable inbox,
 so `wait` returns as soon as it arrives.
+
+### Clear history or remove selected messages
+
+`channel_clear(channel)` permanently removes all messages while keeping the channel usable.
+`messages_remove(channel, message_ids)` removes 1..200 selected message IDs returned by `send` or
+`read`. Both return `{ channel_id, deleted_messages }`; duplicate, missing, or other-channel IDs are
+ignored, and repeating a completed removal returns zero. MCP channel names resolve in this session's
+repository first, then the global scope — never an unrelated repository.
+
+Removal affects every session, not just your view. Message rows, original event payloads, and inbox
+receipts are deleted atomically, so withdrawn mentions stop being delivered by `wait`. Already-returned
+content cannot be recalled from another client. Deleted messages also release their `idempotency_key`.
+Channel/inbox subscribers receive re-read hints; removing a whisper notifies only its participants.
+
+The broker exposes `DELETE /channels/{id}/messages` for clearing and
+`POST /channels/{id}/messages/remove` with `{ "messageIds": ["..."] }` for selected removal.
+Unknown channels return 404; null, empty, blank, or over-200 ID lists return 400.
+
+For manual use, the CLI takes channel IDs rather than names:
+
+```bash
+dotnet run --project src/Peers.Cli -- channel-clear <channel-id>
+dotnet run --project src/Peers.Cli -- messages-remove <channel-id> <message-id> [message-id ...]
+```
 
 ### Whisper inside a channel
 
@@ -144,6 +168,8 @@ by `wait` until you echo their ids back as `ack_inbox_ids`.
 | `presence` | Update this session's role, summary, capabilities, focus paths, and progress on long-running work |
 | `channels` | List channels and their repo scope + message counts |
 | `channel_create` | Create a channel (`name`, optional `repo_root`; names unique per scope) |
+| `channel_clear` | Permanently clear a channel's history and pending deliveries; keep the channel |
+| `messages_remove` | Permanently remove selected `message_ids` from a channel (1..200) |
 | `send` | Post to a channel: `content`, optional `to` mentions, optional `quiet` whisper |
 | `read` | Read a channel from `since_seq`; whispers addressed to others are filtered out |
 | `wait` | Long-poll for directed messages (default 25s, max 120s); echo `ack_inbox_ids` to acknowledge receipts |
@@ -153,15 +179,17 @@ by `wait` until you echo their ids back as `ack_inbox_ids`.
 | `artifact_publish` | Publish a versioned, content-hashed artifact |
 | `artifact_get` | Retrieve an artifact by ID or namespace+name (latest version) |
 | `artifact_list` | List artifact metadata, filter by type/repo/namespace |
+| `review_packet` | Publish complete immutable PLAN/CODE packets, fetch private evidence files, or reply as the selected independent reviewer |
+| `review_checkpoint` | Restore history, obtain a source revision, sync handled receipts, pause/resume, adopt an offline driver, or gate terminal completion |
+| `review_lesson` | Freeze one explicit supported lesson and record/reconcile its single save grant through existing Aletheia tools |
 | `context_export` | Export session state for a Codex handoff |
 | `context_import` | Import a context packet from Codex |
 
 There is no register or heartbeat tool: the MCP server does both for you.
 
-Failures are MCP errors, not payloads. A missing channel, an unknown artifact, a conflicting lookup, or
-a broker fault comes back with `isError: true` and the reason in the text — never as a successful
-result whose body happens to contain an `error` key, which a client can only find by string-matching a
-success.
+Input, lock, lookup, and broker failures are MCP errors with `isError: true`.
+A blocked managed completion is different: it returns `completed: false`, `state`, and `reason` as a successful tool result.
+This result means that the review gate did not authorize completion. It does not report a transport error.
 
 `initialize` reports the server version as `2.0.0+<git sha>`: a stdio server serves the assembly it
 loaded at launch for the whole client session, so the sha is how a session tells a fresh build from one
@@ -174,6 +202,80 @@ Ask for more than 25s only after raising the client budget past it (`OMP_MCP_TIM
 `"timeout": 130000` on the peers entry). Without that, a longer wait dies as a client-side transport
 error that reads exactly like broker silence — and silence is never a verdict.
 
+## Managed independent review
+
+Use one channel for one task, base commit, source-worktree lineage, and driver.
+Publish PLAN/1 with the full task text and an explicit regular plan file.
+After independent PLAN approval, obtain a revision from `review_checkpoint/status` before native verification.
+Publish CODE with that revision and ordered metadata for the exact raw build/test/smoke outputs.
+CODE requires test or smoke evidence. Peers records driver claims and never runs those commands.
+
+The reviewer fetches the exact immutable packet ID and reads the complete materialized payloads.
+Packets include the full tracked binary diff, non-ignored untracked bytes or symlink target text, and supplied evidence.
+Multipart artifacts preserve binary and UTF-8 bytes. Hashes, sizes, order, message identity, and author roles gate decisions.
+An artifact's latest name, an inbox preview, raw approval text, or zero exit status cannot authorize completion.
+Ignored files and external services are outside the source fingerprint.
+Untracked nested repositories require an explicit nested source root, a submodule, or an explicit ignore rule.
+
+Round numbers increase within each phase without a fixed limit. A replacement reviewer must approve a new PLAN before CODE.
+Before completion, observed CODE source drift latches `stale`, even after source restoration.
+A new verified CODE round clears that latch. Only the driver can complete the current independently approved CODE packet.
+Completion ends the channel for new work. Later source changes or commits remain separate from historical completion.
+Status reports `source_changed_since_completion` and evidence integrity without reopening the review.
+
+Channel history authorizes decisions independently of inbox delivery or acknowledgement.
+`review_checkpoint/sync` returns durable `ready_to_ack` IDs and unrelated receipt IDs/types.
+Only prior handled IDs from the same peer can enter its next managed acknowledgement call.
+Ordinary tools and `wait` retain their existing receipt semantics.
+Explicit driver adoption requires the former driver to be offline and preserves the original lineage.
+The selected reviewer cannot adopt the driver role. Loud control records do not depend on a historical reviewer remaining online.
+
+Lesson promotion is explicit and optional after intact terminal completion.
+`scripts/omp-promote-lesson.mjs` uses the caller's existing native mounted tool bridge for Aletheia binding, search, save, and verification.
+One frozen lesson uses literal before/after quotes from retained evidence. Confounded or unsupported proposals produce no entry.
+A durable grant permits one helper dispatch. Ambiguous responses require marker reconciliation rather than another save.
+Visible duplicates produce `duplicate`, not `saved`. Transport retries mean that storage is not atomically exactly-once.
+The helper adds no runtime MCP connection, background learner, execution engine, commit, or deployment.
+
+This is a local coordination protocol, not authentication. A deliberate client can forge broker authors.
+Evidence loss blocks authorization. Deleted or ambiguous review rounds are not silently recreated.
+The broker retains selected source/log artifacts and has no artifact pruning route.
+Private caches do not make captured content safe to execute.
+
+### Build both servers
+
+Build the broker before the MCP server:
+
+```sh
+dotnet build src/Peers.Broker/Peers.Broker.csproj -c Release
+dotnet build src/Peers.Mcp/Peers.Mcp.csproj -c Release
+```
+
+Contract 6 adds `NotifyPeers=false` for internal review parts, indexes, roots, and checkpoints.
+Ordinary `artifact_publish` keeps its normal notifications. SQLite schema v6 does not change.
+Broker startup checks the reported contract after either readiness path.
+A stale selected build reports its actual/required contract and launch path instead of repeated replacement.
+Existing MCP sessions need a restart to expose new tools.
+A new `dotnet run` session during source/build cutover can cause one transient broker replacement.
+The existing process-name kill guard remains in force.
+
+### Isolated real-program smoke
+
+Set `PEERS_REVIEW_BIN` to an isolated published MCP executable before these commands:
+
+```sh
+node scripts/smoke-review-workflow.mjs
+node scripts/smoke-review-workflow.mjs --with-aletheia
+node scripts/smoke-review-workflow.mjs --with-aletheia --with-omp
+```
+
+The runner uses private peers state, a fixture Git repository, and an unused broker port.
+The memory modes require the existing Aletheia Release executable and the documented Docker PostgreSQL service.
+They create and delete only a runner-owned database. SQL proves isolation before the runner claims a daemon PID.
+The omp mode uses normal profile authentication, project-only MCP configuration, and the installed peers skill's exact promotion block.
+An authentication error or deny policy is a failed prerequisite, not permission to substitute a model or bypass policy.
+Native tool events and independent MCP/SQL results provide proof. Final model prose does not.
+
 ## Architecture
 
 ```
@@ -183,9 +285,10 @@ src/
 │   ├── Services/        # ChannelService, PeerService, ArtifactService, EventService
 │   ├── Validation/      # Request size limits and validation
 │   └── Persistence/     # SQLite repositories + schema (auto-migrating)
-├── Peers.Mcp/           # MCP stdio server (thin broker client)
-│   ├── Tools/           # Channel, artifact and context tools
+├── Peers.Mcp/           # MCP stdio server, broker client, and managed review coordination
+│   ├── Tools/           # Channel, artifact, context, claim, and review tools
 │   ├── Resources/       # peers:// resources + resources/subscribe registry
+│   ├── Reviews/         # Read-only Git capture, immutable packets, local ledgers/caches, lesson intents
 │   └── Lifecycle/       # Auto-registration, heartbeat, discovery, resource dispatch
 ├── Peers.Shared/        # Models, contracts, broker runtime
 └── Peers.Cli/           # CLI for testing and debugging
@@ -193,14 +296,19 @@ tests/
 └── Peers.Broker.Tests/  # xunit integration tests
 ```
 
-**Broker** (`localhost:7856`) manages all state in SQLite at `~/.peers/peers.db` (schema v5).
-`/health` reports both the schema version and an HTTP **contract version**; an MCP server that finds a
-broker older than its own contract stops it and starts a current one, so a long-lived daemon can never
-silently break freshly-spawned sessions. It exposes a REST API, handles peer leases (2-minute TTL, auto-renewed), persistent inbox delivery, event fan-out, request validation, and cleanup.
+**Broker** (`localhost:7856`) stores shared coordination facts and immutable evidence in SQLite at `~/.peers/peers.db` (schema v6).
+`/health` reports HTTP contract 6 independently of the schema version.
+The broker manages leases, persistent inbox delivery, event fan-out, request limits, and cleanup.
+Internal review artifacts suppress notifications without changing storage or versioning.
 
-**MCP Server** is a thin stdio wrapper that translates MCP tool calls into broker HTTP requests. It manages the session lifecycle — heartbeat every 30 seconds, event polling every 5 seconds, push notification delivery, and deregistration on shutdown.
+**MCP Server** manages registration, heartbeat, event polling, and stdio tools.
+Managed review uses role-isolated local ledgers and private digest-named evidence caches under `<state>/review-workflows/<channel-sha256>/`.
+The driver shares its control/lesson ledger across explicit successors. Each reviewer or observer keeps separate receipts and projections.
+Only driver transitions update the broker-backed checkpoint mirror.
+Checkpoint payloads use silent multipart blobs behind bounded descriptors, so the single-artifact limit does not impose a round limit.
+Channel records and pinned artifacts remain authoritative after local state loss. A mirror alone never grants approval.
 
-**CLI** provides commands for manual testing: `broker-status`, `broker-start`, `status`, `channels`, `artifacts`, `events --follow`.
+**CLI** provides commands for manual testing: `broker-status`, `broker-start`, `status`, `channels`, `channel-clear`, `messages-remove`, `artifacts`, `events --follow`.
 
 ## Configuration
 
@@ -225,7 +333,7 @@ Check its health:
 
 ```bash
 curl http://localhost:7856/health
-# {"status":"ok","version":5,"contract":4}
+# {"status":"ok","version":6,"contract":5}
 ```
 
 Or use the CLI:

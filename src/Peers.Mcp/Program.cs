@@ -14,6 +14,7 @@ services.AddLogging(builder =>
 });
 services.AddSingleton(client);
 services.AddSingleton(sessionState);
+services.AddSingleton(new Peers.Mcp.Reviews.ReviewStorageOptions(Peers.Shared.PeersPaths.GetStateDirectory()));
 
 using var serviceProvider = services.BuildServiceProvider();
 

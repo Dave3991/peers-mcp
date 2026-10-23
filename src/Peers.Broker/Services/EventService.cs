@@ -1,3 +1,4 @@
+using Microsoft.Data.Sqlite;
 using Peers.Broker.Persistence.Repositories;
 using Peers.Shared.Contracts;
 using Peers.Shared.Models;
@@ -30,18 +31,27 @@ public sealed class EventService(EventRepository events, PeerRepository peers, I
         return new PollResponse { Events = result, Cursor = newCursor };
     }
 
-    public async Task<long> EmitAsync(string type, string payload, CancellationToken ct, string[]? recipientPeerIds = null)
+    public async Task<long> EmitAsync(string type, string payload, CancellationToken ct,
+        string[]? recipientPeerIds = null, SqliteConnection? existingConn = null)
     {
+        async Task<long> InsertAsync(SqliteConnection conn)
+        {
+            var eventId = await events.InsertAsync(type, payload, conn, ct);
+            if (recipientPeerIds is not null)
+                foreach (var peerId in recipientPeerIds)
+                    await inbox.InsertAsync(peerId, eventId, conn, ct);
+            return eventId;
+        }
+
+        if (existingConn is not null)
+            return await InsertAsync(existingConn);
         if (recipientPeerIds is not { Length: > 0 })
             return await events.InsertAsync(type, payload, ct: ct);
 
-        // Atomic: event + inbox rows in one transaction
         return await events.Database.WriteAsync(async conn =>
         {
             using var txn = conn.BeginTransaction();
-            var eventId = await events.InsertAsync(type, payload, conn, ct);
-            foreach (var peerId in recipientPeerIds)
-                await inbox.InsertAsync(peerId, eventId, conn, ct);
+            var eventId = await InsertAsync(conn);
             txn.Commit();
             return eventId;
         }, ct);

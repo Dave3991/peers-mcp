@@ -190,6 +190,59 @@ public sealed class ChannelTools
         catch (BrokerApiException ex) { throw BrokerError(ex); }
     }
 
+    [McpServerTool(Name = "channel_clear"), Description(
+        "Permanently clear a channel's messages for every session, including pending inbox deliveries.\n" +
+        "The channel remains usable and sequence numbers are not reset. Returns: { channel_id, deleted_messages }.")]
+    public static async Task<string> ChannelClear(
+        BrokerClient client,
+        SessionState state,
+        McpServer server,
+        ILoggerFactory loggerFactory,
+        [Description("Channel name to clear")] string channel,
+        CancellationToken cancellationToken = default)
+    {
+        await SessionRegistration.EnsureRegisteredAsync(client, state, server, loggerFactory, cancellationToken);
+        try
+        {
+            var ch = await ResolveChannelAsync(client, channel, state.RepoRoot, cancellationToken)
+                     ?? await ResolveChannelAsync(client, channel, null, cancellationToken);
+            if (ch is null)
+                throw new McpException($"Channel '{channel}' not found.");
+
+            var resp = await client.ClearChannelAsync(ch.ChannelId, cancellationToken);
+            return JsonSerializer.Serialize(resp, JsonOpts);
+        }
+        catch (BrokerApiException ex) { throw BrokerError(ex); }
+    }
+
+    [McpServerTool(Name = "messages_remove"), Description(
+        "Permanently remove selected messages from a channel for every session, including pending inbox deliveries.\n" +
+        "Provide 1..200 message IDs from read/send. Missing IDs are ignored; sequence numbers are not reset.\n" +
+        "Returns: { channel_id, deleted_messages } — repeated removal returns zero.")]
+    public static async Task<string> MessagesRemove(
+        BrokerClient client,
+        SessionState state,
+        McpServer server,
+        ILoggerFactory loggerFactory,
+        [Description("Channel name")] string channel,
+        [Description("Message IDs to remove (1..200)")] string[] message_ids,
+        CancellationToken cancellationToken = default)
+    {
+        await SessionRegistration.EnsureRegisteredAsync(client, state, server, loggerFactory, cancellationToken);
+        try
+        {
+            var ch = await ResolveChannelAsync(client, channel, state.RepoRoot, cancellationToken)
+                     ?? await ResolveChannelAsync(client, channel, null, cancellationToken);
+            if (ch is null)
+                throw new McpException($"Channel '{channel}' not found.");
+
+            var resp = await client.RemoveMessagesAsync(ch.ChannelId,
+                new RemoveMessagesRequest { MessageIds = message_ids }, cancellationToken);
+            return JsonSerializer.Serialize(resp, JsonOpts);
+        }
+        catch (BrokerApiException ex) { throw BrokerError(ex); }
+    }
+
     [McpServerTool(Name = "wait"), Description(
         "Long-poll: block up to timeout_seconds (default 25, max 120) until a directed message arrives — mentions, replies, review requests. Returns as soon as something lands; timed_out:true at the deadline.\n" +
         "The default fits inside the 30s MCP request timeout most clients ship. Progress keepalives go out every 5s, but a client that does not reset its deadline on them aborts a longer wait as a transport error — indistinguishable from broker silence — so raise the client's per-server MCP timeout before passing more than 25.\n" +
@@ -331,7 +384,7 @@ public sealed class ChannelTools
     {
         var list = await client.ListChannelsAsync(repoRoot, limit: 500);
         foreach (var c in list.Channels)
-            if (string.Equals(c.Name, name, StringComparison.Ordinal))
+            if (string.Equals(c.Name, name, StringComparison.Ordinal) && c.RepoRoot == repoRoot)
                 return c;
         return null;
     }

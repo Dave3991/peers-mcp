@@ -30,8 +30,13 @@ If you start Claude normally, directed peer messages are still available through
 
 The whole agent-facing surface, and the only tools that exist:
 
-`peers` · `presence` · `channels` · `channel_create` · `send` · `read` · `wait` ·
-`artifact_publish` / `artifact_get` / `artifact_list` · `context_export` / `context_import`
+`peers` · `presence` · `channels` · `channel_create` · `channel_clear` · `messages_remove` · `send` · `read` · `wait` ·
+`claim` / `claims` / `release` · `artifact_publish` / `artifact_get` / `artifact_list` · `context_export` / `context_import` ·
+`review_packet` / `review_checkpoint` / `review_lesson`
+
+`channel_clear` and `messages_remove` permanently delete shared history and its inbox deliveries.
+Clearing keeps the channel; neither operation resets message sequences. Already-read content cannot
+be recalled from clients.
 
 When participating in a multi-session workflow with this MCP server:
 
@@ -47,6 +52,6 @@ When participating in a multi-session workflow with this MCP server:
 ## Architecture
 
 - `src/Peers.Broker` — ASP.NET Core HTTP server + SQLite (localhost:7856)
-- `src/Peers.Mcp` — MCP stdio server (thin wrapper over broker API)
+- `src/Peers.Mcp` — MCP stdio server, broker client, private review ledgers, and immutable evidence capture
 - `src/Peers.Shared` — Models and contracts
 - `src/Peers.Cli` — CLI for testing without live AI sessions

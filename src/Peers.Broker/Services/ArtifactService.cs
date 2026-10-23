@@ -30,7 +30,7 @@ public sealed class ArtifactService(ArtifactRepository artifacts, EventService e
 
         var (saved, version, isNew) = await artifacts.PublishAsync(artifact, ct);
 
-        if (isNew)
+        if (isNew && req.NotifyPeers)
         {
             var activePeers = await peers.ListAsync(repoRoot: req.RepoRoot, includeExpired: false, ct: ct);
             var recipientPeerIds = activePeers

@@ -15,5 +15,7 @@ public static class EventTypes
     public const string PeerExpired = "peer.expired";
     public const string ChannelCreated = "channel.created";
     public const string ChannelMessageAdded = "channel.message_added";
+    public const string ChannelMessageRemoved = "channel.message_removed";
+    public const string ChannelCleared = "channel.cleared";
     public const string ArtifactPublished = "artifact.published";
 }

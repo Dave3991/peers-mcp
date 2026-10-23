@@ -94,31 +94,38 @@ public sealed class ChannelService(
         }
 
         var messageId = Guid.NewGuid().ToString("N")[..16];
-        var row = await channels.AppendMessageAsync(new MessageRow
+        // Append, event payload, and inbox delivery commit together so removal cannot race a late emit.
+        var row = await channels.Database.WriteAsync(async conn =>
         {
-            MessageId = messageId,
-            ChannelId = channelId,
-            AuthorPeerId = req.AuthorPeerId,
-            Content = req.Content,
-            Mentions = mentions,
-            Quiet = req.Quiet,
-            IdempotencyKey = req.IdempotencyKey,
-            CreatedAt = DateTime.UtcNow.ToString("O"),
-        }, ct);
+            using var txn = conn.BeginTransaction();
+            var appended = await channels.AppendMessageAsync(new MessageRow
+            {
+                MessageId = messageId,
+                ChannelId = channelId,
+                AuthorPeerId = req.AuthorPeerId,
+                Content = req.Content,
+                Mentions = mentions,
+                Quiet = req.Quiet,
+                IdempotencyKey = req.IdempotencyKey,
+                CreatedAt = DateTime.UtcNow.ToString("O"),
+            }, ct, conn);
 
-        await eventService.EmitAsync(EventTypes.ChannelMessageAdded, JsonSerializer.Serialize(new
-        {
-            channel_id = channelId,
-            channel_name = channel.Name,
-            repo_root = channel.RepoRoot,
-            message_id = messageId,
-            seq = row.Seq,
-            author_peer_id = req.AuthorPeerId,
-            content = req.Content,
-            mentions = mentions,
-            quiet = req.Quiet,
-            recipient_peer_ids = mentions,
-        }), ct, mentions.Length == 0 ? null : mentions);
+            await eventService.EmitAsync(EventTypes.ChannelMessageAdded, JsonSerializer.Serialize(new
+            {
+                channel_id = channelId,
+                channel_name = channel.Name,
+                repo_root = channel.RepoRoot,
+                message_id = messageId,
+                seq = appended.Seq,
+                author_peer_id = req.AuthorPeerId,
+                content = req.Content,
+                mentions = mentions,
+                quiet = req.Quiet,
+                recipient_peer_ids = mentions,
+            }), ct, mentions.Length == 0 ? null : mentions, conn);
+            txn.Commit();
+            return appended;
+        }, ct);
 
         return Result.Ok<SendMessageResponse?>(new SendMessageResponse
         {
@@ -149,6 +156,55 @@ public sealed class ChannelService(
     {
         var list = await channels.ListAsync(repoRoot, limit, ct);
         return new ListChannelsResponse { Channels = list.ToArray() };
+    }
+
+    public async Task<Result<RemoveMessagesResponse>> ClearAsync(string channelId, CancellationToken ct)
+    {
+        if (await channels.GetAsync(channelId, ct) is null)
+            return Result.Fail(new NotFoundError($"Channel '{channelId}' not found."));
+
+        var count = await channels.Database.WriteAsync(async conn =>
+        {
+            using var txn = conn.BeginTransaction();
+            var recipients = await channels.GetMentionedPeerIdsAsync(channelId, conn, ct);
+            var deleted = await channels.DeleteMessagesAsync(channelId, null, conn, ct);
+            if (deleted > 0)
+                await eventService.EmitAsync(EventTypes.ChannelCleared, JsonSerializer.Serialize(new
+                {
+                    channel_id = channelId,
+                    recipient_peer_ids = recipients,
+                }), ct, existingConn: conn);
+            txn.Commit();
+            return deleted;
+        }, ct);
+        return Result.Ok(new RemoveMessagesResponse { ChannelId = channelId, DeletedMessages = count });
+    }
+
+    public async Task<Result<RemoveMessagesResponse>> RemoveMessagesAsync(
+        string channelId, RemoveMessagesRequest req, CancellationToken ct)
+    {
+        if (await channels.GetAsync(channelId, ct) is null)
+            return Result.Fail(new NotFoundError($"Channel '{channelId}' not found."));
+
+        var ids = JsonSerializer.Serialize(req.MessageIds);
+        var count = await channels.Database.WriteAsync(async conn =>
+        {
+            using var txn = conn.BeginTransaction();
+            var removed = await channels.GetMessagesForRemovalAsync(channelId, ids, conn, ct);
+            var deleted = await channels.DeleteMessagesAsync(channelId, ids, conn, ct);
+            foreach (var message in removed)
+                await eventService.EmitAsync(EventTypes.ChannelMessageRemoved, JsonSerializer.Serialize(new
+                {
+                    channel_id = channelId,
+                    message_id = message.MessageId,
+                    author_peer_id = message.AuthorPeerId,
+                    quiet = message.Quiet,
+                    recipient_peer_ids = message.Mentions,
+                }), ct, existingConn: conn);
+            txn.Commit();
+            return deleted;
+        }, ct);
+        return Result.Ok(new RemoveMessagesResponse { ChannelId = channelId, DeletedMessages = count });
     }
 
     private static MessageDto ToDto(MessageRow row) => new()

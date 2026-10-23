@@ -6,12 +6,14 @@ using Peers.Shared.Models;
 namespace Peers.Broker.Persistence.Repositories;
 
 /// <summary>
-/// Channels are named message boards scoped optionally to a repository; messages are append-only and
-/// carry an explicit mention list. Quiet messages are participant-scoped: delivered as inbox items to
+/// Channels are named message boards scoped optionally to a repository; messages have stable sequence
+/// numbers and carry an explicit mention list. Quiet messages are delivered as inbox items to
 /// mentioned peers, invisible to everyone else's reads and notifications.
 /// </summary>
 public sealed class ChannelRepository(SqliteConnectionFactory db)
 {
+    public SqliteConnectionFactory Database => db;
+
     public async Task<ChannelRow> InsertAsync(ChannelRow channel, CancellationToken ct = default)
     {
         await db.WriteAsync(async conn =>
@@ -95,26 +97,19 @@ public sealed class ChannelRepository(SqliteConnectionFactory db)
         }, ct);
     }
 
-    /// <summary>
-    /// Appends one message inside a single transaction: per-channel sequence assignment, the row, and
-    /// nothing else. Inbox delivery and the event row happen through <see cref="Services.EventService"/>
-    /// afterwards — they are already atomic together, and the message must exist before any reader can
-    /// be told about it.
-    ///
-    /// An idempotency key is stored with the row and unique per channel, so a retried send collides in
-    /// the index instead of double-posting. <see cref="Services.ChannelService"/> checks for the prior
-    /// row first; the index is what makes the check safe against two retries racing.
-    /// </summary>
-    public async Task<MessageRow> AppendMessageAsync(MessageRow message, CancellationToken ct = default)
+    /// <summary>Sequence assignment and append share the caller's transaction, or create their own.</summary>
+    public async Task<MessageRow> AppendMessageAsync(MessageRow message, CancellationToken ct = default,
+        SqliteConnection? existingConn = null)
     {
-        return await db.WriteAsync(async conn =>
+        async Task<MessageRow> AppendAsync(SqliteConnection conn)
         {
             using var cmd = conn.CreateCommand();
             cmd.CommandText = """
+                UPDATE channels SET last_seq = last_seq + 1 WHERE channel_id = @channel;
                 INSERT INTO channel_messages (message_id, channel_id, seq, author_peer_id, content, mentions, quiet, idempotency_key, created_at)
                 VALUES (
                     @id, @channel,
-                    (SELECT COALESCE(MAX(seq), 0) + 1 FROM channel_messages WHERE channel_id = @channel),
+                    (SELECT last_seq FROM channels WHERE channel_id = @channel),
                     @author, @content, @mentions, @quiet, @key, datetime('now'))
                 RETURNING seq, created_at
                 """;
@@ -129,6 +124,16 @@ public sealed class ChannelRepository(SqliteConnectionFactory db)
             await using var r = await cmd.ExecuteReaderAsync(ct);
             await r.ReadAsync(ct);
             return message with { Seq = r.GetInt64(0), CreatedAt = r.GetString(1) };
+        }
+
+        if (existingConn is not null)
+            return await AppendAsync(existingConn);
+        return await db.WriteAsync(async conn =>
+        {
+            using var txn = conn.BeginTransaction();
+            var row = await AppendAsync(conn);
+            txn.Commit();
+            return row;
         }, ct);
     }
 
@@ -163,6 +168,63 @@ public sealed class ChannelRepository(SqliteConnectionFactory db)
                 CreatedAt = reader.GetString(8),
             };
         }, ct);
+    }
+
+    public async Task<List<RemovedMessageRow>> GetMessagesForRemovalAsync(
+        string channelId, string messageIdsJson, SqliteConnection conn, CancellationToken ct)
+    {
+        using var cmd = conn.CreateCommand();
+        cmd.CommandText = """
+            SELECT message_id, author_peer_id, quiet, mentions FROM channel_messages
+            WHERE channel_id = @channel AND message_id IN (SELECT value FROM json_each(@ids))
+            """;
+        cmd.Parameters.AddWithValue("@channel", channelId);
+        cmd.Parameters.AddWithValue("@ids", messageIdsJson);
+        var rows = new List<RemovedMessageRow>();
+        await using var reader = await cmd.ExecuteReaderAsync(ct);
+        while (await reader.ReadAsync(ct))
+            rows.Add(new RemovedMessageRow(reader.GetString(0), reader.GetString(1),
+                reader.GetInt64(2) != 0, JsonSerializer.Deserialize<string[]>(reader.GetString(3)) ?? []));
+        return rows;
+    }
+
+    public async Task<List<string>> GetMentionedPeerIdsAsync(
+        string channelId, SqliteConnection conn, CancellationToken ct)
+    {
+        using var cmd = conn.CreateCommand();
+        cmd.CommandText = """
+            SELECT DISTINCT j.value FROM channel_messages m, json_each(m.mentions) j
+            WHERE m.channel_id = @channel
+            """;
+        cmd.Parameters.AddWithValue("@channel", channelId);
+        var ids = new List<string>();
+        await using var reader = await cmd.ExecuteReaderAsync(ct);
+        while (await reader.ReadAsync(ct))
+            ids.Add(reader.GetString(0));
+        return ids;
+    }
+
+    /// <summary>Delete original events first; their inbox receipts cascade in the same transaction.</summary>
+    public async Task<int> DeleteMessagesAsync(
+        string channelId, string? messageIdsJson, SqliteConnection conn, CancellationToken ct)
+    {
+        using var cmd = conn.CreateCommand();
+        cmd.CommandText = """
+            DELETE FROM events
+            WHERE type = @type AND json_extract(payload, '$.channel_id') = @channel
+              AND (@ids IS NULL OR json_extract(payload, '$.message_id') IN (
+                  SELECT message_id FROM channel_messages
+                  WHERE channel_id = @channel AND message_id IN (SELECT value FROM json_each(@ids))));
+            """;
+        cmd.Parameters.AddWithValue("@type", EventTypes.ChannelMessageAdded);
+        cmd.Parameters.AddWithValue("@channel", channelId);
+        cmd.Parameters.AddWithValue("@ids", (object?)messageIdsJson ?? DBNull.Value);
+        await cmd.ExecuteNonQueryAsync(ct);
+        cmd.CommandText = """
+            DELETE FROM channel_messages WHERE channel_id = @channel
+              AND (@ids IS NULL OR message_id IN (SELECT value FROM json_each(@ids)));
+            """;
+        return await cmd.ExecuteNonQueryAsync(ct);
     }
 
     /// <summary>
@@ -287,3 +349,5 @@ public sealed record MessageRow
     public string? IdempotencyKey { get; init; }
     public required string CreatedAt { get; init; }
 }
+
+public sealed record RemovedMessageRow(string MessageId, string AuthorPeerId, bool Quiet, string[] Mentions);
