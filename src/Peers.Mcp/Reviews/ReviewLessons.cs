@@ -1,6 +1,7 @@
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
+using System.Text.RegularExpressions;
 using ModelContextProtocol;
 
 namespace Peers.Mcp.Reviews;
@@ -79,6 +80,30 @@ internal sealed partial class ReviewWorkflow
             intent.ObservationIds, intent.Binding,
             intent.Binding is { } binding ? CamelString(binding, "identityConfidence") : null,
             dispatchAllowed, saveRequest, intent.Failure, intent.Warnings);
+    // Non-authoritative pointer at review_lesson after a completed lineage that needed CHANGES rounds.
+    // It only reads pinned verdicts: no lesson intent, ledger field, or channel record is written.
+    private async Task<object?> LessonHintAsync(ReviewLedger ledger)
+    {
+        if (ledger.State != "completed") return null;
+        var before = new List<object>();
+        foreach (var packet in ledger.Packets)
+        {
+            if (packet.VerdictValue != "CHANGES" || packet.Verdict is not { } reference) continue;
+            var verdict = await PinnedAsync(reference);
+            before.Add(new { packet_id = packet.PacketId, phase = packet.Manifest.Phase, round = packet.Manifest.Round,
+                verdict_message_id = reference.MessageId, findings = verdict is null ? Array.Empty<string>() : FindingSummaries(verdict.Content) });
+        }
+        return before.Count == 0 ? null : new
+        {
+            before, after = ledger.LatestPacketId,
+            next_action = "Optional: run review_lesson prepare with a cue and lesson based on these findings; nothing is saved automatically.",
+        };
+    }
+    // ReplyAsync renders one line per finding: "{n}. [OPTIONAL ]{SEVERITY} {location}: {finding} Fix: {fix}".
+    private static string[] FindingSummaries(string verdict) => verdict.Split('\n')
+        .Where(line => Regex.IsMatch(line, @"^\d+\. (OPTIONAL )?(HIGH|MED|LOW) "))
+        .Select(line => line.Length <= 200 ? line : line[..(char.IsHighSurrogate(line[199]) ? 199 : 200)] + "…")
+        .ToArray();
     internal async Task<object> LessonAsync(string action, ReviewLessonProposal? proposal, JsonElement? binding,
         string? attemptId, ReviewLessonResult? result, CancellationToken ct)
     {

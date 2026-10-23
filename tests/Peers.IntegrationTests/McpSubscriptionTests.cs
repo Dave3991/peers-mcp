@@ -1215,6 +1215,49 @@ public sealed class McpSubscriptionTests : IAsyncLifetime
         Assert.Equal("unrelated history", Assert.Single((await _broker.ReadChannelMessagesAsync(foreign.ChannelId, _peerId))!.Messages).Content);
     }
 
+    // Observed 2026-10-22: a reviewer session in one repo got "Channel ... not found" for the driver's
+    // channel scoped to an API worktree. Names stay scoped; an explicit channel_id reaches any repo.
+    [Fact]
+    public async Task ChannelId_ReachesAnotherReposChannel_WhileNamesStayScoped()
+    {
+        await RegisterAsync();
+        _state.RepoRoot = "/repo";
+        var name = $"by-id-{Guid.NewGuid():N}";
+        var foreign = await _broker.CreateChannelAsync(new CreateChannelRequest
+            { Name = name, RepoRoot = "/api-worktree", CreatedByPeerId = _peerId! });
+
+        var byName = await _client.CallToolAsync("send", new Dictionary<string, object?>
+            { ["channel"] = name, ["content"] = "lost" });
+        Assert.True(byName.IsError is true);
+        Assert.Contains($"Channel '{name}' not found.", TextOf(byName));
+
+        var sent = await CallOkAsync("send", new() { ["channel_id"] = foreign.ChannelId, ["content"] = "reached" });
+        Assert.Equal(foreign.ChannelId, Str(sent["channel_id"]));
+        var read = await CallOkAsync("read", new() { ["channel_id"] = foreign.ChannelId });
+        Assert.Equal("reached", Str(Assert.Single(read["messages"]!.AsArray())!["content"]));
+
+        // Name lookup is unchanged: the same name now resolves to this repo's own channel.
+        var own = await CallOkAsync("channel_create", new() { ["name"] = name });
+        var local = await CallOkAsync("send", new() { ["channel"] = name, ["content"] = "local" });
+        Assert.Equal(Str(own["channel_id"]), Str(local["channel_id"]));
+        Assert.Equal("local", Str(Assert.Single((await CallOkAsync("read", new() { ["channel"] = name }))["messages"]!.AsArray())!["content"]));
+        Assert.Single((await _broker.ReadChannelMessagesAsync(foreign.ChannelId, _peerId))!.Messages);
+
+        foreach (var (tool, args) in new (string, Dictionary<string, object?>)[]
+        {
+            ("send", new() { ["content"] = "neither" }),
+            ("send", new() { ["channel"] = name, ["channel_id"] = foreign.ChannelId, ["content"] = "both" }),
+            ("read", new()),
+            ("read", new() { ["channel"] = name, ["channel_id"] = foreign.ChannelId }),
+        })
+        {
+            var rejected = await _client.CallToolAsync(tool, args);
+            Assert.True(rejected.IsError is true, $"{tool} accepted {string.Join(",", args.Keys)}");
+            Assert.Contains("Pass exactly one of `channel` (name) or `channel_id`.", TextOf(rejected));
+        }
+        Assert.Single((await _broker.ReadChannelMessagesAsync(foreign.ChannelId, _peerId))!.Messages);
+    }
+
     /// <summary>Calls a tool, fails with the server's own message when it errored, and parses the result.</summary>
     private async Task<JsonNode> CallOkAsync(string tool, Dictionary<string, object?>? args = null)
     {

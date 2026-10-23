@@ -41,7 +41,8 @@ internal sealed partial class ReviewWorkflow
         return source;
     }
     private static object StatusResult(ReviewLedger ledger, ReviewSourceSnapshot? source, object[]? unrelated = null,
-        string[]? ready = null, string[]? acknowledged = null, string? reason = null, bool? completed = null) => new
+        string[]? ready = null, string[]? acknowledged = null, string? reason = null, bool? completed = null,
+        object? lessonHint = null) => new
     {
         phase = Latest(ledger)?.Manifest.Phase, round = Latest(ledger)?.Manifest.Round,
         packet_id = ledger.LatestPacketId, packet_sha256 = Latest(ledger)?.PacketSha256,
@@ -61,7 +62,7 @@ internal sealed partial class ReviewWorkflow
         },
         applied_through_seq = ledger.AppliedThroughSeq, completion = ledger.Completion,
         ready_to_ack = ready ?? [], unrelated_receipts = unrelated ?? [], acknowledged_inbox_ids = acknowledged ?? [],
-        completed, reason,
+        completed, reason, lesson_hint = lessonHint,
     };
     internal async Task<object> CheckpointAsync(string action, string? sourceRoot, string? expectedPacketId,
         string[]? ackIds, string? reason, CancellationToken ct)
@@ -118,7 +119,7 @@ internal sealed partial class ReviewWorkflow
                 await PersistObservedAsync(ledger, generation);
                 return StatusResult(ledger, current, reason: "Completion requires the current intact independently approved PLAN/CODE lineage, unchanged source, and no stale/pause latch.", completed: false);
             }
-            if (ledger.State == "completed") return StatusResult(ledger, current, completed: true);
+            if (ledger.State == "completed") return StatusResult(ledger, current, completed: true, lessonHint: await LessonHintAsync(ledger));
         }
         if (action == "pause") ReviewJson.Require(ledger.State != "completed", "Completed work cannot be paused.");
         if (action == "resume" && !isDriver)
@@ -165,7 +166,8 @@ internal sealed partial class ReviewWorkflow
                     throw new McpException("Control dispatch is ambiguous/deleted; it cannot be recreated.");
                 }
                 await ReduceAsync(ledger, ct, verifyArtifacts: false); ledger.ControlIntent = null; await PersistAsync(store, ledger);
-                return StatusResult(ledger, source, completed: operation == "complete" ? ledger.State == "completed" : null);
+                return StatusResult(ledger, source, completed: operation == "complete" ? ledger.State == "completed" : null,
+                    lessonHint: operation == "complete" ? await LessonHintAsync(ledger) : null);
             }
             ledger.ControlIntent = new ReviewControlIntent
             {
@@ -186,7 +188,8 @@ internal sealed partial class ReviewWorkflow
             ReviewJson.Require(ledger.Controls.Any(c => c.MessageId == response.MessageId), "Control was not accepted by authoritative history.");
             ledger.ControlIntent = null;
             await PersistAsync(store, ledger);
-            return StatusResult(ledger, source, completed: operation == "complete" ? true : null);
+            return StatusResult(ledger, source, completed: operation == "complete" ? true : null,
+                lessonHint: operation == "complete" ? await LessonHintAsync(ledger) : null);
         }
     }
     private async Task<object> SyncReceiptsAsync(ReviewLedger ledger, ReviewSourceSnapshot? source, string[]? ackIds, CancellationToken ct)

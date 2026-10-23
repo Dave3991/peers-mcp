@@ -209,6 +209,40 @@ public sealed class ReviewWorkflowTests
         Assert.Equal(prepared["lesson_id"]!.GetValue<string>(), recovered["lesson_id"]!.GetValue<string>());
         Assert.Equal(prepared["body"]!.GetValue<string>(), recovered["body"]!.GetValue<string>());
     }
+
+    [Fact]
+    public async Task Completion_after_a_CHANGES_round_hints_at_an_optional_lesson_and_saves_nothing()
+    {
+        await using var f = await ReviewFixture.CreateAsync();
+        var p = (await f.PublishPlan())["packet_id"]!.GetValue<string>(); await f.Reply(p, "APPROVE");
+        var c1 = (await f.PublishCode(1, p))["packet_id"]!.GetValue<string>(); await f.Reply(c1, "CHANGES");
+        var changes = (await f.Status())["verdict"]!["message_id"]!.GetValue<string>();
+        var c2 = (await f.PublishCode(2, c1))["packet_id"]!.GetValue<string>(); await f.Reply(c2, "APPROVE");
+        var completed = await f.Complete(c2);
+        Assert.True(completed["completed"]!.GetValue<bool>());
+        var hint = completed["lesson_hint"]!;
+        var before = Assert.Single(hint["before"]!.AsArray())!;
+        Assert.Equal(c1, before["packet_id"]!.GetValue<string>());
+        Assert.Equal(changes, before["verdict_message_id"]!.GetValue<string>());
+        Assert.Equal("1. HIGH verification: Missing coverage Fix: Run intended checks", Assert.Single(before["findings"]!.AsArray())!.GetValue<string>());
+        Assert.Equal(c2, hint["after"]!.GetValue<string>());
+        Assert.Equal("Optional: run review_lesson prepare with a cue and lesson based on these findings; nothing is saved automatically.", hint["next_action"]!.GetValue<string>());
+        // Read-only: no lesson intent exists to save, and a repeated completion reports the same hint.
+        Assert.Contains("Prepare a supported lesson", await f.Driver.Error("review_lesson", new { action = "begin_save", channel_id = f.ChannelId,
+            binding_result = new { workspaceBindingId = "wb_" + new string('1', 32), identityConfidence = "low", bindingStatus = "observed" } }));
+        Assert.True(JsonNode.DeepEquals(hint, (await f.Complete(c2))["lesson_hint"]));
+    }
+
+    [Fact]
+    public async Task First_round_approval_completes_without_a_lesson_hint()
+    {
+        await using var f = await ReviewFixture.CreateAsync();
+        var p = (await f.PublishPlan())["packet_id"]!.GetValue<string>(); await f.Reply(p, "APPROVE");
+        var c = (await f.PublishCode(1, p))["packet_id"]!.GetValue<string>(); await f.Reply(c, "APPROVE");
+        var completed = await f.Complete(c);
+        Assert.True(completed["completed"]!.GetValue<bool>());
+        Assert.Null(completed["lesson_hint"]);
+    }
 }
 
 internal sealed class ReviewFixture : IAsyncDisposable
@@ -295,9 +329,10 @@ internal sealed class ReviewTestPeer : IAsyncDisposable
         var result = await _client.CallToolAsync(name, Args(value)); var text = string.Join("\n", result.Content.OfType<TextContentBlock>().Select(x => x.Text));
         Assert.False(result.IsError is true, text); return JsonNode.Parse(text)!;
     }
-    internal async Task Error(string name, object value)
+    internal async Task<string> Error(string name, object value)
     {
-        var result = await _client.CallToolAsync(name, Args(value)); Assert.True(result.IsError is true, string.Join("\n", result.Content.OfType<TextContentBlock>().Select(x => x.Text)));
+        var result = await _client.CallToolAsync(name, Args(value)); var text = string.Join("\n", result.Content.OfType<TextContentBlock>().Select(x => x.Text));
+        Assert.True(result.IsError is true, text); return text;
     }
     private bool _disposed;
     public async ValueTask DisposeAsync()

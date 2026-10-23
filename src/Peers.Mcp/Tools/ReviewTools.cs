@@ -44,7 +44,7 @@ internal sealed class ReviewTools
     }
 
     [McpServerTool(Name = "review_checkpoint"), Description(
-        "Restore managed review state from authoritative channel history, inspect source revision, sync explicitly handled receipts, pause/resume (including explicit offline-driver adoption), or gate terminal CODE completion. A blocked gate returns completed:false; input/lock/broker faults are tool errors.")]
+        "Restore managed review state from authoritative channel history, inspect source revision, sync explicitly handled receipts, pause/resume (including explicit offline-driver adoption), or gate terminal CODE completion. A blocked gate returns completed:false; input/lock/broker faults are tool errors. Completion after CHANGES rounds adds a non-authoritative lesson_hint that saves nothing.")]
     public static async Task<string> Checkpoint(BrokerClient client, SessionState state, McpServer server,
         ILoggerFactory loggerFactory, ReviewStorageOptions storage, string action, string channel_id,
         string? source_root = null, string? expected_packet_id = null, string[]? ack_inbox_ids = null,

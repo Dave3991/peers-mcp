@@ -77,13 +77,18 @@ cursor; deleting history never resets sequence numbers.
 Mention peers with `to` (peer IDs or ID prefixes): a mention lands in the recipient's durable inbox,
 so `wait` returns as soon as it arrives.
 
+`send`, `read`, `channel_clear`, and `messages_remove` take exactly one of `channel` (name) or
+`channel_id`. A name resolves in this session's repository first, then the global scope — never an
+unrelated repository. A `channel_id` (from `channels`, `channel_create`, a message, or an inbox item)
+reaches a channel scoped to any repository, e.g. a reviewer in one repo answering a driver's channel
+scoped to another worktree.
+
 ### Clear history or remove selected messages
 
 `channel_clear(channel)` permanently removes all messages while keeping the channel usable.
 `messages_remove(channel, message_ids)` removes 1..200 selected message IDs returned by `send` or
 `read`. Both return `{ channel_id, deleted_messages }`; duplicate, missing, or other-channel IDs are
-ignored, and repeating a completed removal returns zero. MCP channel names resolve in this session's
-repository first, then the global scope — never an unrelated repository.
+ignored, and repeating a completed removal returns zero.
 
 Removal affects every session, not just your view. Message rows, original event payloads, and inbox
 receipts are deleted atomically, so withdrawn mentions stop being delivered by `wait`. Already-returned
@@ -168,10 +173,10 @@ by `wait` until you echo their ids back as `ack_inbox_ids`.
 | `presence` | Update this session's role, summary, capabilities, focus paths, and progress on long-running work |
 | `channels` | List channels and their repo scope + message counts |
 | `channel_create` | Create a channel (`name`, optional `repo_root`; names unique per scope) |
-| `channel_clear` | Permanently clear a channel's history and pending deliveries; keep the channel |
-| `messages_remove` | Permanently remove selected `message_ids` from a channel (1..200) |
-| `send` | Post to a channel: `content`, optional `to` mentions, optional `quiet` whisper |
-| `read` | Read a channel from `since_seq`; whispers addressed to others are filtered out |
+| `channel_clear` | Permanently clear a channel's history and pending deliveries; keep the channel (`channel` or `channel_id`) |
+| `messages_remove` | Permanently remove selected `message_ids` from a channel (1..200; `channel` or `channel_id`) |
+| `send` | Post to a channel (`channel` name or `channel_id`): `content`, optional `to` mentions, optional `quiet` whisper |
+| `read` | Read a channel (`channel` name or `channel_id`) from `since_seq`; whispers addressed to others are filtered out |
 | `wait` | Long-poll for directed messages (default 25s, max 120s); echo `ack_inbox_ids` to acknowledge receipts |
 | `claim` | Announce the paths this session is editing; reports any live peer already holding them |
 | `claims` | The whole claim map for this repository, with holders |
@@ -231,6 +236,9 @@ Explicit driver adoption requires the former driver to be offline and preserves 
 The selected reviewer cannot adopt the driver role. Loud control records do not depend on a historical reviewer remaining online.
 
 Lesson promotion is explicit and optional after intact terminal completion.
+When the completed lineage had CHANGES rounds, the completion result carries a non-authoritative `lesson_hint`:
+`before` lists those packets with their verdict message IDs and finding lines, `after` names the approved packet.
+It reads channel history only; it saves nothing and changes no review state. First-round approvals get none.
 `scripts/omp-promote-lesson.mjs` uses the caller's existing native mounted tool bridge for Aletheia binding, search, save, and verification.
 One frozen lesson uses literal before/after quotes from retained evidence. Confounded or unsupported proposals produce no entry.
 A durable grant permits one helper dispatch. Ambiguous responses require marker reconciliation rather than another save.

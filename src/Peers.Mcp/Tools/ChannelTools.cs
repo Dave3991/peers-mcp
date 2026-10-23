@@ -126,7 +126,7 @@ public sealed class ChannelTools
     }
 
     [McpServerTool(Name = "send"), Description(
-        "Post one message to a channel (resolved by name). Mentions go in `to` as peer IDs or prefixes.\n" +
+        "Post one message to a channel, addressed by `channel` (name) or `channel_id` — exactly one. A name resolves in this session's repo, then the global scope; `channel_id` reaches a channel scoped to any repo. Mentions go in `to` as peer IDs or prefixes.\n" +
         "Loud (default): visible to everyone reading the channel; subscribers get a push hint.\n" +
         "quiet=true: a whisper — delivered to the mentioned peers only; nobody else ever sees it in reads or notifications. Quiet requires at least one mention.\n" +
         "Returns: { message_id, seq, mentions, delivery:{online,offline,unresolved} } — delivery tells you whether each mention reached a live session.")]
@@ -135,8 +135,9 @@ public sealed class ChannelTools
         SessionState state,
         McpServer server,
         ILoggerFactory loggerFactory,
-        [Description("Channel name")] string channel,
         [Description("Markdown content to post")] string content,
+        [Description(ChannelNameDescription)] string? channel = null,
+        [Description(ChannelIdDescription)] string? channel_id = null,
         [Description("Peer IDs (or ID prefixes) to mention")] string[]? to = null,
         [Description("Deliver only to mentions; hide from all other readers")] bool quiet = false,
         [Description("Retry-safe key: a second send with this key in this channel returns the first message instead of posting twice")] string? idempotency_key = null,
@@ -145,12 +146,8 @@ public sealed class ChannelTools
         await SessionRegistration.EnsureRegisteredAsync(client, state, server, loggerFactory, cancellationToken);
         try
         {
-            var ch = await ResolveChannelAsync(client, channel, state.RepoRoot, cancellationToken)
-                     ?? await ResolveChannelAsync(client, channel, null, cancellationToken);
-            if (ch is null)
-                throw new McpException($"Channel '{channel}' not found.");
-
-            var resp = await client.SendMessageAsync(ch.ChannelId, new SendMessageRequest
+            var id = await ChannelIdAsync(client, state, channel, channel_id, cancellationToken);
+            var resp = await client.SendMessageAsync(id, new SendMessageRequest
             {
                 AuthorPeerId = state.PeerId!,
                 Content = content,
@@ -164,14 +161,15 @@ public sealed class ChannelTools
     }
 
     [McpServerTool(Name = "read"), Description(
-        "Read a channel's messages (by name), oldest first. Whispers addressed to others are filtered out of your view automatically; you see your own quiet messages and those mentioning you.\n" +
+        "Read a channel's messages, oldest first, addressed by `channel` (name) or `channel_id` — exactly one. Whispers addressed to others are filtered out of your view automatically; you see your own quiet messages and those mentioning you.\n" +
         "since_seq pages forward from a previous read's last seq; truncated=true means call again with since_seq set.")]
     public static async Task<string> Read(
         BrokerClient client,
         SessionState state,
         McpServer server,
         ILoggerFactory loggerFactory,
-        [Description("Channel name")] string channel,
+        [Description(ChannelNameDescription)] string? channel = null,
+        [Description(ChannelIdDescription)] string? channel_id = null,
         [Description("Only messages after this seq (from a previous read)")] long? since_seq = null,
         [Description("Max messages per call (default 200)")] int? limit = null,
         CancellationToken cancellationToken = default)
@@ -179,44 +177,37 @@ public sealed class ChannelTools
         await SessionRegistration.EnsureRegisteredAsync(client, state, server, loggerFactory, cancellationToken);
         try
         {
-            var ch = await ResolveChannelAsync(client, channel, state.RepoRoot, cancellationToken)
-                     ?? await ResolveChannelAsync(client, channel, null, cancellationToken);
-            if (ch is null)
-                throw new McpException($"Channel '{channel}' not found.");
-
-            var resp = await client.ReadChannelMessagesAsync(ch.ChannelId, viewer: state.PeerId, since_seq ?? 0, limit ?? 200);
+            var id = await ChannelIdAsync(client, state, channel, channel_id, cancellationToken);
+            var resp = await client.ReadChannelMessagesAsync(id, viewer: state.PeerId, since_seq ?? 0, limit ?? 200);
             return JsonSerializer.Serialize(resp, JsonOpts);
         }
         catch (BrokerApiException ex) { throw BrokerError(ex); }
     }
 
     [McpServerTool(Name = "channel_clear"), Description(
-        "Permanently clear a channel's messages for every session, including pending inbox deliveries.\n" +
+        "Permanently clear a channel's messages for every session, including pending inbox deliveries. Address it by `channel` (name) or `channel_id` — exactly one.\n" +
         "The channel remains usable and sequence numbers are not reset. Returns: { channel_id, deleted_messages }.")]
     public static async Task<string> ChannelClear(
         BrokerClient client,
         SessionState state,
         McpServer server,
         ILoggerFactory loggerFactory,
-        [Description("Channel name to clear")] string channel,
+        [Description(ChannelNameDescription)] string? channel = null,
+        [Description(ChannelIdDescription)] string? channel_id = null,
         CancellationToken cancellationToken = default)
     {
         await SessionRegistration.EnsureRegisteredAsync(client, state, server, loggerFactory, cancellationToken);
         try
         {
-            var ch = await ResolveChannelAsync(client, channel, state.RepoRoot, cancellationToken)
-                     ?? await ResolveChannelAsync(client, channel, null, cancellationToken);
-            if (ch is null)
-                throw new McpException($"Channel '{channel}' not found.");
-
-            var resp = await client.ClearChannelAsync(ch.ChannelId, cancellationToken);
+            var id = await ChannelIdAsync(client, state, channel, channel_id, cancellationToken);
+            var resp = await client.ClearChannelAsync(id, cancellationToken);
             return JsonSerializer.Serialize(resp, JsonOpts);
         }
         catch (BrokerApiException ex) { throw BrokerError(ex); }
     }
 
     [McpServerTool(Name = "messages_remove"), Description(
-        "Permanently remove selected messages from a channel for every session, including pending inbox deliveries.\n" +
+        "Permanently remove selected messages from a channel for every session, including pending inbox deliveries. Address it by `channel` (name) or `channel_id` — exactly one.\n" +
         "Provide 1..200 message IDs from read/send. Missing IDs are ignored; sequence numbers are not reset.\n" +
         "Returns: { channel_id, deleted_messages } — repeated removal returns zero.")]
     public static async Task<string> MessagesRemove(
@@ -224,19 +215,16 @@ public sealed class ChannelTools
         SessionState state,
         McpServer server,
         ILoggerFactory loggerFactory,
-        [Description("Channel name")] string channel,
         [Description("Message IDs to remove (1..200)")] string[] message_ids,
+        [Description(ChannelNameDescription)] string? channel = null,
+        [Description(ChannelIdDescription)] string? channel_id = null,
         CancellationToken cancellationToken = default)
     {
         await SessionRegistration.EnsureRegisteredAsync(client, state, server, loggerFactory, cancellationToken);
         try
         {
-            var ch = await ResolveChannelAsync(client, channel, state.RepoRoot, cancellationToken)
-                     ?? await ResolveChannelAsync(client, channel, null, cancellationToken);
-            if (ch is null)
-                throw new McpException($"Channel '{channel}' not found.");
-
-            var resp = await client.RemoveMessagesAsync(ch.ChannelId,
+            var id = await ChannelIdAsync(client, state, channel, channel_id, cancellationToken);
+            var resp = await client.RemoveMessagesAsync(id,
                 new RemoveMessagesRequest { MessageIds = message_ids }, cancellationToken);
             return JsonSerializer.Serialize(resp, JsonOpts);
         }
@@ -377,6 +365,29 @@ public sealed class ChannelTools
         var node = System.Text.Json.Nodes.JsonNode.Parse(shape.Json)!.AsObject();
         node["timed_out"] = timedOut.Value;
         return node.ToJsonString();
+    }
+
+    private const string ChannelNameDescription =
+        "Channel name, resolved in this session's repo, then the global scope. Pass this or channel_id, not both";
+    private const string ChannelIdDescription =
+        "Channel ID (from channels, channel_create, a message, or an inbox item); reaches a channel scoped to any repo. Pass this or channel, not both";
+
+    /// <summary>
+    /// The broker routes are keyed by id, so an id goes straight through — an unknown one is the
+    /// broker's NotFound. A name stays scoped: this session's repo first, then global, never an
+    /// unrelated repo; addressing another repo's channel takes its explicit id.
+    /// </summary>
+    private static async Task<string> ChannelIdAsync(
+        BrokerClient client, SessionState state, string? channel, string? channelId, CancellationToken ct)
+    {
+        var byName = !string.IsNullOrWhiteSpace(channel);
+        if (byName == !string.IsNullOrWhiteSpace(channelId))
+            throw new McpException("Pass exactly one of `channel` (name) or `channel_id`.");
+        if (!byName) return channelId!;
+
+        var ch = await ResolveChannelAsync(client, channel!, state.RepoRoot, ct)
+                 ?? await ResolveChannelAsync(client, channel!, null, ct);
+        return ch?.ChannelId ?? throw new McpException($"Channel '{channel}' not found.");
     }
 
     private static async Task<ChannelSummary?> ResolveChannelAsync(
