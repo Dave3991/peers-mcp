@@ -119,6 +119,59 @@ public sealed class ReviewSnapshotTests
         Assert.Contains($"limit of {ReviewSnapshot.MaxUntrackedTotalBytes} bytes (4 MiB) for all untracked files together", error.Message);
     }
 
+    // Secrets must never reach the broker database, and skipping one would leave the packet silently
+    // incomplete, so a secret-looking name fails the whole capture. The file is unreadable here: the
+    // name check has to fire before any read is attempted.
+    [Theory]
+    [InlineData(".env", ".env")]
+    [InlineData("config/.env.local", ".env.*")]
+    [InlineData("cert.pem", "*.pem")]
+    [InlineData("server.key", "*.key")]
+    [InlineData("store.p12", "*.p12")]
+    [InlineData("store.PFX", "*.pfx")]
+    [InlineData("id_rsa", "id_rsa*")]
+    [InlineData("id_ed25519.pub", "id_ed25519*")]
+    public async Task Rejects_an_untracked_file_with_a_secret_name_before_reading_it(string path, string rule)
+    {
+        using var fixture = new ReviewGitFixture();
+        await fixture.InitializeAsync();
+        var absolute = Path.Combine(fixture.Root, path);
+        Directory.CreateDirectory(Path.GetDirectoryName(absolute)!);
+        await File.WriteAllTextAsync(absolute, "TOKEN=not-for-review\n");
+        if (!OperatingSystem.IsWindows()) File.SetUnixFileMode(absolute, UnixFileMode.None);
+        var error = await Assert.ThrowsAsync<McpException>(() => ReviewSnapshot.CaptureAsync(fixture.Root, "HEAD"));
+        Assert.Contains($"Untracked file '{path}' matches the secret name rule '{rule}'", error.Message);
+        Assert.Contains("exclude it (.gitignore or .git/info/exclude)", error.Message);
+    }
+
+    // Env templates hold placeholder values, so they stay part of the reviewed source.
+    [Theory]
+    [InlineData(".env.example")]
+    [InlineData(".env.sample")]
+    [InlineData(".env.production.template")]
+    public async Task Captures_env_template_files(string path)
+    {
+        using var fixture = new ReviewGitFixture();
+        await fixture.InitializeAsync();
+        await File.WriteAllTextAsync(Path.Combine(fixture.Root, path), "TOKEN=\n");
+        Assert.Equal(path, Assert.Single((await ReviewSnapshot.CaptureAsync(fixture.Root, "HEAD")).Untracked).Path);
+    }
+
+    // An innocent name does not make private key material capturable: the content check runs on the
+    // bytes read (at most 1 MiB, after the size check).
+    [Fact]
+    public async Task Rejects_an_untracked_file_containing_private_key_material()
+    {
+        using var fixture = new ReviewGitFixture();
+        await fixture.InitializeAsync();
+        // Split so a secret scanner does not flag this test source.
+        var pem = "-----BEGIN OPENSSH " + "PRIVATE KEY-----\nAAAAfixture\n-----END OPENSSH " + "PRIVATE KEY-----\n";
+        await File.WriteAllTextAsync(Path.Combine(fixture.Root, "notes.txt"), "deploy notes\n" + pem);
+        var error = await Assert.ThrowsAsync<McpException>(() => ReviewSnapshot.CaptureAsync(fixture.Root, "HEAD"));
+        Assert.Contains("Untracked file 'notes.txt' contains 'PRIVATE KEY-----'", error.Message);
+        Assert.Contains("exclude it (.gitignore or .git/info/exclude)", error.Message);
+    }
+
     [Fact]
     public async Task Store_rejects_digest_generation_and_symlink_conflicts_with_private_modes()
     {

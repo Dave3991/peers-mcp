@@ -180,9 +180,9 @@ public sealed class ReviewWorkflowTests
         Assert.Equal("approved", (await f.Driver.Call("review_checkpoint", new { action = "resume", channel_id = f.ChannelId }))["state"]!.GetValue<string>());
     }
 
-    // Sync counts as handled only the review records that reduction applied. A plain question in the
-    // review channel appears in no review result, so it must stay an unrelated receipt the agent reads,
-    // never one it acknowledges unseen.
+    // Sync counts as handled only the messages the review ledger holds. A plain question in the review
+    // channel appears in no review result, so it must stay an unrelated receipt the agent reads, never
+    // one it acknowledges unseen.
     [Fact]
     public async Task Sync_keeps_a_plain_question_in_the_review_channel_out_of_ready_to_ack()
     {
@@ -201,6 +201,94 @@ public sealed class ReviewWorkflowTests
         Assert.DoesNotContain(questionReceipt, ready);
         Assert.Contains(questionReceipt, unrelated);
         Assert.Contains(await f.ReceiptOf(sync["verdict"]!["message_id"]!.GetValue<string>()), ready);
+    }
+
+    // A well-formed record the reducer rejected is no more visible than chat: here the selected reviewer
+    // sends a late verdict for PLAN/1 after CODE/1 is out. It parses as PEERS_REVIEW_V1, but the ledger
+    // never holds it, so sync must leave it for the agent to read.
+    [Fact]
+    public async Task Sync_keeps_a_rejected_late_verdict_for_an_older_round_out_of_ready_to_ack()
+    {
+        await using var f = await ReviewFixture.CreateAsync();
+        var plan = await f.PublishPlan(); var p = plan["packet_id"]!.GetValue<string>(); await f.Reply(p, "APPROVE");
+        var planVerdict = (await f.Status())["verdict"]!["message_id"]!.GetValue<string>();
+        await f.PublishCode(1, p);
+        var late = await f.Broker.SendMessageAsync(f.ChannelId, new SendMessageRequest { AuthorPeerId = f.Reviewer.Id, To = [f.Driver.Id],
+            Content = $"PEERS_REVIEW_V1\n{{\"kind\":\"verdict\",\"phase\":\"PLAN\",\"round\":1,\"packet_id\":\"{p}\",\"packet_sha256\":\"{plan["packet_sha256"]!.GetValue<string>()}\"}}\nLate second look at PLAN/1\nVERDICT: CHANGES" });
+
+        var sync = await f.Status("sync");
+        Assert.Equal("awaiting_review", sync["state"]!.GetValue<string>()); // Rejected: it changed nothing.
+        Assert.True(sync["applied_through_seq"]!.GetValue<long>() >= late!.Seq);
+        var ready = sync["ready_to_ack"]!.AsArray().Select(x => x!.GetValue<string>()).ToArray();
+        var unrelated = sync["unrelated_receipts"]!.AsArray().Select(x => x!["inbox_id"]!.GetValue<string>()).ToArray();
+        var lateReceipt = await f.ReceiptOf(late.MessageId);
+        Assert.DoesNotContain(lateReceipt, ready);
+        Assert.Contains(lateReceipt, unrelated);
+        Assert.Contains(await f.ReceiptOf(planVerdict), ready);
+    }
+
+    // Agents type severity and verdict in any case. Both match case-insensitively and are stored in their
+    // canonical spelling, so the record still reduces and the lesson hint still parses the finding line.
+    [Fact]
+    public async Task Reply_accepts_lowercase_severity_and_verdict_and_stores_them_canonically()
+    {
+        await using var f = await ReviewFixture.CreateAsync();
+        var p = (await f.PublishPlan())["packet_id"]!.GetValue<string>();
+        await f.Reviewer.Call("review_packet", new { action = "reply", channel_id = f.ChannelId, packet_id = p,
+            reply = new { verdict = "changes", summary = "The plan names no test", findings = new[] { new { severity = "high", location = "plan.md", finding = "No test named", fix = "Name the test", optional = false } } } });
+        var status = await f.Status();
+        Assert.Equal("changes_requested", status["state"]!.GetValue<string>());
+        var stored = Assert.Single((await f.Broker.ReadChannelMessagesAsync(f.ChannelId, f.Driver.Id))!.Messages,
+            m => m.MessageId == status["verdict"]!["message_id"]!.GetValue<string>());
+        Assert.Contains("\n1. HIGH plan.md: No test named Fix: Name the test\n", stored.Content);
+        Assert.EndsWith("\nVERDICT: CHANGES", stored.Content);
+    }
+
+    // Observed in a replay of real agents: 59 of 68 replies were rejected with a bare "Invalid review
+    // finding". An error must name the field, the value it got, and every allowed value.
+    [Fact]
+    public async Task Reply_errors_name_the_field_the_value_and_the_allowed_values()
+    {
+        await using var f = await ReviewFixture.CreateAsync();
+        var p = (await f.PublishPlan())["packet_id"]!.GetValue<string>();
+        var finding = new { severity = "HIGH", location = "plan.md", finding = "No test named", fix = "Name the test", optional = false };
+        var verdict = await f.Reviewer.Error("review_packet", new { action = "reply", channel_id = f.ChannelId, packet_id = p,
+            reply = new { verdict = "REQUEST_CHANGES", summary = "The plan names no test", findings = new[] { finding } } });
+        Assert.Contains("reply.verdict is \"REQUEST_CHANGES\"; allowed values: APPROVE, CHANGES (case-insensitive).", verdict);
+        var severity = await f.Reviewer.Error("review_packet", new { action = "reply", channel_id = f.ChannelId, packet_id = p,
+            reply = new { verdict = "CHANGES", summary = "The plan names no test", findings = new[] { finding with { severity = "CRITICAL" } } } });
+        Assert.Contains("reply.findings[0].severity is \"CRITICAL\"; allowed values: HIGH, MED, LOW (case-insensitive).", severity);
+        Assert.Single((await f.Broker.ReadChannelMessagesAsync(f.ChannelId, f.Driver.Id))!.Messages); // Only the PLAN request.
+    }
+
+    [Fact]
+    public async Task Publish_error_for_a_wrong_evidence_kind_names_kind_and_its_allowed_values()
+    {
+        await using var f = await ReviewFixture.CreateAsync();
+        var error = await f.Driver.Error("review_packet", new { action = "publish", channel_id = f.ChannelId, request = new
+        {
+            phase = "CODE", round = 1, task = f.TaskText, base_sha = f.Base, reviewer_peer_id = f.Reviewer.Id, change_summary = "code",
+            uncertainties = "none", source_root = f.Root, verification_revision = "revision",
+            evidence = new[] { new { path = f.LogPath, kind = "unit", command = "dotnet test", cwd = f.Root, exit_code = 0 } },
+        } });
+        Assert.Contains("request.evidence[0].kind is \"unit\"; allowed values: build, test, smoke, other.", error);
+    }
+
+    // A missing field or a JSON value of the wrong type used to fail argument binding inside the SDK,
+    // which answered only "An error occurred invoking 'review_packet'." Both now name the field.
+    [Fact]
+    public async Task Missing_and_mistyped_reply_fields_are_named_instead_of_an_opaque_binding_error()
+    {
+        await using var f = await ReviewFixture.CreateAsync();
+        var p = (await f.PublishPlan())["packet_id"]!.GetValue<string>();
+        var missing = await f.Reviewer.Error("review_packet", new { action = "reply", channel_id = f.ChannelId, packet_id = p,
+            reply = new { verdict = "CHANGES", summary = "s", findings = new[] { new { severity = "HIGH", location = "x", finding = "y" } } } });
+        Assert.Contains("reply.findings[0].fix is missing or empty; it must be non-blank text.", missing);
+        var mistyped = await f.Reviewer.Error("review_packet", new { action = "reply", channel_id = f.ChannelId, packet_id = p,
+            reply = new { verdict = "CHANGES", summary = "s", findings = new[] { new { severity = "HIGH", location = "x", finding = "y", fix = "z", optional = "no" } } } });
+        Assert.Contains("reply.findings[0].optional is \"no\"; it must be true or false.", mistyped);
+        var topLevel = await f.Reviewer.Error("review_packet", new { action = "fetch", channel_id = f.ChannelId, packet_id = 5 });
+        Assert.Contains("packet_id is 5; it must be a string.", topLevel);
     }
 
     [Fact]

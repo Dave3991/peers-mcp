@@ -1,5 +1,8 @@
 using System.Reflection;
+using System.Text.Json;
+using System.Text.RegularExpressions;
 using Microsoft.Extensions.DependencyInjection;
+using ModelContextProtocol;
 using ModelContextProtocol.Protocol;
 using ModelContextProtocol.Server;
 using Peers.Mcp.Resources;
@@ -52,7 +55,7 @@ internal static class ServerOptionsFactory
                 Managed review:
                 - Use `review_packet` for immutable PLAN/CODE requests, complete evidence fetches, and independent reviewer replies. Approve PLAN before CODE; silence and raw chat never authorize completion.
                 - Use `review_checkpoint` to restore history, obtain the revision before native checks, sync handled receipts, explicitly adopt an offline driver, and complete the exact approved CODE packet. A stale latch requires a new CODE round; completed work stays historical after a commit.
-                - Managed sync acknowledges only this peer's prior durable handled IDs. ready_to_ack holds only review records the workflow already applied; every other message, including plain chat or a question in the review channel, is in unrelated_receipts. Read unrelated_receipts with ordinary tools (`read`, `wait`) and acknowledge them through `wait` before parking.
+                - Managed sync acknowledges only this peer's prior durable handled IDs. ready_to_ack holds only the requests, verdicts, and controls the review ledger accepted; every other message, including a record the workflow rejected (such as a late verdict for an older round), plain chat, or a question in the review channel, is in unrelated_receipts. Read unrelated_receipts with ordinary tools (`read`, `wait`) and acknowledge them through `wait` before parking.
                 - `review_lesson` freezes one explicitly requested supported lesson after intact completion. Use the existing mounted Aletheia tools through the promotion helper; no automatic learning or exactly-once storage guarantee.
 
                 Paths:
@@ -73,7 +76,7 @@ internal static class ServerOptionsFactory
         RegisterTools<ClaimTools>(options, services);
         RegisterTools<ArtifactTools>(options, services);
         RegisterTools<ContextTools>(options, services);
-        RegisterTools<ReviewTools>(options, services);
+        RegisterTools<ReviewTools>(options, services, nameBindingErrors: true);
 
         options.ResourceCollection =
         [
@@ -124,7 +127,7 @@ internal static class ServerOptionsFactory
         return options;
     }
 
-    private static void RegisterTools<TToolType>(McpServerOptions options, IServiceProvider services)
+    private static void RegisterTools<TToolType>(McpServerOptions options, IServiceProvider services, bool nameBindingErrors = false)
     {
         var toolCollection = options.ToolCollection ??= [];
         var toolMethods = typeof(TToolType)
@@ -136,10 +139,85 @@ internal static class ServerOptionsFactory
             if (!method.IsStatic)
                 throw new InvalidOperationException($"Tool method '{method.Name}' on '{typeof(TToolType).Name}' must be static.");
 
-            toolCollection.Add(McpServerTool.Create(method, target: null, new()
+            var tool = McpServerTool.Create(method, target: null, new()
             {
                 Services = services
-            }));
+            });
+            toolCollection.Add(nameBindingErrors ? new BindingErrorNamingTool(tool, method) : tool);
+        }
+    }
+
+    /// <summary>
+    /// An argument whose JSON cannot bind to the parameter type (a string where a boolean belongs) fails
+    /// inside the SDK before the tool runs, and the SDK answers any non-McpException with an opaque
+    /// "An error occurred invoking". The review tools translate their own JSON faults inside their
+    /// bodies, so a JsonException that escapes one of them is a binding failure: rethrow it as a tool
+    /// error that names the field, the value it got, and the JSON type it needs.
+    /// </summary>
+    private sealed class BindingErrorNamingTool(McpServerTool inner, MethodInfo method) : DelegatingMcpServerTool(inner)
+    {
+        public override async ValueTask<CallToolResult> InvokeAsync(RequestContext<CallToolRequestParams> request, CancellationToken cancellationToken = default)
+        {
+            try
+            {
+                return await base.InvokeAsync(request, cancellationToken);
+            }
+            catch (Exception ex) when (ex is JsonException || ex.InnerException is JsonException)
+            {
+                throw new McpException(Describe(request.Params?.Arguments) + " The tool's input schema lists each field's type and allowed values.", ex);
+            }
+        }
+
+        /// <summary>Re-binds each argument alone to find the one that failed; the serializer's path is relative to it.</summary>
+        private string Describe(IDictionary<string, JsonElement>? arguments)
+        {
+            foreach (var parameter in method.GetParameters())
+            {
+                if (parameter.Name is null || arguments is null || !arguments.TryGetValue(parameter.Name, out var value)) continue;
+                try { JsonSerializer.Deserialize(value, parameter.ParameterType, McpJsonUtilities.DefaultOptions); }
+                catch (JsonException json)
+                {
+                    var path = json.Path ?? "$";
+                    var got = At(value, path) is { } bad ? bad.GetRawText() : "a value of the wrong type";
+                    if (got.Length > 80) got = got[..80] + "…";
+                    return $"{parameter.Name}{path[1..]} is {got}; it must be {Expected(json.Message)}.";
+                }
+            }
+            return $"{ProtocolTool.Name} arguments do not match the tool's input schema.";
+        }
+
+        private static JsonElement? At(JsonElement root, string path)
+        {
+            var current = root;
+            foreach (Match step in Regex.Matches(path, @"\.(?<name>[^.\[]+)|\['(?<quoted>[^']*)'\]|\[(?<index>\d+)\]"))
+            {
+                if (step.Groups["index"].Success)
+                {
+                    var index = int.Parse(step.Groups["index"].Value, System.Globalization.CultureInfo.InvariantCulture);
+                    if (current.ValueKind != JsonValueKind.Array || index >= current.GetArrayLength()) return null;
+                    current = current[index];
+                }
+                else
+                {
+                    var name = step.Groups["name"].Success ? step.Groups["name"].Value : step.Groups["quoted"].Value;
+                    if (current.ValueKind != JsonValueKind.Object || !current.TryGetProperty(name, out current)) return null;
+                }
+            }
+            return current;
+        }
+
+        private static string Expected(string message)
+        {
+            var target = Regex.Match(message, @"converted to (?<type>\S+?)\.( Path|$)").Groups["type"].Value;
+            return target switch
+            {
+                "System.Boolean" => "true or false",
+                "System.String" => "a string",
+                _ when target.Contains("System.Int", StringComparison.Ordinal) => "an integer",
+                _ when target.EndsWith("[]", StringComparison.Ordinal) => "an array",
+                "" => "the type the schema gives",
+                _ => "an object",
+            };
         }
     }
 }

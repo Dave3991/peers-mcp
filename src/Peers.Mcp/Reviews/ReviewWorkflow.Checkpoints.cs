@@ -228,10 +228,11 @@ internal sealed partial class ReviewWorkflow
                         if (original is null || original.Seq != seq || original.MessageId != Field(payload, "message_id") ||
                             original.AuthorPeerId != Field(payload, "author_peer_id") || original.Content != Field(payload, "content"))
                         { IntegrityFailure(ledger, "withdrawn"); }
-                        // Only a review record is handled by reduction. Any other message here — a question
-                        // from the reviewer or a person — is shown by no review result, so it stays an
-                        // unrelated receipt that the agent must read, not one it acknowledges unseen.
-                        else handled = seq <= ledger.AppliedThroughSeq && ParseRecord(original) is not null;
+                        // Handled means the ledger holds this exact message: an accepted request, verdict, or
+                        // control. Anything else here — a question from the reviewer or a person, or a record
+                        // the reducer rejected, such as a late verdict for an older round — appears in no
+                        // review result, so it stays an unrelated receipt that the agent must read.
+                        else handled = Holds(ledger, original.MessageId);
                     }
                     else if (item.Event.Type is EventTypes.ChannelMessageRemoved or EventTypes.ChannelCleared)
                     { await RecheckAsync(ledger, artifacts: false, ct); handled = true; }
@@ -246,4 +247,7 @@ internal sealed partial class ReviewWorkflow
             return StatusResult(ledger, source, unrelated.ToArray(), ready.ToArray(), acknowledged.ToArray());
         }
     }
+    private static bool Holds(ReviewLedger ledger, string messageId) =>
+        ledger.Packets.Any(p => p.Request?.MessageId == messageId || p.Verdict?.MessageId == messageId) ||
+        ledger.Controls.Any(c => c.MessageId == messageId);
 }

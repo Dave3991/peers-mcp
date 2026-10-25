@@ -1,4 +1,5 @@
 using System.ComponentModel;
+using System.ComponentModel.DataAnnotations;
 using System.Text.Json;
 using Microsoft.Extensions.Logging;
 using ModelContextProtocol;
@@ -12,20 +13,21 @@ namespace Peers.Mcp.Tools;
 internal sealed class ReviewTools
 {
     [McpServerTool(Name = "review_packet"), Description(
-        "Managed independent review: publish a complete immutable PLAN/CODE packet, fetch its verified private evidence files, or reply as its exact selected reviewer. PLAN approval precedes CODE. Fetch never approves; evidence claims are not executed. Non-ignored untracked files are captured up to 1 MiB each and 4 MiB in total; a larger one fails the capture and names the file.")]
+        "Managed independent review: publish a complete immutable PLAN/CODE packet, fetch its verified private evidence files, or reply as its exact selected reviewer. PLAN approval precedes CODE. Fetch never approves; evidence claims are not executed. Non-ignored untracked files are captured up to 1 MiB each and 4 MiB in total; a larger one fails the capture and names the file. So does an untracked file that looks like a secret: .env or .env.* (not *.example/*.sample/*.template), *.pem, *.key, *.p12, *.pfx, id_rsa*, id_ed25519*, or content containing 'PRIVATE KEY-----'.")]
     public static async Task<string> Packet(BrokerClient client, SessionState state, McpServer server,
         ILoggerFactory loggerFactory, ReviewStorageOptions storage,
-        string action, string channel_id, string? packet_id = null, ReviewRequest? request = null,
-        ReviewReply? reply = null, CancellationToken cancellationToken = default)
+        [Description("publish (driver: needs request), fetch (needs packet_id), or reply (selected reviewer: needs packet_id and reply). Exact, lowercase."), AllowedValues("publish", "fetch", "reply")] string action,
+        [Description("The review channel's channel_id.")] string channel_id,
+        [Description("fetch/reply: the packet_id to fetch or answer; reply answers only the latest packet.")] string? packet_id = null,
+        [Description("publish only: the PLAN or CODE request. evidence[].kind is build, test, smoke, or other.")] ReviewRequest? request = null,
+        [Description("reply only: verdict APPROVE or CHANGES and findings whose severity is HIGH, MED, or LOW (both case-insensitive).")] ReviewReply? reply = null,
+        CancellationToken cancellationToken = default)
     {
-        ReviewJson.Require(!string.IsNullOrWhiteSpace(channel_id), "channel_id is required.");
-        ReviewJson.Require(action switch
-        {
-            "publish" => request is not null && packet_id is null && reply is null,
-            "fetch" => packet_id is not null && request is null && reply is null,
-            "reply" => packet_id is not null && request is null && reply is not null,
-            _ => false,
-        }, "Invalid review_packet action or contradictory payloads.");
+        ReviewJson.RequireText("channel_id", channel_id);
+        ReviewJson.RequireOneOf("action", action, PacketActions);
+        RequirePayload(action, "request", request is not null, required: action == "publish");
+        RequirePayload(action, "packet_id", packet_id is not null, required: action is "fetch" or "reply");
+        RequirePayload(action, "reply", reply is not null, required: action == "reply");
         await SessionRegistration.EnsureRegisteredAsync(client, state, server, loggerFactory, cancellationToken);
         try
         {
@@ -42,6 +44,12 @@ internal sealed class ReviewTools
         catch (JsonException ex) { throw new McpException("Invalid review evidence JSON.", ex); }
         catch (IOException ex) { throw new McpException("Review filesystem operation failed: " + ex.Message, ex); }
     }
+
+    private static readonly string[] PacketActions = ["publish", "fetch", "reply"];
+    private static void RequirePayload(string action, string field, bool present, bool required) =>
+        ReviewJson.Require(present == required, required
+            ? $"{field} is missing; action \"{action}\" requires it."
+            : $"{field} must be omitted for action \"{action}\".");
 
     [McpServerTool(Name = "review_checkpoint"), Description(
         "Restore managed review state from authoritative channel history, inspect source revision, sync explicitly handled receipts, pause/resume (including explicit offline-driver adoption), or gate terminal CODE completion. A blocked gate returns completed:false; input/lock/broker faults are tool errors. Completion after CHANGES rounds adds a non-authoritative lesson_hint that saves nothing.")]

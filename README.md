@@ -230,6 +230,13 @@ Publish PLAN/1 with the full task text and an explicit regular plan file.
 After independent PLAN approval, obtain a revision from `review_checkpoint/status` before native verification.
 Publish CODE with that revision and ordered metadata for the exact raw build/test/smoke outputs.
 CODE requires test or smoke evidence. Peers records driver claims and never runs those commands.
+Evidence `kind` is `build`, `test`, `smoke`, or `other` (exact, lowercase).
+
+The reviewer replies with verdict `APPROVE` or `CHANGES` and findings whose severity is `HIGH`, `MED`, or `LOW`.
+Verdict and severity match case-insensitively and are stored in that canonical spelling; there are no synonyms such as `REQUEST_CHANGES`.
+`APPROVE` allows only optional findings; `CHANGES` needs at least one blocking finding (`optional: false`).
+The `review_packet` schema lists these allowed values as enums.
+A rejected call names the field (for example `reply.findings[0].severity`), the value it got, and the allowed values.
 
 The reviewer fetches the exact immutable packet ID and reads the complete materialized payloads.
 Packets include the full tracked binary diff, non-ignored untracked bytes or symlink target text, and supplied evidence.
@@ -241,6 +248,10 @@ Untracked capture is limited to 1 MiB (1,048,576 bytes) per file and 4 MiB (4,19
 The broker keeps every captured byte and has no artifact pruning, and every `review_checkpoint` call reads these files again.
 A larger untracked file fails capture in `review_packet/publish` and `review_checkpoint` with an error that names the file and the limit. Remove it or exclude it with `.gitignore` or `.git/info/exclude`.
 The tracked diff and the evidence files are not subject to these limits.
+Capture also refuses an untracked file that looks like a secret; it fails, and never silently skips the file.
+Before reading, it checks the file name: `.env`, `.env.*` (except names ending in `.example`, `.sample`, or `.template`), `*.pem`, `*.key`, `*.p12`, `*.pfx`, `id_rsa*`, and `id_ed25519*`.
+After reading, it checks the content of each file (at most 1 MiB) for `PRIVATE KEY-----`.
+The error names the file. Add the file to `.gitignore` or `.git/info/exclude`, or remove it.
 
 Round numbers increase within each phase without a fixed limit. A replacement reviewer must approve a new PLAN before CODE.
 Before completion, observed CODE source drift latches `stale`, even after source restoration.
@@ -250,8 +261,9 @@ Status reports `source_changed_since_completion` and evidence integrity without 
 
 Channel history authorizes decisions independently of inbox delivery or acknowledgement.
 `review_checkpoint/sync` returns durable `ready_to_ack` IDs and unrelated receipt IDs/types.
-`ready_to_ack` holds only `PEERS_REVIEW_V1` records that the workflow has already applied (and review artifact or deletion notices).
-Any other message in the review channel, such as a question from the reviewer or a person, is an unrelated receipt: read it with `read` or `wait` before you acknowledge it through `wait`.
+`ready_to_ack` holds only the requests, verdicts, and controls that the review ledger accepted, plus review artifact and deletion notices.
+Every other message in the review channel is an unrelated receipt: a question from the reviewer or a person, and also a `PEERS_REVIEW_V1` record that the workflow rejected, such as a late verdict for an older round.
+Read an unrelated receipt with `read` or `wait` before you acknowledge it through `wait`.
 Only prior handled IDs from the same peer can enter its next managed acknowledgement call.
 Ordinary tools and `wait` retain their existing receipt semantics.
 Explicit driver adoption requires the former driver to be offline and preserves the original lineage.

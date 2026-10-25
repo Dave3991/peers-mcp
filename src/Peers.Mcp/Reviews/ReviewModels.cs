@@ -1,3 +1,5 @@
+using System.ComponentModel;
+using System.ComponentModel.DataAnnotations;
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
@@ -25,44 +27,87 @@ internal static class ReviewJson
     {
         if (!condition) throw new McpException(message);
     }
+
+    // Input validation names the field, the value it got, and what it accepts: an agent can only fix a
+    // call whose error says which value to change. A bare "Invalid review finding" made agents guess.
+    private static readonly JsonSerializerOptions ShowOptions = new() { Encoder = System.Text.Encodings.Web.JavaScriptEncoder.UnsafeRelaxedJsonEscaping };
+    internal static string Show(string? value) => value is null ? "null" :
+        JsonSerializer.Serialize(value.Length <= 80 ? value : value[..80] + "…", ShowOptions);
+    // A missing input property binds as "" (the DTOs mark required fields for the schema only), so
+    // missing and empty read the same.
+    private static string Got(string? value) => string.IsNullOrEmpty(value) ? "missing or empty" : Show(value);
+    internal static void RequireText(string field, string? value) =>
+        Require(!string.IsNullOrWhiteSpace(value), $"{field} is {Got(value)}; it must be non-blank text.");
+    /// <summary>The canonical allowed spelling of <paramref name="value"/>, or an error that lists every allowed value.</summary>
+    internal static string RequireOneOf(string field, string? value, string[] allowed, bool ignoreCase = false)
+    {
+        var comparison = ignoreCase ? StringComparison.OrdinalIgnoreCase : StringComparison.Ordinal;
+        foreach (var candidate in allowed)
+            if (string.Equals(candidate, value, comparison)) return candidate;
+        throw new McpException($"{field} is {Got(value)}; allowed values: {string.Join(", ", allowed)}{(ignoreCase ? " (case-insensitive)" : "")}.");
+    }
+    internal static readonly string[] Phases = ["PLAN", "CODE"];
+    internal static readonly string[] EvidenceKinds = ["build", "test", "smoke", "other"];
+    internal static readonly string[] Verdicts = ["APPROVE", "CHANGES"];
+    internal static readonly string[] Severities = ["HIGH", "MED", "LOW"];
 }
 
+// Input DTOs mark required properties with [Required], not [JsonRequired]. [Required] only shapes the
+// published JSON schema; [JsonRequired] would make a missing property fail argument binding inside the
+// SDK, which answers with an opaque "An error occurred invoking" instead of a message naming the field.
+// The workflow validates every field itself.
 internal sealed class ReviewRequest
 {
-    [JsonPropertyName("phase"), JsonRequired] public string Phase { get; set; } = "";
-    [JsonPropertyName("round"), JsonRequired] public int Round { get; set; }
-    [JsonPropertyName("task"), JsonRequired] public string Task { get; set; } = "";
-    [JsonPropertyName("base_sha"), JsonRequired] public string BaseSha { get; set; } = "";
-    [JsonPropertyName("reviewer_peer_id"), JsonRequired] public string ReviewerPeerId { get; set; } = "";
-    [JsonPropertyName("change_summary"), JsonRequired] public string ChangeSummary { get; set; } = "";
-    [JsonPropertyName("uncertainties"), JsonRequired] public string Uncertainties { get; set; } = "";
-    [JsonPropertyName("expected_previous_packet_id")] public string? ExpectedPreviousPacketId { get; set; }
+    [JsonPropertyName("phase"), Required, Description("PLAN or CODE (exact). PLAN/1 comes first; CODE needs the current reviewer's approved PLAN."), AllowedValues("PLAN", "CODE")]
+    public string Phase { get; set; } = "";
+    [JsonPropertyName("round"), Required, Description("Positive round number, counted per phase: the next PLAN or CODE round.")]
+    public int Round { get; set; }
+    [JsonPropertyName("task"), Required] public string Task { get; set; } = "";
+    [JsonPropertyName("base_sha"), Required] public string BaseSha { get; set; } = "";
+    [JsonPropertyName("reviewer_peer_id"), Required, Description("Exact peer_id of a different live peer (see `peers`).")]
+    public string ReviewerPeerId { get; set; } = "";
+    [JsonPropertyName("change_summary"), Required] public string ChangeSummary { get; set; } = "";
+    [JsonPropertyName("uncertainties"), Required] public string Uncertainties { get; set; } = "";
+    [JsonPropertyName("expected_previous_packet_id"), Description("packet_id of the latest packet of either phase; omit before the first request.")]
+    public string? ExpectedPreviousPacketId { get; set; }
     [JsonPropertyName("source_root")] public string? SourceRoot { get; set; }
-    [JsonPropertyName("plan_path")] public string? PlanPath { get; set; }
-    [JsonPropertyName("verification_revision")] public string? VerificationRevision { get; set; }
-    [JsonPropertyName("evidence")] public ReviewEvidence[] Evidence { get; set; } = [];
+    [JsonPropertyName("plan_path"), Description("PLAN only: absolute path of a regular plan file.")]
+    public string? PlanPath { get; set; }
+    [JsonPropertyName("verification_revision"), Description("CODE only: revision_sha256 from review_checkpoint status, taken before the checks ran.")]
+    public string? VerificationRevision { get; set; }
+    [JsonPropertyName("evidence"), Description("Raw output files of the checks; CODE needs at least one entry with kind test or smoke.")]
+    public ReviewEvidence[] Evidence { get; set; } = [];
 }
 internal sealed class ReviewEvidence
 {
-    [JsonPropertyName("path"), JsonRequired] public string Path { get; set; } = "";
-    [JsonPropertyName("kind"), JsonRequired] public string Kind { get; set; } = "";
-    [JsonPropertyName("command"), JsonRequired] public string Command { get; set; } = "";
-    [JsonPropertyName("cwd"), JsonRequired] public string Cwd { get; set; } = "";
-    [JsonPropertyName("exit_code"), JsonRequired] public int ExitCode { get; set; }
+    [JsonPropertyName("path"), Required, Description("Absolute path of a regular file holding the raw output.")]
+    public string Path { get; set; } = "";
+    [JsonPropertyName("kind"), Required, Description("build, test, smoke, or other (exact, lowercase)."), AllowedValues("build", "test", "smoke", "other")]
+    public string Kind { get; set; } = "";
+    [JsonPropertyName("command"), Required] public string Command { get; set; } = "";
+    [JsonPropertyName("cwd"), Required, Description("Absolute directory the command ran in.")]
+    public string Cwd { get; set; } = "";
+    // Nullable so a missing exit code is reported, not silently recorded as a success.
+    [JsonPropertyName("exit_code"), Required, Description("The command's integer exit code.")]
+    public int? ExitCode { get; set; }
 }
 internal sealed class ReviewReply
 {
-    [JsonPropertyName("verdict"), JsonRequired] public string Verdict { get; set; } = "";
-    [JsonPropertyName("summary"), JsonRequired] public string Summary { get; set; } = "";
-    [JsonPropertyName("findings"), JsonRequired] public ReviewFinding[] Findings { get; set; } = [];
+    [JsonPropertyName("verdict"), Required, Description("APPROVE or CHANGES (case-insensitive). APPROVE allows only optional findings; CHANGES needs at least one blocking finding (optional: false)."), AllowedValues("APPROVE", "CHANGES")]
+    public string Verdict { get; set; } = "";
+    [JsonPropertyName("summary"), Required] public string Summary { get; set; } = "";
+    [JsonPropertyName("findings"), Required, Description("Findings; an empty array is a clean APPROVE.")]
+    public ReviewFinding[] Findings { get; set; } = [];
 }
 internal sealed class ReviewFinding
 {
-    [JsonPropertyName("severity"), JsonRequired] public string Severity { get; set; } = "";
-    [JsonPropertyName("location"), JsonRequired] public string Location { get; set; } = "";
-    [JsonPropertyName("finding"), JsonRequired] public string Finding { get; set; } = "";
-    [JsonPropertyName("fix"), JsonRequired] public string Fix { get; set; } = "";
-    [JsonPropertyName("optional")] public bool Optional { get; set; }
+    [JsonPropertyName("severity"), Required, Description("HIGH, MED, or LOW (case-insensitive)."), AllowedValues("HIGH", "MED", "LOW")]
+    public string Severity { get; set; } = "";
+    [JsonPropertyName("location"), Required] public string Location { get; set; } = "";
+    [JsonPropertyName("finding"), Required] public string Finding { get; set; } = "";
+    [JsonPropertyName("fix"), Required] public string Fix { get; set; } = "";
+    [JsonPropertyName("optional"), Description("true for a non-blocking finding; default false (blocking).")]
+    public bool Optional { get; set; }
 }
 internal sealed record ReviewPart(string ArtifactId, int Version, string ContentHash, int ByteLength);
 internal sealed record ReviewBlob(string Encoding, string Sha256, long ByteLength, ReviewPart[] Parts);

@@ -1072,6 +1072,24 @@ public sealed class McpSubscriptionTests : IAsyncLifetime
             listed);
     }
 
+    // An agent can only send an allowed value it can see: the review_packet schema lists the allowed
+    // actions, verdicts, severities, and evidence kinds as enums and in the field descriptions.
+    [Fact]
+    public async Task ReviewPacketSchema_ListsTheAllowedVerdictsSeveritiesAndEvidenceKinds()
+    {
+        var tool = (await _client.ListToolsAsync()).Single(t => t.Name == "review_packet");
+        var schema = JsonNode.Parse(tool.JsonSchema.GetRawText())!.ToJsonString();
+        foreach (var allowed in new[] { "[\"publish\",\"fetch\",\"reply\"]", "[\"APPROVE\",\"CHANGES\"]", "[\"HIGH\",\"MED\",\"LOW\"]", "[\"build\",\"test\",\"smoke\",\"other\"]" })
+            Assert.Contains($"\"enum\":{allowed}", schema);
+        Assert.Contains("APPROVE or CHANGES (case-insensitive)", schema);
+        Assert.Contains("HIGH, MED, or LOW (case-insensitive)", schema);
+        Assert.Contains("build, test, smoke, or other", schema);
+        // Required fields are marked for the schema only ([Required]), so a missing one reaches the
+        // tool's own field-naming validation instead of failing argument binding.
+        Assert.Contains("\"required\":[\"severity\",\"location\",\"finding\",\"fix\"]", schema);
+        Assert.Contains("\"required\":[\"path\",\"kind\",\"command\",\"cwd\",\"exit_code\"]", schema);
+    }
+
     [Fact]
     public async Task ToolFailures_AreMarkedAsMcpErrors()
     {

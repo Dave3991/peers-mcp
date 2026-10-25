@@ -21,13 +21,37 @@ internal static class ReviewSnapshot
     internal const long MaxUntrackedFileBytes = 1024 * 1024;
     internal const long MaxUntrackedTotalBytes = 4 * 1024 * 1024;
 
+    private const string Remedy = "Remove it or exclude it (.gitignore or .git/info/exclude); captured untracked bytes stay in the broker database permanently.";
+
     private static void RequireCapturable(string path, long length, long capturedSoFar)
     {
-        const string Remedy = "Remove it or exclude it (.gitignore or .git/info/exclude); captured untracked bytes stay in the broker database permanently.";
         if (length > MaxUntrackedFileBytes)
             throw new McpException($"Untracked file '{path}' is {length} bytes, over the review capture limit of {MaxUntrackedFileBytes} bytes (1 MiB) per untracked file. {Remedy}");
         if (capturedSoFar + length > MaxUntrackedTotalBytes)
             throw new McpException($"Untracked file '{path}' brings the captured untracked total to {capturedSoFar + length} bytes, over the review capture limit of {MaxUntrackedTotalBytes} bytes (4 MiB) for all untracked files together. {Remedy}");
+    }
+
+    private static readonly string[] SecretExtensions = [".pem", ".key", ".p12", ".pfx"];
+    private static readonly string[] SecretPrefixes = ["id_rsa", "id_ed25519"];
+    private static readonly string[] EnvTemplateSuffixes = [".example", ".sample", ".template"];
+
+    /// <summary>
+    /// The secret-name rule an untracked file matches, or null. A match fails the capture rather than
+    /// skipping the file: a skipped file would make the packet silently incomplete, and an uploaded one
+    /// would stay in the broker database for good. Case-insensitive, as on macOS file systems.
+    /// </summary>
+    private static string? SecretNameRule(string path)
+    {
+        const StringComparison IgnoreCase = StringComparison.OrdinalIgnoreCase;
+        var name = Path.GetFileName(path);
+        if (name.Equals(".env", IgnoreCase)) return ".env";
+        if (name.StartsWith(".env.", IgnoreCase))
+            return EnvTemplateSuffixes.Any(suffix => name.EndsWith(suffix, IgnoreCase)) ? null : ".env.*";
+        foreach (var extension in SecretExtensions)
+            if (name.EndsWith(extension, IgnoreCase)) return "*" + extension;
+        foreach (var prefix in SecretPrefixes)
+            if (name.StartsWith(prefix, IgnoreCase)) return prefix + "*";
+        return null;
     }
 
     internal static async Task<byte[]> RunGitAsync(string root, IEnumerable<string> args, CancellationToken ct = default)
@@ -90,6 +114,8 @@ internal static class ReviewSnapshot
             var absolute = Path.GetFullPath(Path.Combine(root, path));
             if (!absolute.StartsWith(root + Path.DirectorySeparatorChar, StringComparison.Ordinal))
                 throw new McpException("Git returned an unsafe untracked path.");
+            if (SecretNameRule(path) is { } rule)
+                throw new McpException($"Untracked file '{path}' matches the secret name rule '{rule}'; the review capture refuses it before reading. {Remedy}");
             var info = new FileInfo(absolute);
             var target = info.LinkTarget;
             byte[] bytes;
@@ -112,6 +138,8 @@ internal static class ReviewSnapshot
                     (File.GetUnixFileMode(absolute) & (UnixFileMode.UserExecute | UnixFileMode.GroupExecute | UnixFileMode.OtherExecute)) != 0;
             }
             RequireCapturable(path, bytes.LongLength, captured); // The file may have grown since the check.
+            if (bytes.AsSpan().IndexOf("PRIVATE KEY-----"u8) >= 0)
+                throw new McpException($"Untracked file '{path}' contains 'PRIVATE KEY-----'; the review capture refuses private key material. {Remedy}");
             captured += bytes.LongLength;
             files.Add(new(path, kind, executable, bytes, ReviewJson.Hash(bytes)));
         }

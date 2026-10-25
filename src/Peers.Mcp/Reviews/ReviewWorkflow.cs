@@ -278,30 +278,56 @@ internal sealed partial class ReviewWorkflow(BrokerClient client, SessionState s
         round = packet.Manifest.Round, state = ledger.State, message_id = response?.MessageId,
         seq = response?.Seq, deduplicated = response?.Deduplicated, delivery = response?.Delivery,
     };
-    private static FileStream ExplicitFile(string path)
+    private static FileStream ExplicitFile(string field, string? path)
     {
-        ReviewJson.Require(Path.IsPathFullyQualified(path), "Plan/evidence paths must be explicit absolute files.");
+        ReviewJson.Require(path is not null && Path.IsPathFullyQualified(path), $"{field} is {ReviewJson.Show(path)}; it must be an absolute file path.");
         var info = new FileInfo(path);
         ReviewJson.Require(info.Exists && info.LinkTarget is null && (info.Attributes & (FileAttributes.Directory | FileAttributes.ReparsePoint)) == 0,
-            "Plan/evidence inputs must be regular files, never directories or symlinks.");
+            $"{field} is {ReviewJson.Show(path)}; it must be an existing regular file, never a directory or symlink.");
         for (var parent = info.Directory; parent is not null; parent = parent.Parent)
-            ReviewJson.Require(parent.LinkTarget is null, "Plan/evidence input paths must not follow symlink targets.");
+            ReviewJson.Require(parent.LinkTarget is null,
+                $"{field} is {ReviewJson.Show(path)}; its parent {ReviewJson.Show(parent.FullName)} is a symlink, and plan/evidence paths must not follow symlinks.");
         return new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read);
     }
     internal async Task<object> PublishAsync(ReviewRequest request, CancellationToken ct)
     {
-        ReviewJson.Require(request.Phase is "PLAN" or "CODE" && request.Round > 0 && !string.IsNullOrWhiteSpace(request.Task) &&
-            !string.IsNullOrWhiteSpace(request.ReviewerPeerId), "Publish requires phase PLAN|CODE, positive round, task and exact reviewer_peer_id.");
-        ReviewJson.Require(request.Evidence is not null && request.ChangeSummary is not null && request.Uncertainties is not null, "Missing request fields.");
-        ReviewJson.Require(request.Evidence.All(e => e is not null), "Evidence entries must be objects.");
-        ReviewJson.Require(request.Phase == "PLAN" ? request.PlanPath is not null && request.VerificationRevision is null :
-            request.PlanPath is null && request.VerificationRevision is not null && request.Evidence.Any(e => e.Kind is "test" or "smoke"),
-            "PLAN requires plan_path; CODE requires verification_revision and test/smoke evidence.");
-        foreach (var evidence in request.Evidence)
-            ReviewJson.Require(evidence.Kind is "build" or "test" or "smoke" or "other" && !string.IsNullOrWhiteSpace(evidence.Command) &&
-                Path.IsPathFullyQualified(evidence.Cwd), "Invalid evidence kind/command/cwd.");
+        ReviewJson.RequireOneOf("request.phase", request.Phase, ReviewJson.Phases);
+        ReviewJson.Require(request.Round > 0, $"request.round is {request.Round}; it must be a positive integer (1 for the first round of each phase).");
+        ReviewJson.RequireText("request.task", request.Task);
+        ReviewJson.RequireText("request.base_sha", request.BaseSha);
+        ReviewJson.RequireText("request.reviewer_peer_id", request.ReviewerPeerId);
+        ReviewJson.Require(request.ChangeSummary is not null, "request.change_summary is null; it must be text.");
+        ReviewJson.Require(request.Uncertainties is not null, "request.uncertainties is null; it must be text.");
+        ReviewJson.Require(request.Evidence is not null, "request.evidence is null; it must be an array (empty for PLAN).");
+        for (var i = 0; i < request.Evidence.Length; i++)
+        {
+            var evidence = request.Evidence[i];
+            ReviewJson.Require(evidence is not null, $"request.evidence[{i}] is null; it must be an object with path, kind, command, cwd and exit_code.");
+            ReviewJson.RequireOneOf($"request.evidence[{i}].kind", evidence.Kind, ReviewJson.EvidenceKinds);
+            ReviewJson.RequireText($"request.evidence[{i}].command", evidence.Command);
+            ReviewJson.Require(evidence.Cwd is not null && Path.IsPathFullyQualified(evidence.Cwd),
+                $"request.evidence[{i}].cwd is {ReviewJson.Show(evidence.Cwd)}; it must be an absolute directory path.");
+            ReviewJson.Require(evidence.ExitCode is not null, $"request.evidence[{i}].exit_code is missing; it must be the command's integer exit code.");
+        }
+        if (request.Phase == "PLAN")
+        {
+            ReviewJson.Require(request.PlanPath is not null, "request.plan_path is null; phase PLAN requires the absolute path of a plan file.");
+            ReviewJson.Require(request.VerificationRevision is null,
+                $"request.verification_revision is {ReviewJson.Show(request.VerificationRevision)}; phase PLAN requires it to be omitted (it belongs to CODE).");
+        }
+        else
+        {
+            ReviewJson.Require(request.PlanPath is null, $"request.plan_path is {ReviewJson.Show(request.PlanPath)}; phase CODE requires it to be omitted (it belongs to PLAN).");
+            ReviewJson.Require(request.VerificationRevision is not null,
+                "request.verification_revision is null; phase CODE requires the revision_sha256 that review_checkpoint status returned before the checks ran.");
+            ReviewJson.Require(request.Evidence.Any(e => e.Kind is "test" or "smoke"),
+                $"request.evidence kinds are [{string.Join(", ", request.Evidence.Select(e => e.Kind))}]; phase CODE requires at least one entry with kind test or smoke.");
+        }
         var roster = await client.ListPeersAsync();
-        ReviewJson.Require(request.ReviewerPeerId != PeerId && roster.Any(p => p.PeerId == request.ReviewerPeerId), "Reviewer must be a different exact live peer ID.");
+        ReviewJson.Require(request.ReviewerPeerId != PeerId,
+            $"request.reviewer_peer_id is {ReviewJson.Show(request.ReviewerPeerId)}, this session's own peer_id; it must be a different live peer.");
+        ReviewJson.Require(roster.Any(p => p.PeerId == request.ReviewerPeerId),
+            $"request.reviewer_peer_id is {ReviewJson.Show(request.ReviewerPeerId)}; it must be the exact peer_id of a live peer (see `peers`).");
         var root = request.SourceRoot ?? session.RepoRoot ?? Directory.GetCurrentDirectory();
         var source = await ReviewSnapshot.CaptureAsync(root, request.BaseSha, ct);
         var inputHash = ReviewJson.Hash(ReviewJson.Bytes(new { request, revision_sha256 = source.RevisionSha256,
@@ -346,15 +372,20 @@ internal sealed partial class ReviewWorkflow(BrokerClient client, SessionState s
                 return PacketResult(ledger, existing, new SendMessageResponse { ChannelId = channelId, MessageId = message!.MessageId,
                     Seq = message.Seq, Mentions = message.Mentions, Deduplicated = true, Delivery = existing.Delivery });
             }
-            ReviewJson.Require(request.ExpectedPreviousPacketId == ledger.LatestPacketId, "expected_previous_packet_id must match the latest packet of either phase.");
-            ReviewJson.Require(request.Round == (request.Phase == "PLAN" ? ledger.PlanRound : ledger.CodeRound) + 1 &&
-                (ledger.Packets.Count != 0 || request.Phase == "PLAN" && request.Round == 1), "Round counters are monotonic per phase; first request must be PLAN/1.");
+            ReviewJson.Require(request.ExpectedPreviousPacketId == ledger.LatestPacketId,
+                $"request.expected_previous_packet_id is {ReviewJson.Show(request.ExpectedPreviousPacketId)}; it must be the latest packet_id of either phase, {ReviewJson.Show(ledger.LatestPacketId)} (null before the first request).");
+            ReviewJson.Require(ledger.Packets.Count != 0 || request.Phase == "PLAN" && request.Round == 1,
+                $"request is {request.Phase}/{request.Round}; the first request on a channel must be phase PLAN, round 1.");
+            var nextRound = (request.Phase == "PLAN" ? ledger.PlanRound : ledger.CodeRound) + 1;
+            ReviewJson.Require(request.Round == nextRound,
+                $"request.round is {request.Round}; the next {request.Phase} round is {nextRound} (rounds count up by one per phase).");
             if (request.Phase == "CODE")
             {
-                ReviewJson.Require(ledger.ApprovedPlanPacketId is not null && request.ReviewerPeerId == ledger.ReviewerPeerId,
-                    "CODE requires the current reviewer's approved PLAN.");
+                ReviewJson.Require(ledger.ApprovedPlanPacketId is not null, "request.phase is \"CODE\"; CODE requires an approved PLAN, and the latest PLAN round has no approval yet.");
+                ReviewJson.Require(request.ReviewerPeerId == ledger.ReviewerPeerId,
+                    $"request.reviewer_peer_id is {ReviewJson.Show(request.ReviewerPeerId)}; CODE requires the reviewer who approved the PLAN, {ReviewJson.Show(ledger.ReviewerPeerId)}. A new reviewer must first approve a new PLAN round.");
                 ReviewJson.Require(request.VerificationRevision == source.RevisionSha256 && ledger.VerificationRevision == request.VerificationRevision,
-                    "Verification revision must be issued by review_checkpoint before checks and still match Git-visible source.");
+                    $"request.verification_revision is {ReviewJson.Show(request.VerificationRevision)}; it must be the revision_sha256 that review_checkpoint status issued before the checks, and it must still match the Git-visible source ({ReviewJson.Show(source.RevisionSha256)} now).");
             }
             if (ledger.Publication is { Dispatched: true } frozen)
             {
@@ -382,20 +413,20 @@ internal sealed partial class ReviewWorkflow(BrokerClient client, SessionState s
             var blob = await Artifacts.PublishBlobAsync(bytes, source.SourceRoot, ConfirmPart, ct);
             files.Add(new(logical, original, kind, executable, evidence, blob));
         }
-        async Task AddFile(string logical, string path, string kind, ReviewEvidence? evidence = null)
+        async Task AddFile(string field, string logical, string path, string kind, ReviewEvidence? evidence = null)
         {
-            await using var input = ExplicitFile(path);
+            await using var input = ExplicitFile(field, path);
             var blob = await Artifacts.PublishBlobAsync(input, source.SourceRoot, ConfirmPart, ct);
             files.Add(new(logical, path, kind, false, evidence, blob));
         }
         await Add("task.txt", Encoding.UTF8.GetBytes(request.Task), "task");
-        if (request.PlanPath is not null) await AddFile("plan.md", request.PlanPath, "plan");
+        if (request.PlanPath is not null) await AddFile("request.plan_path", "plan.md", request.PlanPath, "plan");
         await Add("tracked.diff", source.TrackedDiff, "diff");
         foreach (var file in source.Untracked) await Add("untracked/" + file.Path, file.Bytes, file.Kind, file.Path, file.Executable);
         for (var i = 0; i < request.Evidence.Length; i++)
         {
             var evidence = request.Evidence[i];
-            await AddFile($"evidence/{i:D4}-{evidence.Kind}.log", evidence.Path, "evidence", evidence);
+            await AddFile($"request.evidence[{i}].path", $"evidence/{i:D4}-{evidence.Kind}.log", evidence.Path, "evidence", evidence);
         }
         var payload = new ReviewPayloadIndex(1, request.ChangeSummary, request.Uncertainties, files.ToArray());
         var index = await Artifacts.PublishBlobAsync(ReviewJson.Bytes(payload), source.SourceRoot, ConfirmPart, ct);
@@ -441,9 +472,11 @@ internal sealed partial class ReviewWorkflow(BrokerClient client, SessionState s
     private static async Task<string[]> InputHashesAsync(ReviewRequest request, CancellationToken ct)
     {
         var hashes = new List<string>();
-        foreach (var path in (request.PlanPath is null ? Array.Empty<string>() : new[] { request.PlanPath }).Concat(request.Evidence.Select(e => e.Path)))
+        var inputs = (request.PlanPath is null ? [] : new[] { ("request.plan_path", request.PlanPath) })
+            .Concat(request.Evidence.Select((e, i) => ($"request.evidence[{i}].path", e.Path)));
+        foreach (var (field, path) in inputs)
         {
-            await using var input = ExplicitFile(path);
+            await using var input = ExplicitFile(field, path);
             hashes.Add(Convert.ToHexStringLower(await System.Security.Cryptography.SHA256.HashDataAsync(input, ct)));
         }
         return hashes.ToArray();
@@ -451,7 +484,8 @@ internal sealed partial class ReviewWorkflow(BrokerClient client, SessionState s
     internal async Task<object> FetchAsync(string packetId, CancellationToken ct)
     {
         var ledger = await ProjectionAsync(ct) ?? throw new McpException("No recoverable review checkpoint.");
-        var packet = ledger.Packets.SingleOrDefault(p => p.PacketId == packetId) ?? throw new McpException("Packet has no authoritative channel request.");
+        var packet = ledger.Packets.SingleOrDefault(p => p.PacketId == packetId) ?? throw new McpException(
+            $"packet_id is {ReviewJson.Show(packetId)}; it must be one of this channel's packets: {string.Join(", ", ledger.Packets.Select(p => $"{p.PacketId} ({p.Manifest.Phase}/{p.Manifest.Round})"))}.");
         ReviewJson.Require(ledger.Integrity == "intact" && packet.Request is not null && await PinnedAsync(packet.Request) is not null,
             "Packet request/evidence was deleted or is unverifiable.");
         var materialized = await Artifacts.MaterializeAsync(packetId, PeerStore(packet.Manifest.ReviewerPeerId), packet.PacketSha256, ct);
@@ -465,17 +499,34 @@ internal sealed partial class ReviewWorkflow(BrokerClient client, SessionState s
     }
     internal async Task<object> ReplyAsync(string packetId, ReviewReply reply, CancellationToken ct)
     {
-        ReviewJson.Require(reply.Verdict is "APPROVE" or "CHANGES" && !string.IsNullOrWhiteSpace(reply.Summary) && reply.Findings is not null,
-            "Reply requires APPROVE|CHANGES, summary and findings.");
-        ReviewJson.Require(reply.Findings.All(f => f is not null), "Findings must be objects.");
-        foreach (var finding in reply.Findings)
-            ReviewJson.Require(finding.Severity is "HIGH" or "MED" or "LOW" && !string.IsNullOrWhiteSpace(finding.Location) &&
-                !string.IsNullOrWhiteSpace(finding.Finding) && !string.IsNullOrWhiteSpace(finding.Fix), "Invalid review finding.");
-        ReviewJson.Require(reply.Verdict == "APPROVE" ? reply.Findings.All(f => f.Optional) : reply.Findings.Any(f => !f.Optional),
-            "APPROVE cannot contain blocking findings; CHANGES requires a blocking finding.");
+        // Verdict and severity match case-insensitively and are stored in their canonical spelling, so
+        // the record text the reducer and lesson hints parse never depends on how the caller typed them.
+        reply.Verdict = ReviewJson.RequireOneOf("reply.verdict", reply.Verdict, ReviewJson.Verdicts, ignoreCase: true);
+        ReviewJson.RequireText("reply.summary", reply.Summary);
+        ReviewJson.Require(reply.Findings is not null, "reply.findings is null; it must be an array (empty for a clean APPROVE).");
+        for (var i = 0; i < reply.Findings.Length; i++)
+        {
+            var finding = reply.Findings[i];
+            ReviewJson.Require(finding is not null, $"reply.findings[{i}] is null; it must be an object with severity, location, finding, fix and optional.");
+            finding.Severity = ReviewJson.RequireOneOf($"reply.findings[{i}].severity", finding.Severity, ReviewJson.Severities, ignoreCase: true);
+            ReviewJson.RequireText($"reply.findings[{i}].location", finding.Location);
+            ReviewJson.RequireText($"reply.findings[{i}].finding", finding.Finding);
+            ReviewJson.RequireText($"reply.findings[{i}].fix", finding.Fix);
+        }
+        if (reply.Verdict == "APPROVE")
+        {
+            var blocking = Array.FindIndex(reply.Findings, f => !f.Optional);
+            ReviewJson.Require(blocking < 0,
+                $"reply.findings[{blocking}].optional is false with reply.verdict \"APPROVE\"; APPROVE allows only optional findings (optional: true). Use verdict CHANGES for a blocking finding.");
+        }
+        else
+            ReviewJson.Require(reply.Findings.Any(f => !f.Optional),
+                $"reply.verdict is \"CHANGES\" but none of the {reply.Findings.Length} findings is blocking; CHANGES requires at least one finding with optional: false.");
         var ledger = await ProjectionAsync(ct) ?? throw new McpException("No recoverable review checkpoint.");
-        ReviewJson.Require(ledger.LatestPacketId == packetId && ledger.ReviewerPeerId == PeerId && ledger.DriverPeerId != PeerId &&
-            ledger.State != "completed" && ledger.Integrity == "intact", "Only the selected independent reviewer may reply to the latest intact packet.");
+        ReviewJson.Require(ledger.LatestPacketId == packetId,
+            $"packet_id is {ReviewJson.Show(packetId)}; reply only to the latest packet, {ReviewJson.Show(ledger.LatestPacketId)}.");
+        ReviewJson.Require(ledger.ReviewerPeerId == PeerId && ledger.DriverPeerId != PeerId && ledger.State != "completed" && ledger.Integrity == "intact",
+            "Only the selected independent reviewer may reply to the latest intact packet.");
         var packet = Latest(ledger)!;
         await Artifacts.MaterializeAsync(packetId, PeerStore(PeerId), packet.PacketSha256, ct);
         var prose = reply.Summary + "\n" + string.Join("\n", reply.Findings.Select((f, i) =>
