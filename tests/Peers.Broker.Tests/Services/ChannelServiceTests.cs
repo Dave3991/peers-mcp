@@ -285,6 +285,47 @@ public sealed class ChannelServiceTests : IDisposable
         Assert.Equal("after clear", Assert.Single((await channels.ReadAsync(channel.ChannelId, author, last.Seq, 100, CancellationToken.None))!.Messages).Content);
     }
 
+    // A pre-v6 broker (db8c7f9 and earlier) opens a v6 database without complaint, appends with
+    // MAX(seq)+1, and never moves last_seq. The next append here must step over that row: last_seq + 1
+    // alone collides on idx_channel_messages_seq, and every later send to the channel fails the same way.
+    [Fact]
+    public async Task Send_AfterAnOlderBrokerAppendedAboveLastSeq_Succeeds_AndReusesNoSeq()
+    {
+        var (_, peers, _, channels) = Create();
+        var author = await RegisterAsync(peers, "legacy-author");
+        var channel = (await channels.CreateAsync(new CreateChannelRequest
+            { Name = "legacy", CreatedByPeerId = author }, CancellationToken.None)).Value;
+        var first = (await channels.SendAsync(channel.ChannelId, new SendMessageRequest
+            { AuthorPeerId = author, Content = "v6" }, CancellationToken.None)).Value!;
+        await _db.Factory.WriteAsync(async conn =>
+        {
+            using var cmd = conn.CreateCommand();
+            // db8c7f9's append SQL, with literals for the message fields.
+            cmd.CommandText = """
+                INSERT INTO channel_messages (message_id, channel_id, seq, author_peer_id, content, mentions, quiet, idempotency_key, created_at)
+                VALUES ('legacy-row', @channel,
+                    (SELECT COALESCE(MAX(seq), 0) + 1 FROM channel_messages WHERE channel_id = @channel),
+                    @author, 'pre-v6 append', '[]', 0, NULL, datetime('now'))
+                """;
+            cmd.Parameters.AddWithValue("@channel", channel.ChannelId);
+            cmd.Parameters.AddWithValue("@author", author);
+            await cmd.ExecuteNonQueryAsync();
+        });
+
+        var next = (await channels.SendAsync(channel.ChannelId, new SendMessageRequest
+            { AuthorPeerId = author, Content = "after legacy" }, CancellationToken.None)).Value!;
+        Assert.Equal(first.Seq + 2, next.Seq);
+        Assert.Equal(new[] { first.Seq, first.Seq + 1, next.Seq },
+            (await channels.ReadAsync(channel.ChannelId, author, 0, 100, CancellationToken.None))!.Messages.Select(m => m.Seq));
+
+        // last_seq moved past the legacy row, so deleting the newest message frees no seq either.
+        await channels.RemoveMessagesAsync(channel.ChannelId,
+            new RemoveMessagesRequest { MessageIds = [next.MessageId] }, CancellationToken.None);
+        var last = (await channels.SendAsync(channel.ChannelId, new SendMessageRequest
+            { AuthorPeerId = author, Content = "after removal" }, CancellationToken.None)).Value!;
+        Assert.Equal(next.Seq + 1, last.Seq);
+    }
+
     [Theory]
     [InlineData(false)]
     [InlineData(true)]

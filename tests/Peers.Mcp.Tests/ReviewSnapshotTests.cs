@@ -84,6 +84,41 @@ public sealed class ReviewSnapshotTests
         await Assert.ThrowsAsync<McpException>(() => ReviewSnapshot.CaptureAsync(fixture.Root, "HEAD"));
     }
 
+    // Captured untracked bytes stay in the broker database for good, so a file over the per-file
+    // limit fails the capture by name instead of being uploaded. Exactly at the limit still passes.
+    [Fact]
+    public async Task Rejects_an_untracked_file_over_the_per_file_limit_and_names_it()
+    {
+        using var fixture = new ReviewGitFixture();
+        await fixture.InitializeAsync();
+        await File.WriteAllBytesAsync(Path.Combine(fixture.Root, "at-limit.bin"), new byte[ReviewSnapshot.MaxUntrackedFileBytes]);
+        Assert.Equal(ReviewSnapshot.MaxUntrackedFileBytes,
+            Assert.Single((await ReviewSnapshot.CaptureAsync(fixture.Root, "HEAD")).Untracked).Bytes.LongLength);
+
+        await File.WriteAllBytesAsync(Path.Combine(fixture.Root, "data.bin"), new byte[ReviewSnapshot.MaxUntrackedFileBytes + 1]);
+        var error = await Assert.ThrowsAsync<McpException>(() => ReviewSnapshot.CaptureAsync(fixture.Root, "HEAD"));
+        Assert.Contains($"Untracked file 'data.bin' is {ReviewSnapshot.MaxUntrackedFileBytes + 1} bytes", error.Message);
+        Assert.Contains($"limit of {ReviewSnapshot.MaxUntrackedFileBytes} bytes (1 MiB) per untracked file", error.Message);
+    }
+
+    // Many files under the per-file limit can still add up; the file that crosses the total is named.
+    [Fact]
+    public async Task Rejects_untracked_files_over_the_total_limit_and_names_the_file_that_crosses_it()
+    {
+        using var fixture = new ReviewGitFixture();
+        await fixture.InitializeAsync();
+        var files = (int)(ReviewSnapshot.MaxUntrackedTotalBytes / ReviewSnapshot.MaxUntrackedFileBytes);
+        for (var i = 0; i < files; i++)
+            await File.WriteAllBytesAsync(Path.Combine(fixture.Root, $"part-{i}.bin"), new byte[ReviewSnapshot.MaxUntrackedFileBytes]);
+        Assert.Equal(ReviewSnapshot.MaxUntrackedTotalBytes,
+            (await ReviewSnapshot.CaptureAsync(fixture.Root, "HEAD")).Untracked.Sum(f => f.Bytes.LongLength));
+
+        await File.WriteAllTextAsync(Path.Combine(fixture.Root, "zz-last.txt"), "x");
+        var error = await Assert.ThrowsAsync<McpException>(() => ReviewSnapshot.CaptureAsync(fixture.Root, "HEAD"));
+        Assert.Contains($"Untracked file 'zz-last.txt' brings the captured untracked total to {ReviewSnapshot.MaxUntrackedTotalBytes + 1} bytes", error.Message);
+        Assert.Contains($"limit of {ReviewSnapshot.MaxUntrackedTotalBytes} bytes (4 MiB) for all untracked files together", error.Message);
+    }
+
     [Fact]
     public async Task Store_rejects_digest_generation_and_symlink_conflicts_with_private_modes()
     {

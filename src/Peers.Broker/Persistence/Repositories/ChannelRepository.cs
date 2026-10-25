@@ -97,7 +97,11 @@ public sealed class ChannelRepository(SqliteConnectionFactory db)
         }, ct);
     }
 
-    /// <summary>Sequence assignment and append share the caller's transaction, or create their own.</summary>
+    /// <summary>
+    /// Sequence assignment and append share the caller's transaction, or create their own.
+    /// last_seq never goes below MAX(seq): a pre-v6 broker opening this database appends with
+    /// MAX(seq)+1 and leaves last_seq behind, and last_seq + 1 alone would then collide with its rows.
+    /// </summary>
     public async Task<MessageRow> AppendMessageAsync(MessageRow message, CancellationToken ct = default,
         SqliteConnection? existingConn = null)
     {
@@ -105,7 +109,9 @@ public sealed class ChannelRepository(SqliteConnectionFactory db)
         {
             using var cmd = conn.CreateCommand();
             cmd.CommandText = """
-                UPDATE channels SET last_seq = last_seq + 1 WHERE channel_id = @channel;
+                UPDATE channels SET last_seq = MAX(last_seq,
+                    COALESCE((SELECT MAX(seq) FROM channel_messages WHERE channel_id = @channel), 0)) + 1
+                WHERE channel_id = @channel;
                 INSERT INTO channel_messages (message_id, channel_id, seq, author_peer_id, content, mentions, quiet, idempotency_key, created_at)
                 VALUES (
                     @id, @channel,

@@ -78,10 +78,10 @@ Mention peers with `to` (peer IDs or ID prefixes): a mention lands in the recipi
 so `wait` returns as soon as it arrives.
 
 `send`, `read`, `channel_clear`, and `messages_remove` take exactly one of `channel` (name) or
-`channel_id`. A name resolves in this session's repository first, then the global scope — never an
-unrelated repository. A `channel_id` (from `channels`, `channel_create`, a message, or an inbox item)
-reaches a channel scoped to any repository, e.g. a reviewer in one repo answering a driver's channel
-scoped to another worktree.
+`channel_id`. For `send` and `read`, a name resolves in this session's repository first, then the
+global scope — never an unrelated repository. A `channel_id` (from `channels`, `channel_create`, a
+message, or an inbox item) reaches a channel scoped to any repository, e.g. a reviewer in one repo
+answering a driver's channel scoped to another worktree.
 
 ### Clear history or remove selected messages
 
@@ -89,6 +89,12 @@ scoped to another worktree.
 `messages_remove(channel, message_ids)` removes 1..200 selected message IDs returned by `send` or
 `read`. Both return `{ channel_id, name, repo_root, deleted_messages }`; duplicate, missing, or
 other-channel IDs are ignored, and repeating a completed removal returns zero.
+
+For `channel_clear` and `messages_remove`, a name resolves in this session's repository only. It never
+falls back to a global channel of the same name: a session in a linked worktree, or outside Git, does
+not see the main checkout's repository channels, so a fallback would empty an unrelated global channel.
+A session with no repository cannot delete by name at all. Delete a global channel by `channel_id`
+with `confirm_channel`.
 
 `confirm_channel` is the channel's exact, case-sensitive name; a blank one counts as absent.
 Addressed by `channel_id` instead of a name, both require it. It is compared with the name the broker
@@ -183,8 +189,8 @@ by `wait` until you echo their ids back as `ack_inbox_ids`.
 | `presence` | Update this session's role, summary, capabilities, focus paths, and progress on long-running work |
 | `channels` | List channels and their repo scope + message counts |
 | `channel_create` | Create a channel (`name`, optional `repo_root`; names unique per scope) |
-| `channel_clear` | Permanently clear a channel's history and pending deliveries; keep the channel (`channel`, or `channel_id` with `confirm_channel`) |
-| `messages_remove` | Permanently remove selected `message_ids` from a channel (1..200; `channel`, or `channel_id` with `confirm_channel`) |
+| `channel_clear` | Permanently clear a channel's history and pending deliveries; keep the channel (`channel` in this session's repo only, or `channel_id` with `confirm_channel`) |
+| `messages_remove` | Permanently remove selected `message_ids` from a channel (1..200; `channel` in this session's repo only, or `channel_id` with `confirm_channel`) |
 | `send` | Post to a channel (`channel` name or `channel_id`): `content`, optional `to` mentions, optional `quiet` whisper |
 | `read` | Read a channel (`channel` name or `channel_id`) from `since_seq`; whispers addressed to others are filtered out |
 | `wait` | Long-poll for directed messages (default 25s, max 120s); echo `ack_inbox_ids` to acknowledge receipts |
@@ -231,6 +237,10 @@ Multipart artifacts preserve binary and UTF-8 bytes. Hashes, sizes, order, messa
 An artifact's latest name, an inbox preview, raw approval text, or zero exit status cannot authorize completion.
 Ignored files and external services are outside the source fingerprint.
 Untracked nested repositories require an explicit nested source root, a submodule, or an explicit ignore rule.
+Untracked capture is limited to 1 MiB (1,048,576 bytes) per file and 4 MiB (4,194,304 bytes) for all untracked files together; symlink target text counts toward both.
+The broker keeps every captured byte and has no artifact pruning, and every `review_checkpoint` call reads these files again.
+A larger untracked file fails capture in `review_packet/publish` and `review_checkpoint` with an error that names the file and the limit. Remove it or exclude it with `.gitignore` or `.git/info/exclude`.
+The tracked diff and the evidence files are not subject to these limits.
 
 Round numbers increase within each phase without a fixed limit. A replacement reviewer must approve a new PLAN before CODE.
 Before completion, observed CODE source drift latches `stale`, even after source restoration.
@@ -240,6 +250,8 @@ Status reports `source_changed_since_completion` and evidence integrity without 
 
 Channel history authorizes decisions independently of inbox delivery or acknowledgement.
 `review_checkpoint/sync` returns durable `ready_to_ack` IDs and unrelated receipt IDs/types.
+`ready_to_ack` holds only `PEERS_REVIEW_V1` records that the workflow has already applied (and review artifact or deletion notices).
+Any other message in the review channel, such as a question from the reviewer or a person, is an unrelated receipt: read it with `read` or `wait` before you acknowledge it through `wait`.
 Only prior handled IDs from the same peer can enter its next managed acknowledgement call.
 Ordinary tools and `wait` retain their existing receipt semantics.
 Explicit driver adoption requires the former driver to be offline and preserves the original lineage.
@@ -352,7 +364,7 @@ Check its health:
 
 ```bash
 curl http://localhost:7856/health
-# {"status":"ok","version":6,"contract":5}
+# {"status":"ok","version":6,"contract":7}
 ```
 
 Or use the CLI:

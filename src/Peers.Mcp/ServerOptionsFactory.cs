@@ -52,7 +52,7 @@ internal static class ServerOptionsFactory
                 Managed review:
                 - Use `review_packet` for immutable PLAN/CODE requests, complete evidence fetches, and independent reviewer replies. Approve PLAN before CODE; silence and raw chat never authorize completion.
                 - Use `review_checkpoint` to restore history, obtain the revision before native checks, sync handled receipts, explicitly adopt an offline driver, and complete the exact approved CODE packet. A stale latch requires a new CODE round; completed work stays historical after a commit.
-                - Managed sync acknowledges only this peer's prior durable handled IDs. Handle unrelated_receipts with ordinary tools and acknowledge them through `wait` before parking.
+                - Managed sync acknowledges only this peer's prior durable handled IDs. ready_to_ack holds only review records the workflow already applied; every other message, including plain chat or a question in the review channel, is in unrelated_receipts. Read unrelated_receipts with ordinary tools (`read`, `wait`) and acknowledge them through `wait` before parking.
                 - `review_lesson` freezes one explicitly requested supported lesson after intact completion. Use the existing mounted Aletheia tools through the promotion helper; no automatic learning or exactly-once storage guarantee.
 
                 Paths:

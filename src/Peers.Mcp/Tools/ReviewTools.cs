@@ -12,7 +12,7 @@ namespace Peers.Mcp.Tools;
 internal sealed class ReviewTools
 {
     [McpServerTool(Name = "review_packet"), Description(
-        "Managed independent review: publish a complete immutable PLAN/CODE packet, fetch its verified private evidence files, or reply as its exact selected reviewer. PLAN approval precedes CODE. Fetch never approves; evidence claims are not executed.")]
+        "Managed independent review: publish a complete immutable PLAN/CODE packet, fetch its verified private evidence files, or reply as its exact selected reviewer. PLAN approval precedes CODE. Fetch never approves; evidence claims are not executed. Non-ignored untracked files are captured up to 1 MiB each and 4 MiB in total; a larger one fails the capture and names the file.")]
     public static async Task<string> Packet(BrokerClient client, SessionState state, McpServer server,
         ILoggerFactory loggerFactory, ReviewStorageOptions storage,
         string action, string channel_id, string? packet_id = null, ReviewRequest? request = null,

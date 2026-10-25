@@ -12,6 +12,24 @@ internal sealed record ReviewSourceSnapshot(string SourceRoot, string GitDir, st
 
 internal static class ReviewSnapshot
 {
+    /// <summary>
+    /// Capture limits for untracked files (symlink target text counts too). Every captured byte is
+    /// uploaded into the broker database, which never prunes artifacts, and each status/sync capture
+    /// reads them all again. Untracked review input is new source, so 1 MiB per file and 4 MiB in total
+    /// leave room for real work while a data dump or a stray secrets file fails loudly instead.
+    /// </summary>
+    internal const long MaxUntrackedFileBytes = 1024 * 1024;
+    internal const long MaxUntrackedTotalBytes = 4 * 1024 * 1024;
+
+    private static void RequireCapturable(string path, long length, long capturedSoFar)
+    {
+        const string Remedy = "Remove it or exclude it (.gitignore or .git/info/exclude); captured untracked bytes stay in the broker database permanently.";
+        if (length > MaxUntrackedFileBytes)
+            throw new McpException($"Untracked file '{path}' is {length} bytes, over the review capture limit of {MaxUntrackedFileBytes} bytes (1 MiB) per untracked file. {Remedy}");
+        if (capturedSoFar + length > MaxUntrackedTotalBytes)
+            throw new McpException($"Untracked file '{path}' brings the captured untracked total to {capturedSoFar + length} bytes, over the review capture limit of {MaxUntrackedTotalBytes} bytes (4 MiB) for all untracked files together. {Remedy}");
+    }
+
     internal static async Task<byte[]> RunGitAsync(string root, IEnumerable<string> args, CancellationToken ct = default)
     {
         var start = new ProcessStartInfo("git")
@@ -63,6 +81,7 @@ internal static class ReviewSnapshot
         var paths = new UTF8Encoding(false, true).GetString(await RunGitAsync(root,
             ["ls-files", "--others", "--exclude-standard", "-z"], ct)).Split('\0', StringSplitOptions.RemoveEmptyEntries);
         var files = new List<ReviewSourceFile>();
+        long captured = 0;
         foreach (var path in paths.Order(StringComparer.Ordinal))
         {
             ct.ThrowIfCancellationRequested();
@@ -85,11 +104,15 @@ internal static class ReviewSnapshot
                 if (!info.Exists || (info.Attributes & (FileAttributes.Directory | FileAttributes.ReparsePoint)) != 0)
                     throw new McpException($"Untracked path is not a regular file: {path}");
                 kind = "file";
+                // Checked before reading, so an oversized file is never loaded into memory.
+                RequireCapturable(path, info.Length, captured);
                 try { bytes = await File.ReadAllBytesAsync(absolute, ct); }
                 catch (UnauthorizedAccessException ex) { throw new McpException($"Cannot read untracked file: {path}", ex); }
                 executable = !OperatingSystem.IsWindows() &&
                     (File.GetUnixFileMode(absolute) & (UnixFileMode.UserExecute | UnixFileMode.GroupExecute | UnixFileMode.OtherExecute)) != 0;
             }
+            RequireCapturable(path, bytes.LongLength, captured); // The file may have grown since the check.
+            captured += bytes.LongLength;
             files.Add(new(path, kind, executable, bytes, ReviewJson.Hash(bytes)));
         }
         var revision = ReviewJson.Bytes(new

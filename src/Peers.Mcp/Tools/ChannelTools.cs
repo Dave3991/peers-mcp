@@ -185,14 +185,14 @@ public sealed class ChannelTools
     }
 
     [McpServerTool(Name = "channel_clear"), Description(
-        "Permanently clear a channel's messages for every session, including pending inbox deliveries. Address it by `channel` (name) or `channel_id` — exactly one. " + ConfirmRule + "\n" +
+        "Permanently clear a channel's messages for every session, including pending inbox deliveries. Address it by `channel` (name) or `channel_id` — exactly one. " + DeleteScopeRule + " " + ConfirmRule + "\n" +
         "The channel remains usable and sequence numbers are not reset. Returns: { channel_id, name, repo_root, deleted_messages }.")]
     public static async Task<string> ChannelClear(
         BrokerClient client,
         SessionState state,
         McpServer server,
         ILoggerFactory loggerFactory,
-        [Description(ChannelNameDescription)] string? channel = null,
+        [Description(DeletableChannelNameDescription)] string? channel = null,
         [Description(ChannelIdDescription)] string? channel_id = null,
         [Description(ConfirmChannelDescription)] string? confirm_channel = null,
         CancellationToken cancellationToken = default)
@@ -208,7 +208,7 @@ public sealed class ChannelTools
     }
 
     [McpServerTool(Name = "messages_remove"), Description(
-        "Permanently remove selected messages from a channel for every session, including pending inbox deliveries. Address it by `channel` (name) or `channel_id` — exactly one. " + ConfirmRule + "\n" +
+        "Permanently remove selected messages from a channel for every session, including pending inbox deliveries. Address it by `channel` (name) or `channel_id` — exactly one. " + DeleteScopeRule + " " + ConfirmRule + "\n" +
         "Provide 1..200 message IDs from read/send. Missing IDs are ignored; sequence numbers are not reset.\n" +
         "Returns: { channel_id, name, repo_root, deleted_messages } — repeated removal returns zero.")]
     public static async Task<string> MessagesRemove(
@@ -217,7 +217,7 @@ public sealed class ChannelTools
         McpServer server,
         ILoggerFactory loggerFactory,
         [Description("Message IDs to remove (1..200)")] string[] message_ids,
-        [Description(ChannelNameDescription)] string? channel = null,
+        [Description(DeletableChannelNameDescription)] string? channel = null,
         [Description(ChannelIdDescription)] string? channel_id = null,
         [Description(ConfirmChannelDescription)] string? confirm_channel = null,
         CancellationToken cancellationToken = default)
@@ -371,6 +371,10 @@ public sealed class ChannelTools
 
     private const string ChannelNameDescription =
         "Channel name, resolved in this session's repo, then the global scope. Pass this or channel_id, not both";
+    private const string DeletableChannelNameDescription =
+        "Channel name, resolved in this session's repo only, never the global scope; delete a global channel by channel_id. Pass this or channel_id, not both";
+    private const string DeleteScopeRule =
+        "A name resolves only in this session's repo and never falls back to a global channel of the same name; delete a global channel by `channel_id` with `confirm_channel`.";
     private const string ChannelIdDescription =
         "Channel ID (from channels, channel_create, a message, or an inbox item); reaches a channel scoped to any repo. Pass this or channel, not both";
     private const string ConfirmRule =
@@ -386,33 +390,49 @@ public sealed class ChannelTools
     private static async Task<string> ChannelIdAsync(
         BrokerClient client, SessionState state, string? channel, string? channelId, CancellationToken ct)
     {
-        var byName = !string.IsNullOrWhiteSpace(channel);
-        if (byName == !string.IsNullOrWhiteSpace(channelId))
-            throw new McpException("Pass exactly one of `channel` (name) or `channel_id`.");
-        if (!byName) return channelId!;
+        if (!ByName(channel, channelId)) return channelId!;
 
         var ch = await ResolveChannelAsync(client, channel!, state.RepoRoot, ct)
                  ?? await ResolveChannelAsync(client, channel!, null, ct);
         return ch?.ChannelId ?? throw new McpException($"Channel '{channel}' not found.");
     }
 
+    /// <summary>True for a name, false for an id; anything but exactly one of them is an error.</summary>
+    private static bool ByName(string? channel, string? channelId)
+    {
+        var byName = !string.IsNullOrWhiteSpace(channel);
+        if (byName == !string.IsNullOrWhiteSpace(channelId))
+            throw new McpException("Pass exactly one of `channel` (name) or `channel_id`.");
+        return byName;
+    }
+
     /// <summary>
-    /// Deletion by id reaches a channel in any repo, so a stray or stale id must not silently empty
-    /// another repo's history. The confirmation is compared with the name stored for THAT id — never
-    /// resolved in this session's repo, where the same name can be a different channel. Only the name is
-    /// compared: names are unique per repo, so a same-named channel elsewhere also passes, and the
-    /// result's repo_root shows which channel was hit. By name, the name is its own confirmation, but a
-    /// confirmation that contradicts it means the caller is unsure which channel it means.
+    /// By name, deletion resolves in this session's repo ONLY. The send/read fallback to a global
+    /// channel is unsafe here: a session in a linked worktree or outside Git does not see the main
+    /// checkout's repo channels, so `channel_clear("review")` would silently empty a global "review".
+    /// The name is its own confirmation, but a confirmation that contradicts it means the caller is
+    /// unsure which channel it means.
+    ///
+    /// Deletion by id reaches a channel in any repo, global included, so a stray or stale id must not
+    /// silently empty another repo's history. The confirmation is compared with the name stored for THAT
+    /// id — never resolved in this session's repo, where the same name can be a different channel. Only
+    /// the name is compared: names are unique per repo, so a same-named channel elsewhere also passes,
+    /// and the result's repo_root shows which channel was hit.
     /// </summary>
     private static async Task<string> DeletableChannelIdAsync(BrokerClient client, SessionState state,
         string? channel, string? channelId, string? confirmChannel, CancellationToken ct)
     {
-        var id = await ChannelIdAsync(client, state, channel, channelId, ct);
-        if (!string.IsNullOrWhiteSpace(channel))
-            return string.IsNullOrWhiteSpace(confirmChannel) || string.Equals(channel, confirmChannel, StringComparison.Ordinal)
-                ? id
-                : throw new McpException($"confirm_channel '{confirmChannel}' does not match channel '{channel}'. Nothing was deleted.");
+        if (ByName(channel, channelId))
+        {
+            if (!string.IsNullOrWhiteSpace(confirmChannel) && !string.Equals(channel, confirmChannel, StringComparison.Ordinal))
+                throw new McpException($"confirm_channel '{confirmChannel}' does not match channel '{channel}'. Nothing was deleted.");
+            var own = state.RepoRoot is null ? null : await ResolveChannelAsync(client, channel!, state.RepoRoot, ct);
+            return own?.ChannelId ?? throw new McpException($"Channel '{channel}' not found in " +
+                (state.RepoRoot is null ? "this session's repo: the session has no repo_root" : $"this session's repo_root '{state.RepoRoot}'") +
+                ". Deletion by name never falls back to a global channel; delete one by channel_id with confirm_channel. Nothing was deleted.");
+        }
 
+        var id = channelId!;
         var stored = await client.GetChannelAsync(id, ct);
         if (string.Equals(stored.Name, confirmChannel, StringComparison.Ordinal)) return id;
         var actual = $"channel_id '{id}' is '{stored.Name}' in repo_root " +

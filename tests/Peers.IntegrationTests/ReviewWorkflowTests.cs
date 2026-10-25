@@ -38,7 +38,7 @@ public sealed class ReviewWorkflowTests
         var files = fetched["files"]!.AsArray();
         Assert.Equal(await File.ReadAllBytesAsync(f.LogPath), await File.ReadAllBytesAsync(files.Single(x => x!["path"]!.GetValue<string>() == "evidence/0000-test.log")!["local_path"]!.GetValue<string>()));
         Assert.Equal(binary, await File.ReadAllBytesAsync(files.Single(x => x!["path"]!.GetValue<string>() == "untracked/new.bin")!["local_path"]!.GetValue<string>()));
-        await f.Broker.SendMessageAsync(f.ChannelId, new SendMessageRequest { AuthorPeerId = f.Reviewer.Id, To = [f.Driver.Id], Content = "Raw chat\nVERDICT: APPROVE" });
+        var rawChat = await f.Broker.SendMessageAsync(f.ChannelId, new SendMessageRequest { AuthorPeerId = f.Reviewer.Id, To = [f.Driver.Id], Content = "Raw chat\nVERDICT: APPROVE" });
         Assert.False((await f.Complete(id1))["completed"]!.GetValue<bool>());
         await f.Reviewer.Error("review_packet", new { action = "reply", channel_id = f.ChannelId, packet_id = id1,
             reply = new { verdict = "APPROVE", summary = "Invalid blocking approval", findings = new[] { new { severity = "HIGH", location = "test", finding = "missing coverage", fix = "run intended test", optional = false } } } });
@@ -47,6 +47,8 @@ public sealed class ReviewWorkflowTests
         await f.Reply(id2, "APPROVE", new string('x', 4000));
         var sync = await f.Status("sync"); Assert.Equal("approved", sync["state"]!.GetValue<string>());
         var handled = sync["ready_to_ack"]!.AsArray().Select(x => x!.GetValue<string>()).ToArray(); Assert.NotEmpty(handled);
+        // Raw chat is no review record, so sync leaves its receipt for the agent to read.
+        Assert.DoesNotContain(await f.ReceiptOf(rawChat!.MessageId), handled);
         await f.Broker.AckInboxAsync(f.Driver.Id, handled); // Ordinary wait/ack cannot erase channel approval.
         await File.WriteAllTextAsync(Path.Combine(f.Root, "value.txt"), "3\n");
         Assert.Equal("stale", (await f.Status())["state"]!.GetValue<string>());
@@ -157,6 +159,48 @@ public sealed class ReviewWorkflowTests
         await f.Broker.DeregisterAsync(f.Driver.Id);
         await using var successor = await f.NewPeer("successor-after-lost-complete");
         Assert.Equal("completed", (await successor.Call("review_checkpoint", new { action = "resume", channel_id = f.ChannelId, source_root = f.Root, reason = "recover confirmed completion" }))["state"]!.GetValue<string>());
+    }
+
+    // A lost request response leaves delivery unknown, so every deduplicated retry pauses the round. A
+    // verdict reduced between two retries is held in PrePauseState; the second retry must not overwrite
+    // it with "paused", or resume restores "paused" and the approval is lost.
+    [Fact]
+    public async Task Second_deduplicated_retry_keeps_a_verdict_that_arrived_between_retries()
+    {
+        await using var f = await ReviewFixture.CreateAsync();
+        f.Handler.LoseNextSendKind = "request";
+        await f.Driver.Error("review_packet", new { action = "publish", channel_id = f.ChannelId, request = f.PlanRequest() });
+        var first = await f.PublishPlan(); var p = first["packet_id"]!.GetValue<string>();
+        Assert.True(first["deduplicated"]!.GetValue<bool>());
+        Assert.Equal("paused", first["state"]!.GetValue<string>());
+        await f.Reply(p, "APPROVE");
+        var second = await f.PublishPlan();
+        Assert.True(second["deduplicated"]!.GetValue<bool>());
+        Assert.Equal("paused", second["state"]!.GetValue<string>());
+        Assert.Equal("approved", (await f.Driver.Call("review_checkpoint", new { action = "resume", channel_id = f.ChannelId }))["state"]!.GetValue<string>());
+    }
+
+    // Sync counts as handled only the review records that reduction applied. A plain question in the
+    // review channel appears in no review result, so it must stay an unrelated receipt the agent reads,
+    // never one it acknowledges unseen.
+    [Fact]
+    public async Task Sync_keeps_a_plain_question_in_the_review_channel_out_of_ready_to_ack()
+    {
+        await using var f = await ReviewFixture.CreateAsync();
+        var p = (await f.PublishPlan())["packet_id"]!.GetValue<string>();
+        var question = await f.Broker.SendMessageAsync(f.ChannelId, new SendMessageRequest
+            { AuthorPeerId = f.Reviewer.Id, To = [f.Driver.Id], Content = "Question: should value.txt keep its trailing newline?" });
+        await f.Reply(p, "APPROVE");
+
+        var sync = await f.Status("sync");
+        Assert.Equal("approved", sync["state"]!.GetValue<string>());
+        Assert.True(sync["applied_through_seq"]!.GetValue<long>() > question!.Seq);
+        var ready = sync["ready_to_ack"]!.AsArray().Select(x => x!.GetValue<string>()).ToArray();
+        var unrelated = sync["unrelated_receipts"]!.AsArray().Select(x => x!["inbox_id"]!.GetValue<string>()).ToArray();
+        var questionReceipt = await f.ReceiptOf(question.MessageId);
+        Assert.DoesNotContain(questionReceipt, ready);
+        Assert.Contains(questionReceipt, unrelated);
+        Assert.Contains(await f.ReceiptOf(sync["verdict"]!["message_id"]!.GetValue<string>()), ready);
     }
 
     [Fact]
@@ -317,6 +361,9 @@ internal sealed class ReviewFixture : IAsyncDisposable
     { action = "reply", channel_id = ChannelId, packet_id = id, reply = new { verdict, summary, findings = verdict == "APPROVE" ? Array.Empty<object>() : new object[] { new { severity = "HIGH", location = "verification", finding = "Missing coverage", fix = "Run intended checks", optional = false } } } });
     internal Task<JsonNode> Status(string action = "status") => Driver.Call("review_checkpoint", new { action, channel_id = ChannelId });
     internal Task<JsonNode> Complete(string id) => Driver.Call("review_checkpoint", new { action = "complete", channel_id = ChannelId, expected_packet_id = id });
+    /// <summary>The driver's inbox receipt for one channel message.</summary>
+    internal async Task<string> ReceiptOf(string messageId) => (await Broker.GetInboxAsync(Driver.Id, limit: 500))!.Items
+        .Single(i => i.Event.Type == Peers.Shared.Models.EventTypes.ChannelMessageAdded && i.Event.Payload.Contains(messageId, StringComparison.Ordinal)).InboxId;
     internal object Proposal(string before, string after, string cue = "When test counts matter") => new { cue, lesson = "Inspect counts", effect = "helped", confidence = "high", confidence_reason = "Fixture contrast",
         before = new[] { new { packet_id = before, path = "task.txt", quote = "Set value to two" } }, after = new[] { new { packet_id = after, path = "evidence/0000-test.log", quote = "# pass 1" } } };
     internal Task<byte[]> Git(params string[] args) => ReviewSnapshot.RunGitAsync(Root, args);

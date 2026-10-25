@@ -335,7 +335,13 @@ internal sealed partial class ReviewWorkflow(BrokerClient client, SessionState s
                 var message = await PinnedAsync(existing.Request!);
                 ReviewJson.Require(message is not null, "Deleted review requests cannot be recreated; create a new channel.");
                 ledger.Publication = null;
-                if (existing.Delivery is null) { ledger.PrePauseState = ledger.State; ledger.State = "paused"; }
+                if (existing.Delivery is null)
+                {
+                    // A second deduplicated retry must not overwrite the state saved by the first: a verdict
+                    // reduced in between already lives in PrePauseState, and resume restores it.
+                    if (ledger.State != "paused") ledger.PrePauseState = ledger.State;
+                    ledger.State = "paused";
+                }
                 await PersistAsync(store, ledger);
                 return PacketResult(ledger, existing, new SendMessageResponse { ChannelId = channelId, MessageId = message!.MessageId,
                     Seq = message.Seq, Mentions = message.Mentions, Deduplicated = true, Delivery = existing.Delivery });

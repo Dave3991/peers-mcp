@@ -228,7 +228,10 @@ internal sealed partial class ReviewWorkflow
                         if (original is null || original.Seq != seq || original.MessageId != Field(payload, "message_id") ||
                             original.AuthorPeerId != Field(payload, "author_peer_id") || original.Content != Field(payload, "content"))
                         { IntegrityFailure(ledger, "withdrawn"); }
-                        else handled = seq <= ledger.AppliedThroughSeq;
+                        // Only a review record is handled by reduction. Any other message here — a question
+                        // from the reviewer or a person — is shown by no review result, so it stays an
+                        // unrelated receipt that the agent must read, not one it acknowledges unseen.
+                        else handled = seq <= ledger.AppliedThroughSeq && ParseRecord(original) is not null;
                     }
                     else if (item.Event.Type is EventTypes.ChannelMessageRemoved or EventTypes.ChannelCleared)
                     { await RecheckAsync(ledger, artifacts: false, ct); handled = true; }

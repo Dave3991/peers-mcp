@@ -1056,6 +1056,20 @@ public sealed class McpSubscriptionTests : IAsyncLifetime
         var listed = (await _client.ListToolsAsync()).Select(t => t.Name).Order().ToArray();
 
         Assert.Equal(declared, listed);
+
+        // And the surface itself, spelled out: a tool silently disappearing from BOTH sides is still a
+        // contract change, and this is the line that has to be edited to make it deliberate.
+        Assert.Equal(
+            new[]
+            {
+                "artifact_get", "artifact_list", "artifact_publish",
+                "channel_clear", "channel_create", "channels", "claim", "claims",
+                "context_export", "context_import", "messages_remove",
+                "peers", "presence", "read", "release",
+                "review_checkpoint", "review_lesson", "review_packet",
+                "send", "wait",
+            },
+            listed);
     }
 
     [Fact]
@@ -1354,6 +1368,48 @@ public sealed class McpSubscriptionTests : IAsyncLifetime
         Assert.Equal(channel.ChannelId, Str(cleared["channel_id"]));
         Assert.Equal(1, cleared["deleted_messages"]!.GetValue<int>());
         Assert.Empty((await _broker.ReadChannelMessagesAsync(channel.ChannelId, _peerId))!.Messages);
+    }
+
+    // Delete by name never falls back to a global channel. A session in a linked worktree, or outside
+    // Git, does not see the main checkout's repo channels, so a fallback would silently empty a global
+    // channel that merely shares the name. Deleting a global channel takes channel_id + confirm_channel.
+    [Theory]
+    [InlineData("/repo")]
+    [InlineData(null)]
+    public async Task DeletionByName_NeverFallsBackToAGlobalChannelOfThatName(string? sessionRepo)
+    {
+        await RegisterAsync();
+        _state.RepoRoot = sessionRepo;
+        var name = $"global-only-{Guid.NewGuid():N}";
+        var global = await _broker.CreateChannelAsync(new CreateChannelRequest
+            { Name = name, CreatedByPeerId = _peerId! });
+        async Task<string> PostAsync(string content) => (await _broker.SendMessageAsync(global.ChannelId,
+            new SendMessageRequest { AuthorPeerId = _peerId!, Content = content }))!.MessageId;
+        var first = await PostAsync("first");
+        await PostAsync("second");
+        var where = sessionRepo is null ? "the session has no repo_root" : $"this session's repo_root '{sessionRepo}'";
+
+        foreach (var (tool, args) in new (string, Dictionary<string, object?>)[]
+        {
+            ("channel_clear", new() { ["channel"] = name }),
+            ("channel_clear", new() { ["channel"] = name, ["confirm_channel"] = name }),
+            ("messages_remove", new() { ["channel"] = name, ["message_ids"] = new[] { first } }),
+        })
+        {
+            var rejected = await _client.CallToolAsync(tool, args);
+            Assert.True(rejected.IsError is true, $"{tool} deleted from the global channel by name");
+            Assert.Contains($"Channel '{name}' not found in", TextOf(rejected));
+            Assert.Contains(where, TextOf(rejected));
+            Assert.Contains("never falls back to a global channel", TextOf(rejected));
+        }
+        Assert.Equal(new[] { "first", "second" },
+            (await _broker.ReadChannelMessagesAsync(global.ChannelId, _peerId))!.Messages.Select(m => m.Content));
+
+        // send/read keep their fallback, and the explicit id path still reaches the global channel.
+        Assert.Equal(global.ChannelId, Str((await CallOkAsync("read", new() { ["channel"] = name }))["channel_id"]));
+        var cleared = await CallOkAsync("channel_clear", new() { ["channel_id"] = global.ChannelId, ["confirm_channel"] = name });
+        Assert.Null(cleared["repo_root"]);
+        Assert.Equal(2, cleared["deleted_messages"]!.GetValue<int>());
     }
 
     /// <summary>Calls a tool, fails with the server's own message when it errored, and parses the result.</summary>

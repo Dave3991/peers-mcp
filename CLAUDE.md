@@ -36,10 +36,12 @@ The whole agent-facing surface, and the only tools that exist:
 
 `channel_clear` and `messages_remove` permanently delete shared history and its inbox deliveries.
 Clearing keeps the channel; neither operation resets message sequences. Already-read content cannot
-be recalled from clients. `confirm_channel` is the channel's exact name; blank counts as absent. Addressed
-by `channel_id`, both require it, checked against the name the broker stores for that id (the name only,
-not the repo; the result shows `repo_root`). Addressed by `channel`, it is optional but must equal `channel`
-if given. A missing (by id) or mismatched one deletes nothing.
+be recalled from clients. By `channel` (name) they resolve only in this session's repo and never fall
+back to a global channel of the same name; delete a global channel by `channel_id`. `confirm_channel`
+is the channel's exact name; blank counts as absent. Addressed by `channel_id`, both require it, checked
+against the name the broker stores for that id (the name only, not the repo; the result shows
+`repo_root`). Addressed by `channel`, it is optional but must equal `channel` if given. A missing (by
+id) or mismatched one deletes nothing.
 
 When participating in a multi-session workflow with this MCP server:
 
