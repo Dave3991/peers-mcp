@@ -37,6 +37,9 @@ const port = await unusedPort();
 const peersEnv = { ...process.env, PEERS_STATE_DIR: state, PEERS_DB_PATH: join(state, 'peers.db'), PEERS_PORT: String(port),
   PEERS_BROKER_PROJECT: join(B, 'src/Peers.Broker/Peers.Broker.csproj') };
 delete peersEnv.PEERS_HOME;
+// The broker under test is built from this checkout, so its /health contract must be BrokerContract.Current here.
+const contract = Number(/const int Current = (\d+);/.exec(await readFile(join(B, 'src/Peers.Shared/BrokerRuntime.cs'), 'utf8'))?.[1]);
+assert(Number.isInteger(contract), 'BrokerContract.Current not found in src/Peers.Shared/BrokerRuntime.cs');
 
 // NDJSON framing from Aletheia/scripts/try-mcp-framed.mjs; no copied environment defaults.
 class Mcp {
@@ -234,7 +237,7 @@ try {
   assert.equal(broker.port, port); await access(join(state, 'peers.db'));
   const brokerPath = execFileSync('ps', ['-ww', '-p', String(broker.pid), '-o', 'comm='], { encoding: 'utf8' }).trim();
   assert(brokerPath.startsWith(B + '/src/Peers.Broker/') && brokerPath.endsWith('/Peers.Broker'), 'Private discovery points outside candidate broker'); ownedBroker = true;
-  assert.equal((await (await fetch(`http://127.0.0.1:${port}/health`)).json()).contract, 6);
+  assert.equal((await (await fetch(`http://127.0.0.1:${port}/health`)).json()).contract, contract);
   const request = { phase: 'PLAN', round: 1, task: 'Change value.txt from 1\\n to 2\\n. Prove that the intended Node test ran. Preserve Czech/emoji and binary evidence exactly.',
     base_sha: base, reviewer_peer_id: reviewerId, change_summary: 'Review the verification plan', uncertainties: 'A zero exit code can hide a filtered-out test.', source_root: repo, plan_path: planPath };
   const publish = request => driver.call('review_packet', { action: 'publish', channel_id: channelId, request });
@@ -316,7 +319,7 @@ try {
   };
   assert.equal((await driver.call('review_lesson', { action: 'prepare', channel_id: channelId, proposal: { ...proposal, effect: 'confounded' } })).status, 'no_entry');
   const prepared = await driver.call('review_lesson', { action: 'prepare', channel_id: channelId, proposal }); assert.equal(prepared.status, 'prepared');
-  console.log(JSON.stringify({ workflow_smoke: 'passed', channel_id: channelId, completed_packet: code3, evidence_bytes: Buffer.byteLength(afterText), source_changed_since_completion: true, contract: 6, index_unchanged_by_capture: true }));
+  console.log(JSON.stringify({ workflow_smoke: 'passed', channel_id: channelId, completed_packet: code3, evidence_bytes: Buffer.byteLength(afterText), source_changed_since_completion: true, contract, index_unchanged_by_capture: true }));
   if (flags.has('--with-aletheia')) {
     const memoryInfo = await startMemory();
     if (flags.has('--with-omp')) await runOmp(channelId, code3, proposal, memoryInfo, prepared.marker);

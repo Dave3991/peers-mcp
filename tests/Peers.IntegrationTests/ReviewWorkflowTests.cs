@@ -243,6 +243,24 @@ public sealed class ReviewWorkflowTests
         Assert.True(completed["completed"]!.GetValue<bool>());
         Assert.Null(completed["lesson_hint"]);
     }
+
+    // The hint is read after the completion was sent and persisted; a broker fault at that moment
+    // drops the hint and must not turn the finished completion into a tool error.
+    [Fact]
+    public async Task Completion_survives_a_broker_fault_while_reading_the_lesson_hint()
+    {
+        await using var f = await ReviewFixture.CreateAsync();
+        var p = (await f.PublishPlan())["packet_id"]!.GetValue<string>(); await f.Reply(p, "APPROVE");
+        var c1 = (await f.PublishCode(1, p))["packet_id"]!.GetValue<string>(); await f.Reply(c1, "CHANGES");
+        var c2 = (await f.PublishCode(2, c1))["packet_id"]!.GetValue<string>(); await f.Reply(c2, "APPROVE");
+        f.Handler.FailReadAfterPersistedSendKind = "control";
+        var completed = await f.Complete(c2);
+        Assert.Null(f.Handler.FailReadAfterPersistedSendKind); // The fault fired on the hint's read.
+        Assert.True(completed["completed"]!.GetValue<bool>());
+        Assert.Equal("completed", completed["state"]!.GetValue<string>());
+        Assert.Null(completed["lesson_hint"]);
+        Assert.NotNull((await f.Complete(c2))["lesson_hint"]);
+    }
 }
 
 internal sealed class ReviewFixture : IAsyncDisposable
@@ -346,8 +364,14 @@ internal sealed class ReviewFaultHandler(HttpMessageHandler inner) : DelegatingH
     internal bool LoseNextAck { get; set; }
     internal Action? ChangeOnBlob { get; set; }
     internal string? LoseNextSendKind { get; set; }
+    // Fails the first channel read after the checkpoint that follows a managed send of this kind: the
+    // read a completion makes once its control is sent and its ledger persisted.
+    internal string? FailReadAfterPersistedSendKind { get; set; }
+    private bool _sendSeen, _failNextRead;
     protected override async Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken ct)
     {
+        if (_failNextRead && request.Method == HttpMethod.Get && request.RequestUri!.AbsolutePath.EndsWith("/messages", StringComparison.Ordinal))
+        { _failNextRead = false; FailReadAfterPersistedSendKind = null; throw new HttpRequestException("Broker read failed after completion was persisted"); }
         if (ChangeOnBlob is not null && request.Method == HttpMethod.Post && request.RequestUri!.AbsolutePath == "/artifacts")
         {
             var json = await request.Content!.ReadFromJsonAsync<JsonElement>(ct);
@@ -360,6 +384,18 @@ internal sealed class ReviewFaultHandler(HttpMessageHandler inner) : DelegatingH
             var content = json.GetProperty("content").GetString()!;
             if (content.StartsWith("PEERS_REVIEW_V1\n", StringComparison.Ordinal) && content.Contains($"\"kind\":\"{LoseNextSendKind}\"", StringComparison.Ordinal))
             { LoseNextSendKind = null; response.Dispose(); throw new HttpRequestException("Managed send committed; response lost"); }
+        }
+        if (FailReadAfterPersistedSendKind is { } failKind && request.Method == HttpMethod.Post)
+        {
+            var path = request.RequestUri!.AbsolutePath;
+            if (!_sendSeen && path.EndsWith("/messages", StringComparison.Ordinal))
+            {
+                var content = (await request.Content!.ReadFromJsonAsync<JsonElement>(ct)).GetProperty("content").GetString()!;
+                _sendSeen = content.StartsWith("PEERS_REVIEW_V1\n", StringComparison.Ordinal) && content.Contains($"\"kind\":\"{failKind}\"", StringComparison.Ordinal);
+            }
+            else if (_sendSeen && path == "/artifacts" &&
+                (await request.Content!.ReadFromJsonAsync<JsonElement>(ct)).GetProperty("name").GetString() == "checkpoint")
+            { _sendSeen = false; _failNextRead = true; }
         }
         if (LoseNextAck && request.RequestUri!.AbsolutePath.EndsWith("/inbox/ack", StringComparison.Ordinal))
         { LoseNextAck = false; response.Dispose(); throw new HttpRequestException("Ack committed; response lost"); }

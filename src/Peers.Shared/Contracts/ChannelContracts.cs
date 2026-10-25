@@ -7,6 +7,7 @@ public sealed class CreateChannelRequest
     public required string CreatedByPeerId { get; init; }
 }
 
+/// <summary>A channel's stored identity: returned by POST /channels and GET /channels/{id}.</summary>
 public sealed class CreateChannelResponse
 {
     public required string ChannelId { get; init; }
@@ -33,14 +34,6 @@ public sealed class ChannelSummary
     public required string CreatedByPeerId { get; init; }
     public required string CreatedAt { get; init; }
     public long MessageCount { get; init; }
-}
-
-/// <summary>A channel's stored identity, fetched by id.</summary>
-public sealed class ChannelDto
-{
-    public required string ChannelId { get; init; }
-    public required string Name { get; init; }
-    public string? RepoRoot { get; init; }
 }
 
 public sealed class SendMessageRequest
@@ -90,7 +83,8 @@ public sealed class RemoveMessagesRequest
 public sealed class RemoveMessagesResponse
 {
     public required string ChannelId { get; init; }
-    public required string Name { get; init; }
+    /// <summary>Optional: a contract-6 broker deletes without returning it, and the CLI must still read that reply.</summary>
+    public string? Name { get; init; }
     public string? RepoRoot { get; init; }
     public int DeletedMessages { get; init; }
 }

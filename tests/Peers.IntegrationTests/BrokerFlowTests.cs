@@ -241,6 +241,20 @@ public sealed class BrokerFlowTests : IAsyncLifetime
         Assert.Equal(HttpStatusCode.NotFound, (await _http.GetAsync("/channels/missing")).StatusCode);
     }
 
+    // A rebuilt CLI can still meet the running contract-6 broker, which deletes and then replies without
+    // name or repo_root. The CLI reads that reply exactly like this (camelCase, case-insensitive); it must
+    // not fail after the delete already happened.
+    [Fact]
+    public async Task RemovalReply_FromAContract6Broker_StillDeserializes()
+    {
+        using var reply = new StringContent("""{"channelId":"ch-1","deletedMessages":2}""", System.Text.Encoding.UTF8, "application/json");
+        var result = await reply.ReadFromJsonAsync<RemoveMessagesResponse>(JsonOpts);
+        Assert.Equal("ch-1", result!.ChannelId);
+        Assert.Equal(2, result.DeletedMessages);
+        Assert.Null(result.Name);
+        Assert.Null(result.RepoRoot);
+    }
+
     // -------------------------------------------------------------------------
     // Helpers
     // -------------------------------------------------------------------------

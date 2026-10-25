@@ -1313,6 +1313,49 @@ public sealed class McpSubscriptionTests : IAsyncLifetime
         Assert.Empty((await _broker.ReadChannelMessagesAsync(foreign.ChannelId, _peerId))!.Messages);
     }
 
+    // By name, confirm_channel is optional, but a given one must equal `channel`: a contradiction means
+    // the caller is unsure which channel it means, so nothing is deleted. A blank one counts as absent.
+    [Fact]
+    public async Task DeletionByName_RejectsAMismatchedConfirmation_AndDeletesOnAMatch()
+    {
+        await RegisterAsync();
+        _state.RepoRoot = "/repo";
+        var name = $"confirm-name-{Guid.NewGuid():N}";
+        var channel = await _broker.CreateChannelAsync(new CreateChannelRequest
+            { Name = name, RepoRoot = "/repo", CreatedByPeerId = _peerId! });
+        async Task<string> PostAsync(string content) => (await _broker.SendMessageAsync(channel.ChannelId,
+            new SendMessageRequest { AuthorPeerId = _peerId!, Content = content }))!.MessageId;
+        var first = await PostAsync("first");
+        var second = await PostAsync("second");
+        await PostAsync("third");
+
+        foreach (var (tool, args, wrong) in new (string, Dictionary<string, object?>, string)[]
+        {
+            ("channel_clear", new() { ["channel"] = name, ["confirm_channel"] = name.ToUpperInvariant() }, name.ToUpperInvariant()),
+            ("messages_remove", new() { ["channel"] = name, ["confirm_channel"] = "wrong", ["message_ids"] = new[] { first } }, "wrong"),
+        })
+        {
+            var rejected = await _client.CallToolAsync(tool, args);
+            Assert.True(rejected.IsError is true, $"{tool} accepted confirm_channel '{wrong}'");
+            Assert.Contains($"confirm_channel '{wrong}' does not match channel '{name}'. Nothing was deleted.", TextOf(rejected));
+        }
+        Assert.Equal(new[] { "first", "second", "third" },
+            (await _broker.ReadChannelMessagesAsync(channel.ChannelId, _peerId))!.Messages.Select(m => m.Content));
+
+        var blank = await CallOkAsync("messages_remove", new()
+            { ["channel"] = name, ["confirm_channel"] = " ", ["message_ids"] = new[] { first } });
+        Assert.Equal(1, blank["deleted_messages"]!.GetValue<int>());
+        var removed = await CallOkAsync("messages_remove", new()
+            { ["channel"] = name, ["confirm_channel"] = name, ["message_ids"] = new[] { second } });
+        Assert.Equal(1, removed["deleted_messages"]!.GetValue<int>());
+        Assert.Equal("third", Assert.Single((await _broker.ReadChannelMessagesAsync(channel.ChannelId, _peerId))!.Messages).Content);
+
+        var cleared = await CallOkAsync("channel_clear", new() { ["channel"] = name, ["confirm_channel"] = name });
+        Assert.Equal(channel.ChannelId, Str(cleared["channel_id"]));
+        Assert.Equal(1, cleared["deleted_messages"]!.GetValue<int>());
+        Assert.Empty((await _broker.ReadChannelMessagesAsync(channel.ChannelId, _peerId))!.Messages);
+    }
+
     /// <summary>Calls a tool, fails with the server's own message when it errored, and parses the result.</summary>
     private async Task<JsonNode> CallOkAsync(string tool, Dictionary<string, object?>? args = null)
     {

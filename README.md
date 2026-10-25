@@ -90,10 +90,14 @@ scoped to another worktree.
 `read`. Both return `{ channel_id, name, repo_root, deleted_messages }`; duplicate, missing, or
 other-channel IDs are ignored, and repeating a completed removal returns zero.
 
-Addressed by `channel_id` instead of a name, both also require `confirm_channel`: the channel's exact,
-case-sensitive name. It is compared with the name the broker stores for that id, never resolved in this
-session's repository. A missing or mismatched confirmation deletes nothing, and the error names the
-channel and `repo_root` the id actually belongs to. Addressing by name needs no confirmation.
+`confirm_channel` is the channel's exact, case-sensitive name; a blank one counts as absent.
+Addressed by `channel_id` instead of a name, both require it. It is compared with the name the broker
+stores for that id, never resolved in this session's repository. Only the name is compared, not the
+repository: names are unique per repository, so a same-named channel in another repository also passes,
+and the result's `repo_root` shows which channel was hit. A missing or mismatched confirmation deletes
+nothing, and the error names the channel and `repo_root` the id actually belongs to.
+Addressed by name, `confirm_channel` is optional. If given, it must equal `channel`; a mismatch deletes
+nothing and the error says so.
 
 Removal affects every session, not just your view. Message rows, original event payloads, and inbox
 receipts are deleted atomically, so withdrawn mentions stop being delivered by `wait`. Already-returned
@@ -265,6 +269,7 @@ dotnet build src/Peers.Broker/Peers.Broker.csproj -c Release
 dotnet build src/Peers.Mcp/Peers.Mcp.csproj -c Release
 ```
 
+Contract 7 adds `GET /channels/{id}`, which deletion by `channel_id` reads to confirm the channel name.
 Contract 6 adds `NotifyPeers=false` for internal review parts, indexes, roots, and checkpoints.
 Ordinary `artifact_publish` keeps its normal notifications. SQLite schema v6 does not change.
 Broker startup checks the reported contract after either readiness path.
@@ -311,7 +316,7 @@ tests/
 ```
 
 **Broker** (`localhost:7856`) stores shared coordination facts and immutable evidence in SQLite at `~/.peers/peers.db` (schema v6).
-`/health` reports HTTP contract 6 independently of the schema version.
+`/health` reports HTTP contract 7 independently of the schema version.
 The broker manages leases, persistent inbox delivery, event fan-out, request limits, and cleanup.
 Internal review artifacts suppress notifications without changing storage or versioning.
 

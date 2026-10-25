@@ -185,7 +185,7 @@ public sealed class ChannelTools
     }
 
     [McpServerTool(Name = "channel_clear"), Description(
-        "Permanently clear a channel's messages for every session, including pending inbox deliveries. Address it by `channel` (name) or `channel_id` — exactly one. " + ConfirmByIdRule + "\n" +
+        "Permanently clear a channel's messages for every session, including pending inbox deliveries. Address it by `channel` (name) or `channel_id` — exactly one. " + ConfirmRule + "\n" +
         "The channel remains usable and sequence numbers are not reset. Returns: { channel_id, name, repo_root, deleted_messages }.")]
     public static async Task<string> ChannelClear(
         BrokerClient client,
@@ -208,7 +208,7 @@ public sealed class ChannelTools
     }
 
     [McpServerTool(Name = "messages_remove"), Description(
-        "Permanently remove selected messages from a channel for every session, including pending inbox deliveries. Address it by `channel` (name) or `channel_id` — exactly one. " + ConfirmByIdRule + "\n" +
+        "Permanently remove selected messages from a channel for every session, including pending inbox deliveries. Address it by `channel` (name) or `channel_id` — exactly one. " + ConfirmRule + "\n" +
         "Provide 1..200 message IDs from read/send. Missing IDs are ignored; sequence numbers are not reset.\n" +
         "Returns: { channel_id, name, repo_root, deleted_messages } — repeated removal returns zero.")]
     public static async Task<string> MessagesRemove(
@@ -373,10 +373,10 @@ public sealed class ChannelTools
         "Channel name, resolved in this session's repo, then the global scope. Pass this or channel_id, not both";
     private const string ChannelIdDescription =
         "Channel ID (from channels, channel_create, a message, or an inbox item); reaches a channel scoped to any repo. Pass this or channel, not both";
-    private const string ConfirmByIdRule =
-        "By `channel_id` it also needs `confirm_channel`, the channel's exact name, checked against the name the broker stores for that id; a missing or wrong one deletes nothing.";
+    private const string ConfirmRule =
+        "`confirm_channel` is the channel's exact, case-sensitive name; a blank one counts as absent. With `channel_id` it is required and compared with the name the broker stores for that id — the name only, not the repo: names are unique per repo, so check repo_root in the result. With `channel` it is optional, but if given it must equal `channel`. A missing (by id) or mismatched confirmation deletes nothing.";
     private const string ConfirmChannelDescription =
-        "Required with channel_id: the channel's exact, case-sensitive name, checked against the name stored for that id. Not needed with channel";
+        "The channel's exact, case-sensitive name; blank counts as absent. Required with channel_id: compared with the name stored for that id (the name only, not the repo). Optional with channel: if given, it must equal channel. A mismatch deletes nothing";
 
     /// <summary>
     /// The broker routes are keyed by id, so an id goes straight through — an unknown one is the
@@ -399,14 +399,19 @@ public sealed class ChannelTools
     /// <summary>
     /// Deletion by id reaches a channel in any repo, so a stray or stale id must not silently empty
     /// another repo's history. The confirmation is compared with the name stored for THAT id — never
-    /// resolved in this session's repo, where the same name can be a different channel. A name is
-    /// already its own confirmation, so the name path is unchanged.
+    /// resolved in this session's repo, where the same name can be a different channel. Only the name is
+    /// compared: names are unique per repo, so a same-named channel elsewhere also passes, and the
+    /// result's repo_root shows which channel was hit. By name, the name is its own confirmation, but a
+    /// confirmation that contradicts it means the caller is unsure which channel it means.
     /// </summary>
     private static async Task<string> DeletableChannelIdAsync(BrokerClient client, SessionState state,
         string? channel, string? channelId, string? confirmChannel, CancellationToken ct)
     {
         var id = await ChannelIdAsync(client, state, channel, channelId, ct);
-        if (!string.IsNullOrWhiteSpace(channel)) return id;
+        if (!string.IsNullOrWhiteSpace(channel))
+            return string.IsNullOrWhiteSpace(confirmChannel) || string.Equals(channel, confirmChannel, StringComparison.Ordinal)
+                ? id
+                : throw new McpException($"confirm_channel '{confirmChannel}' does not match channel '{channel}'. Nothing was deleted.");
 
         var stored = await client.GetChannelAsync(id, ct);
         if (string.Equals(stored.Name, confirmChannel, StringComparison.Ordinal)) return id;

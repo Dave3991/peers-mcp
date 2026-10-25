@@ -82,17 +82,23 @@ internal sealed partial class ReviewWorkflow
             dispatchAllowed, saveRequest, intent.Failure, intent.Warnings);
     // Non-authoritative pointer at review_lesson after a completed lineage that needed CHANGES rounds.
     // It only reads pinned verdicts: no lesson intent, ledger field, or channel record is written.
+    // It is built after the completion landed, so a broker fault here drops the hint instead of
+    // reporting that finished completion as an error.
     private async Task<object?> LessonHintAsync(ReviewLedger ledger)
     {
         if (ledger.State != "completed") return null;
         var before = new List<object>();
-        foreach (var packet in ledger.Packets)
+        try
         {
-            if (packet.VerdictValue != "CHANGES" || packet.Verdict is not { } reference) continue;
-            var verdict = await PinnedAsync(reference);
-            before.Add(new { packet_id = packet.PacketId, phase = packet.Manifest.Phase, round = packet.Manifest.Round,
-                verdict_message_id = reference.MessageId, findings = verdict is null ? Array.Empty<string>() : FindingSummaries(verdict.Content) });
+            foreach (var packet in ledger.Packets)
+            {
+                if (packet.VerdictValue != "CHANGES" || packet.Verdict is not { } reference) continue;
+                var verdict = await PinnedAsync(reference);
+                before.Add(new { packet_id = packet.PacketId, phase = packet.Manifest.Phase, round = packet.Manifest.Round,
+                    verdict_message_id = reference.MessageId, findings = verdict is null ? Array.Empty<string>() : FindingSummaries(verdict.Content) });
+            }
         }
+        catch (BrokerApiException) { return null; }
         return before.Count == 0 ? null : new
         {
             before, after = ledger.LatestPacketId,

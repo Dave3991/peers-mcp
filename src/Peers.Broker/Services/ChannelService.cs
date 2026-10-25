@@ -158,9 +158,9 @@ public sealed class ChannelService(
         return new ListChannelsResponse { Channels = list.ToArray() };
     }
 
-    public async Task<ChannelDto?> GetAsync(string channelId, CancellationToken ct) =>
+    public async Task<CreateChannelResponse?> GetAsync(string channelId, CancellationToken ct) =>
         await channels.GetAsync(channelId, ct) is { } row
-            ? new ChannelDto { ChannelId = row.ChannelId, Name = row.Name, RepoRoot = row.RepoRoot }
+            ? new CreateChannelResponse { ChannelId = row.ChannelId, Name = row.Name, RepoRoot = row.RepoRoot }
             : null;
 
     public async Task<Result<RemoveMessagesResponse>> ClearAsync(string channelId, CancellationToken ct)

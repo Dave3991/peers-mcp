@@ -54,8 +54,8 @@ public sealed class BrokerClient : IDisposable
         return (await GetAsync<ListChannelsResponse>($"/channels{query}"))!;
     }
 
-    public async Task<ChannelDto> GetChannelAsync(string channelId, CancellationToken cancellationToken = default) =>
-        (await GetAsync<ChannelDto>($"/channels/{Uri.EscapeDataString(channelId)}", cancellationToken))!;
+    public async Task<CreateChannelResponse> GetChannelAsync(string channelId, CancellationToken cancellationToken = default) =>
+        (await GetAsync<CreateChannelResponse>($"/channels/{Uri.EscapeDataString(channelId)}", cancellationToken))!;
 
     public async Task<SendMessageResponse?> SendMessageAsync(string channelId, SendMessageRequest req) =>
         await PostAsync<SendMessageResponse>($"/channels/{Uri.EscapeDataString(channelId)}/messages", req);
