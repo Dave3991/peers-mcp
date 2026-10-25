@@ -286,9 +286,28 @@ public sealed class ReviewWorkflowTests
         Assert.Contains("reply.findings[0].fix is missing or empty; it must be non-blank text.", missing);
         var mistyped = await f.Reviewer.Error("review_packet", new { action = "reply", channel_id = f.ChannelId, packet_id = p,
             reply = new { verdict = "CHANGES", summary = "s", findings = new[] { new { severity = "HIGH", location = "x", finding = "y", fix = "z", optional = "no" } } } });
-        Assert.Contains("reply.findings[0].optional is \"no\"; it must be true or false.", mistyped);
+        Assert.Contains("reply.findings[0].optional has the wrong JSON type: ", mistyped);
+        Assert.Contains("System.Boolean", mistyped);
         var topLevel = await f.Reviewer.Error("review_packet", new { action = "fetch", channel_id = f.ChannelId, packet_id = 5 });
-        Assert.Contains("packet_id is 5; it must be a string.", topLevel);
+        Assert.Contains("packet_id has the wrong JSON type: ", topLevel);
+        Assert.Contains("System.String", topLevel);
+    }
+
+    // The argument-type wrapper translates only binding failures. A tool's own McpException that wraps a
+    // JsonException — here the store's "Malformed review state" — must reach the caller unchanged, not
+    // be rewritten into an argument error the arguments never caused.
+    [Fact]
+    public async Task Corrupt_reviewer_state_reports_malformed_state_not_an_argument_error()
+    {
+        await using var f = await ReviewFixture.CreateAsync();
+        var p = (await f.PublishPlan())["packet_id"]!.GetValue<string>();
+        var reviewerState = Path.Combine(f.Storage, "review-workflows", ReviewJson.Hash(f.ChannelId), "reviewer-" + ReviewJson.Hash(f.Reviewer.Id));
+        Directory.CreateDirectory(reviewerState);
+        await File.WriteAllTextAsync(Path.Combine(reviewerState, "state.json"), "{\"generation\":");
+        var error = await f.Reviewer.Error("review_packet", new { action = "reply", channel_id = f.ChannelId, packet_id = p,
+            reply = new { verdict = "APPROVE", summary = "Independent evidence review", findings = Array.Empty<object>() } });
+        Assert.Contains("Malformed review state; recover from verified checkpoint and channel facts.", error);
+        Assert.DoesNotContain("input schema", error);
     }
 
     [Fact]

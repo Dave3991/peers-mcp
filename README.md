@@ -249,8 +249,8 @@ The broker keeps every captured byte and has no artifact pruning, and every `rev
 A larger untracked file fails capture in `review_packet/publish` and `review_checkpoint` with an error that names the file and the limit. Remove it or exclude it with `.gitignore` or `.git/info/exclude`.
 The tracked diff and the evidence files are not subject to these limits.
 Capture also refuses an untracked file that looks like a secret; it fails, and never silently skips the file.
-Before reading, it checks the file name: `.env`, `.env.*` (except names ending in `.example`, `.sample`, or `.template`), `*.pem`, `*.key`, `*.p12`, `*.pfx`, `id_rsa*`, and `id_ed25519*`.
-After reading, it checks the content of each file (at most 1 MiB) for `PRIVATE KEY-----`.
+Before reading, it checks the file name: `.env`, `.envrc`, `.env.*` (except names ending in `.example`, `.sample`, or `.template`), `*.env`, `*.pem`, `*.key`, `*.p12`, `*.pfx`, `id_rsa*`, and `id_ed25519*`.
+After reading, it checks the content of each file (at most 1 MiB) for `PRIVATE KEY-----` (PEM and OpenSSH keys) and `PRIVATE KEY BLOCK-----` (PGP keys).
 The error names the file. Add the file to `.gitignore` or `.git/info/exclude`, or remove it.
 
 Round numbers increase within each phase without a fixed limit. A replacement reviewer must approve a new PLAN before CODE.

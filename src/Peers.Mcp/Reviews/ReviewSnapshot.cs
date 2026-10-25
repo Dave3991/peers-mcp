@@ -31,7 +31,8 @@ internal static class ReviewSnapshot
             throw new McpException($"Untracked file '{path}' brings the captured untracked total to {capturedSoFar + length} bytes, over the review capture limit of {MaxUntrackedTotalBytes} bytes (4 MiB) for all untracked files together. {Remedy}");
     }
 
-    private static readonly string[] SecretExtensions = [".pem", ".key", ".p12", ".pfx"];
+    private static readonly string[] SecretNames = [".env", ".envrc"];
+    private static readonly string[] SecretExtensions = [".env", ".pem", ".key", ".p12", ".pfx"];
     private static readonly string[] SecretPrefixes = ["id_rsa", "id_ed25519"];
     private static readonly string[] EnvTemplateSuffixes = [".example", ".sample", ".template"];
 
@@ -44,7 +45,8 @@ internal static class ReviewSnapshot
     {
         const StringComparison IgnoreCase = StringComparison.OrdinalIgnoreCase;
         var name = Path.GetFileName(path);
-        if (name.Equals(".env", IgnoreCase)) return ".env";
+        foreach (var exact in SecretNames)
+            if (name.Equals(exact, IgnoreCase)) return exact;
         if (name.StartsWith(".env.", IgnoreCase))
             return EnvTemplateSuffixes.Any(suffix => name.EndsWith(suffix, IgnoreCase)) ? null : ".env.*";
         foreach (var extension in SecretExtensions)
@@ -53,6 +55,12 @@ internal static class ReviewSnapshot
             if (name.StartsWith(prefix, IgnoreCase)) return prefix + "*";
         return null;
     }
+
+    /// <summary>The private-key marker in <paramref name="bytes"/>, or null: PEM/OpenSSH headers end in
+    /// "PRIVATE KEY-----", PGP armor in "PRIVATE KEY BLOCK-----".</summary>
+    private static string? PrivateKeyMarker(ReadOnlySpan<byte> bytes) =>
+        bytes.IndexOf("PRIVATE KEY-----"u8) >= 0 ? "PRIVATE KEY-----" :
+        bytes.IndexOf("PRIVATE KEY BLOCK-----"u8) >= 0 ? "PRIVATE KEY BLOCK-----" : null;
 
     internal static async Task<byte[]> RunGitAsync(string root, IEnumerable<string> args, CancellationToken ct = default)
     {
@@ -138,8 +146,8 @@ internal static class ReviewSnapshot
                     (File.GetUnixFileMode(absolute) & (UnixFileMode.UserExecute | UnixFileMode.GroupExecute | UnixFileMode.OtherExecute)) != 0;
             }
             RequireCapturable(path, bytes.LongLength, captured); // The file may have grown since the check.
-            if (bytes.AsSpan().IndexOf("PRIVATE KEY-----"u8) >= 0)
-                throw new McpException($"Untracked file '{path}' contains 'PRIVATE KEY-----'; the review capture refuses private key material. {Remedy}");
+            if (PrivateKeyMarker(bytes) is { } marker)
+                throw new McpException($"Untracked file '{path}' contains '{marker}'; the review capture refuses private key material. {Remedy}");
             captured += bytes.LongLength;
             files.Add(new(path, kind, executable, bytes, ReviewJson.Hash(bytes)));
         }

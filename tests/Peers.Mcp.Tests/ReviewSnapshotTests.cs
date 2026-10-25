@@ -124,7 +124,9 @@ public sealed class ReviewSnapshotTests
     // name check has to fire before any read is attempted.
     [Theory]
     [InlineData(".env", ".env")]
+    [InlineData(".envrc", ".envrc")]
     [InlineData("config/.env.local", ".env.*")]
+    [InlineData("deploy/prod.env", "*.env")]
     [InlineData("cert.pem", "*.pem")]
     [InlineData("server.key", "*.key")]
     [InlineData("store.p12", "*.p12")]
@@ -158,17 +160,20 @@ public sealed class ReviewSnapshotTests
     }
 
     // An innocent name does not make private key material capturable: the content check runs on the
-    // bytes read (at most 1 MiB, after the size check).
-    [Fact]
-    public async Task Rejects_an_untracked_file_containing_private_key_material()
+    // bytes read (at most 1 MiB, after the size check). PEM/OpenSSH and PGP armor end their headers
+    // differently, so both markers count.
+    [Theory]
+    [InlineData("OPENSSH ", "PRIVATE KEY-----")]
+    [InlineData("PGP ", "PRIVATE KEY BLOCK-----")]
+    public async Task Rejects_an_untracked_file_containing_private_key_material(string kind, string marker)
     {
         using var fixture = new ReviewGitFixture();
         await fixture.InitializeAsync();
-        // Split so a secret scanner does not flag this test source.
-        var pem = "-----BEGIN OPENSSH " + "PRIVATE KEY-----\nAAAAfixture\n-----END OPENSSH " + "PRIVATE KEY-----\n";
-        await File.WriteAllTextAsync(Path.Combine(fixture.Root, "notes.txt"), "deploy notes\n" + pem);
+        // Assembled at run time so a secret scanner does not flag this test source.
+        var key = "-----BEGIN " + kind + marker + "\nAAAAfixture\n-----END " + kind + marker + "\n";
+        await File.WriteAllTextAsync(Path.Combine(fixture.Root, "notes.txt"), "deploy notes\n" + key);
         var error = await Assert.ThrowsAsync<McpException>(() => ReviewSnapshot.CaptureAsync(fixture.Root, "HEAD"));
-        Assert.Contains("Untracked file 'notes.txt' contains 'PRIVATE KEY-----'", error.Message);
+        Assert.Contains($"Untracked file 'notes.txt' contains '{marker}'", error.Message);
         Assert.Contains("exclude it (.gitignore or .git/info/exclude)", error.Message);
     }
 

@@ -1,6 +1,5 @@
 using System.Reflection;
 using System.Text.Json;
-using System.Text.RegularExpressions;
 using Microsoft.Extensions.DependencyInjection;
 using ModelContextProtocol;
 using ModelContextProtocol.Protocol;
@@ -150,9 +149,10 @@ internal static class ServerOptionsFactory
     /// <summary>
     /// An argument whose JSON cannot bind to the parameter type (a string where a boolean belongs) fails
     /// inside the SDK before the tool runs, and the SDK answers any non-McpException with an opaque
-    /// "An error occurred invoking". The review tools translate their own JSON faults inside their
-    /// bodies, so a JsonException that escapes one of them is a binding failure: rethrow it as a tool
-    /// error that names the field, the value it got, and the JSON type it needs.
+    /// "An error occurred invoking". Rethrow such a binding failure as a tool error that names the field
+    /// and keeps the serializer's message, which names the type it expected. A tool's own McpException
+    /// passes through untouched even when it wraps a JsonException ("Malformed review state", invalid
+    /// checkpoint JSON): it already says what went wrong, and it is no argument error.
     /// </summary>
     private sealed class BindingErrorNamingTool(McpServerTool inner, MethodInfo method) : DelegatingMcpServerTool(inner)
     {
@@ -162,7 +162,7 @@ internal static class ServerOptionsFactory
             {
                 return await base.InvokeAsync(request, cancellationToken);
             }
-            catch (Exception ex) when (ex is JsonException || ex.InnerException is JsonException)
+            catch (Exception ex) when (ex is not McpException && (ex is JsonException || ex.InnerException is JsonException))
             {
                 throw new McpException(Describe(request.Params?.Arguments) + " The tool's input schema lists each field's type and allowed values.", ex);
             }
@@ -177,47 +177,10 @@ internal static class ServerOptionsFactory
                 try { JsonSerializer.Deserialize(value, parameter.ParameterType, McpJsonUtilities.DefaultOptions); }
                 catch (JsonException json)
                 {
-                    var path = json.Path ?? "$";
-                    var got = At(value, path) is { } bad ? bad.GetRawText() : "a value of the wrong type";
-                    if (got.Length > 80) got = got[..80] + "…";
-                    return $"{parameter.Name}{path[1..]} is {got}; it must be {Expected(json.Message)}.";
+                    return $"{parameter.Name}{(json.Path ?? "$")[1..]} has the wrong JSON type: {json.Message}";
                 }
             }
             return $"{ProtocolTool.Name} arguments do not match the tool's input schema.";
-        }
-
-        private static JsonElement? At(JsonElement root, string path)
-        {
-            var current = root;
-            foreach (Match step in Regex.Matches(path, @"\.(?<name>[^.\[]+)|\['(?<quoted>[^']*)'\]|\[(?<index>\d+)\]"))
-            {
-                if (step.Groups["index"].Success)
-                {
-                    var index = int.Parse(step.Groups["index"].Value, System.Globalization.CultureInfo.InvariantCulture);
-                    if (current.ValueKind != JsonValueKind.Array || index >= current.GetArrayLength()) return null;
-                    current = current[index];
-                }
-                else
-                {
-                    var name = step.Groups["name"].Success ? step.Groups["name"].Value : step.Groups["quoted"].Value;
-                    if (current.ValueKind != JsonValueKind.Object || !current.TryGetProperty(name, out current)) return null;
-                }
-            }
-            return current;
-        }
-
-        private static string Expected(string message)
-        {
-            var target = Regex.Match(message, @"converted to (?<type>\S+?)\.( Path|$)").Groups["type"].Value;
-            return target switch
-            {
-                "System.Boolean" => "true or false",
-                "System.String" => "a string",
-                _ when target.Contains("System.Int", StringComparison.Ordinal) => "an integer",
-                _ when target.EndsWith("[]", StringComparison.Ordinal) => "an array",
-                "" => "the type the schema gives",
-                _ => "an object",
-            };
         }
     }
 }
