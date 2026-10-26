@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using FluentResults;
 using Peers.Broker.Errors;
 using Peers.Broker.Persistence.Repositories;
@@ -28,14 +29,15 @@ public sealed class ClaimService(ClaimRepository claims, PeerRepository peers)
         if (peer is null)
             return Result.Fail(new NotFoundError($"Peer '{req.PeerId}' not found."));
         // Server-derived scope: a session claims in the repo it registered from, or — for an absolute
-        // path elsewhere — in the working tree that holds that path. A session outside Git claims nothing.
+        // path — in the working tree that holds that path. A session outside Git claims nothing.
         if (string.IsNullOrWhiteSpace(peer.RepoRoot))
             return Result.Fail(new BadRequestError("This session is not in a git repository, so it has no path scope to claim."));
 
+        var roots = new Dictionary<string, string?>(StringComparer.Ordinal);
         var targets = new List<ClaimTarget>();
         foreach (var path in req.Paths)
         {
-            var result = Resolve(path, peer.RepoRoot);
+            var result = await ResolveAsync(path, peer.RepoRoot, roots, ct);
             if (result.IsFailed)
                 return result.ToResult<ClaimPathsResponse>();
             targets.Add(result.Value);
@@ -89,16 +91,33 @@ public sealed class ClaimService(ClaimRepository claims, PeerRepository peers)
         if (req.Paths is not null)
         {
             targets = [];
+            var roots = new Dictionary<string, string?>(StringComparer.Ordinal);
+            List<(string RepoRoot, string Path)>? mine = null;
             foreach (var path in req.Paths)
             {
-                var result = Resolve(path, peer.RepoRoot);
-                if (result.IsFailed)
-                    return result.ToResult<ReleaseClaimsResponse>();
-                targets.Add((result.Value.RepoRoot, result.Value.Path));
+                var result = await ResolveAsync(path, peer.RepoRoot, roots, ct);
+                if (result.IsSuccess)
+                    targets.Add((result.Value.RepoRoot, result.Value.Path));
+
+                // An absolute path also matches the caller's own claims spelled out in full. A removed
+                // worktree no longer resolves (or now resolves to the repo around it), yet its claims are
+                // still keyed by the tree they were made in.
+                if (AbsolutePath(path) is not { } absolute)
+                {
+                    if (result.IsFailed)
+                        return result.ToResult<ReleaseClaimsResponse>();
+                    continue;
+                }
+                mine ??= await claims.ListForPeerAsync(req.PeerId, ct);
+                var held = mine.Where(row => (row.Path.Length == 0 ? row.RepoRoot : $"{row.RepoRoot}/{row.Path}") == absolute).ToList();
+                if (result.IsFailed && held.Count == 0)
+                    return Result.Fail(new BadRequestError(
+                        $"{result.Errors[0].Message} This session holds no claim on that path either; release without paths drops all of its claims."));
+                targets.AddRange(held);
             }
         }
 
-        return Result.Ok(new ReleaseClaimsResponse { Released = await claims.DeleteAsync(req.PeerId, targets, ct) });
+        return Result.Ok(new ReleaseClaimsResponse { Released = await claims.DeleteAsync(req.PeerId, targets?.Distinct().ToList(), ct) });
     }
 
     public async Task<ListClaimsResponse> ListAsync(string repoRoot, CancellationToken ct)
@@ -136,14 +155,18 @@ public sealed class ClaimService(ClaimRepository claims, PeerRepository peers)
 
     /// <summary>
     /// The working tree and the repo-relative, forward-slashed path a claim is keyed by, so the same
-    /// file cannot be claimed twice under two spellings. A relative path, or an absolute one inside the
-    /// peer's repo, belongs to that repo. Any other absolute path belongs to the git working tree that
-    /// holds it — the nearest ancestor with a .git entry, as `git rev-parse --show-toplevel` reports it
-    /// for the sessions working there — so a session editing a sibling worktree claims where that
-    /// tree's sessions look. A path in no working tree, or one that climbs out with "..", is rejected
-    /// rather than silently reinterpreted.
+    /// file cannot be claimed twice under two spellings.
+    ///
+    /// A relative path belongs to the peer's repo. An absolute path belongs to the nearest working tree
+    /// that holds it (the closest ancestor with a .git entry, so a worktree nested inside a repo wins
+    /// over the repo), keyed by the root `git rev-parse --show-toplevel` reports: the physical spelling
+    /// every session registers with, whatever case or symlinked folder the caller typed. Only when no
+    /// .git is found does the prefix of the peer's own repo root decide. A path in no working tree, or
+    /// one that climbs out with "..", is rejected rather than silently reinterpreted.
     /// </summary>
-    internal static Result<ClaimTarget> Resolve(string path, string? repoRoot)
+    /// <param name="roots">Toplevels already asked of git in this request, by tree directory.</param>
+    internal static async Task<Result<ClaimTarget>> ResolveAsync(string path, string? repoRoot,
+        Dictionary<string, string?> roots, CancellationToken ct)
     {
         var trimmed = path?.Trim();
         if (string.IsNullOrEmpty(trimmed))
@@ -153,37 +176,100 @@ public sealed class ClaimService(ClaimRepository claims, PeerRepository peers)
         // Before any root matching: "/repo/../other" must not pass as inside /repo, nor walk up to a .git above it.
         if (unified.Split('/').Contains(".."))
             return Result.Fail(new BadRequestError($"Path '{trimmed}' escapes the repository root."));
-        var scope = repoRoot;
-        if (Path.IsPathRooted(unified))
-        {
-            unified = SystemPaths.Canonicalize(unified);
-            var root = repoRoot?.Replace('\\', '/').TrimEnd('/');
-            if (root is null || (unified != root && !unified.StartsWith($"{root}/", StringComparison.Ordinal)))
-            {
-                root = scope = WorkTreeOf(unified);
-                if (root is null)
-                    return Result.Fail(new BadRequestError(
-                        $"Path '{trimmed}' is outside this session's repository ({repoRoot ?? "none"}) and inside no git working tree " +
-                        "(no .git in it or any parent directory). Claims are kept per repository: claim paths inside a git working tree."));
-            }
-            unified = unified.Length <= root.Length ? "" : unified[(root.Length + 1)..];
-        }
-        else if (scope is null)
-            return Result.Fail(new BadRequestError(
-                $"Path '{trimmed}' is relative, but this session is not in a git repository; pass an absolute path inside a git working tree."));
 
-        // The repo root itself (no segments): a whole-repo claim, which Overlaps treats as containing everything.
-        var segments = unified.Split('/').Where(segment => segment.Length > 0 && segment != ".");
-        return Result.Ok(new ClaimTarget(scope!, string.Join('/', segments)));
+        if (AbsolutePath(unified) is not { } absolute)
+            return repoRoot is null
+                ? Result.Fail(new BadRequestError(
+                    $"Path '{trimmed}' is relative, but this session is not in a git repository; pass an absolute path inside a git working tree."))
+                : Result.Ok(new ClaimTarget(repoRoot, Relative(unified)));
+
+        if (WorkTreeOf(absolute) is { } tree)
+        {
+            if (!roots.TryGetValue(tree, out var root))
+                roots[tree] = root = tree == repoRoot ? repoRoot : await GitTopLevelAsync(tree, ct);
+            return root is null
+                ? Result.Fail(new BadRequestError(
+                    $"Path '{trimmed}' is inside '{tree}', which has a .git entry, but git reports no working tree there; claim paths inside a git working tree."))
+                : Result.Ok(new ClaimTarget(root, Relative(absolute[tree.Length..])));
+        }
+
+        var own = repoRoot?.Replace('\\', '/').TrimEnd('/');
+        if (own is not null && (absolute == own || absolute.StartsWith($"{own}/", StringComparison.Ordinal)))
+            return Result.Ok(new ClaimTarget(repoRoot!, Relative(absolute[own.Length..])));
+        return Result.Fail(new BadRequestError(
+            $"Path '{trimmed}' is outside this session's repository ({repoRoot ?? "none"}) and inside no git working tree " +
+            "(no .git in it or any parent directory). Claims are kept per repository: claim paths inside a git working tree."));
     }
+
+    /// <summary>
+    /// A rooted path with "//" and "/./" collapsed and the macOS /tmp, /var and /etc links resolved,
+    /// without a trailing slash; null for a relative path or one with "..". Every root match and slice
+    /// runs on this form, so an odd spelling above the tree root cannot shift the relative path.
+    /// </summary>
+    private static string? AbsolutePath(string? path)
+    {
+        var unified = path?.Trim().Replace('\\', '/');
+        if (string.IsNullOrEmpty(unified) || !Path.IsPathRooted(unified) || unified.Split('/').Contains(".."))
+            return null;
+        var full = SystemPaths.Canonicalize(Path.GetFullPath(unified));
+        return full.Length > 1 ? full.TrimEnd('/') : full;
+    }
+
+    /// <summary>The repo-relative claim key: forward-slashed segments, without empty or "." ones. No segments is the whole repo.</summary>
+    private static string Relative(string path) =>
+        string.Join('/', path.Split('/').Where(segment => segment.Length > 0 && segment != "."));
 
     /// <summary>The nearest directory at or above <paramref name="path"/> holding a .git entry (a directory, or a worktree's .git file).</summary>
     private static string? WorkTreeOf(string path)
     {
-        for (var dir = path.TrimEnd('/'); !string.IsNullOrEmpty(dir); dir = Path.GetDirectoryName(dir))
+        for (var dir = path; !string.IsNullOrEmpty(dir); dir = Path.GetDirectoryName(dir))
             if (Directory.Exists(Path.Combine(dir, ".git")) || File.Exists(Path.Combine(dir, ".git")))
                 return dir;
         return null;
+    }
+
+    /// <summary>
+    /// The working tree root as `git rev-parse --show-toplevel` reports it for <paramref name="tree"/> —
+    /// the physical path in its stored case, exactly what sessions register — or null when git finds no
+    /// working tree there (or cannot run within 10 seconds).
+    /// </summary>
+    private static async Task<string?> GitTopLevelAsync(string tree, CancellationToken ct)
+    {
+        var start = new ProcessStartInfo("git")
+        {
+            RedirectStandardOutput = true,
+            RedirectStandardError = true,
+            UseShellExecute = false,
+        };
+        foreach (var arg in new[] { "-C", tree, "rev-parse", "--show-toplevel" })
+            start.ArgumentList.Add(arg);
+
+        using var deadline = CancellationTokenSource.CreateLinkedTokenSource(ct);
+        deadline.CancelAfter(TimeSpan.FromSeconds(10));
+        Process? git = null;
+        try
+        {
+            git = Process.Start(start)!;
+            var output = git.StandardOutput.ReadToEndAsync(deadline.Token);
+            var error = git.StandardError.ReadToEndAsync(deadline.Token);
+            await git.WaitForExitAsync(deadline.Token);
+            var top = (await output).TrimEnd('\r', '\n');
+            await error;
+            return git.ExitCode == 0 && top.Length > 0 ? top : null;
+        }
+        catch (OperationCanceledException) when (!ct.IsCancellationRequested)
+        {
+            git?.Kill(entireProcessTree: true);
+            return null;
+        }
+        catch (System.ComponentModel.Win32Exception)
+        {
+            return null; // git is not installed: no working tree can be confirmed.
+        }
+        finally
+        {
+            git?.Dispose();
+        }
     }
 
     /// <summary>Whether two normalized paths name the same work: equal, or one containing the other.</summary>

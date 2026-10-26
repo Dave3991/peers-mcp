@@ -1,7 +1,7 @@
+using System.Diagnostics;
 using Peers.Broker.Persistence.Repositories;
 using Peers.Broker.Services;
 using Peers.Broker.Tests.Helpers;
-using Peers.Shared;
 using Peers.Shared.Contracts;
 using Xunit;
 
@@ -10,12 +10,14 @@ namespace Peers.Broker.Tests.Services;
 /// <summary>
 /// Claims are the pre-edit answer to "is anyone else on this path". The properties that matter: a
 /// conflict names the holder and writes nothing, overlap follows directory containment rather than
-/// string prefixes, scope is the peer's own repo, and an abandoned session stops blocking anyone
-/// without ever calling release.
+/// string prefixes, scope is the peer's own repo or the git working tree that holds an absolute path,
+/// and an abandoned session stops blocking anyone without ever calling release.
 /// </summary>
 public sealed class ClaimServiceTests : IDisposable
 {
     private readonly TestDb _db = new();
+    // Under $TMPDIR (/var/folders/... on macOS, behind the /var link) for the cross-tree tests' git repos.
+    private readonly DirectoryInfo _temp = Directory.CreateTempSubdirectory("peers-claims-");
 
     private (PeerService peers, ClaimService claims) Create()
     {
@@ -153,34 +155,105 @@ public sealed class ClaimServiceTests : IDisposable
     }
 
     // Observed 2026-10-26: an API session editing a fe worktree got "outside this session's repository".
-    // An absolute path in another working tree is held in that tree, where the tree's own sessions look,
-    // whichever spelling of the macOS /var link the caller used, and it is released by the same path.
+    // An absolute path in another working tree is held in that tree under the root its own sessions
+    // register (git's physical path), whichever spelling of the macOS /var link the caller used, and it
+    // is released by the same path.
     [Fact]
     public async Task Claim_AbsolutePathInAnotherWorkTree_IsHeldInThatTree()
     {
         var (peers, claims) = Create();
-        var temp = Directory.CreateTempSubdirectory("peers-claims-"); // $TMPDIR: /var/folders/... on macOS
-        try
-        {
-            var tree = Directory.CreateDirectory(Path.Combine(temp.FullName, "fe-worktree")).FullName;
-            File.WriteAllText(Path.Combine(tree, ".git"), "gitdir: /elsewhere/.git/worktrees/fe"); // a linked worktree's .git file
-            var gitRoot = SystemPaths.Canonicalize(tree); // as `git rev-parse --show-toplevel` reports it
-            var api = await RegisterAsync(peers, "m-api", repo: "/api");
-            var fe = await RegisterAsync(peers, "m-fe", repo: gitRoot);
-            var claimed = Path.Combine(tree, "src", "PowerAi");
+        var fe = InitRepo("fe");
+        var api = await RegisterAsync(peers, "m-api", repo: "/api");
+        var feSession = await RegisterAsync(peers, "m-fe", repo: fe);
+        var claimed = Path.Combine(_temp.FullName, "fe", "src", "PowerAi"); // $TMPDIR spelling: /var/... on macOS
 
-            var grant = Assert.Single((await ClaimAsync(claims, api, claimed)).Granted);
-            Assert.Equal((gitRoot, "src/PowerAi"), (grant.RepoRoot, grant.Path));
-            Assert.Empty((await claims.ListAsync("/api", CancellationToken.None)).Claims);
+        var grant = Assert.Single((await ClaimAsync(claims, api, claimed)).Granted);
+        Assert.Equal((fe, "src/PowerAi"), (grant.RepoRoot, grant.Path));
+        Assert.Empty((await claims.ListAsync("/api", CancellationToken.None)).Claims);
 
-            var conflict = Assert.Single((await ClaimAsync(claims, fe, "src/PowerAi/view.vue")).Conflicts);
-            Assert.Equal(api, conflict.HolderPeerId);
+        var conflict = Assert.Single((await ClaimAsync(claims, feSession, "src/PowerAi/view.vue")).Conflicts);
+        Assert.Equal(api, conflict.HolderPeerId);
 
-            var released = await claims.ReleaseAsync(new ReleaseClaimsRequest { PeerId = api, Paths = [claimed] }, CancellationToken.None);
-            Assert.Equal(1, released.Value.Released);
-            Assert.Empty((await ClaimAsync(claims, fe, "src/PowerAi/view.vue")).Conflicts);
-        }
-        finally { temp.Delete(recursive: true); }
+        Assert.Equal(1, await ReleaseAsync(claims, api, claimed));
+        Assert.Empty((await ClaimAsync(claims, feSession, "src/PowerAi/view.vue")).Conflicts);
+    }
+
+    // "//" and "/./" above the tree root once shifted the slice: "/a//b/fe/src/x" was granted as "e/src/x".
+    [Fact]
+    public async Task Claim_RedundantSeparatorsAboveTheTreeRoot_KeyTheSamePath()
+    {
+        var (peers, claims) = Create();
+        var fe = InitRepo("fe");
+        var api = await RegisterAsync(peers, "m-api", repo: "/api");
+
+        var grant = Assert.Single((await ClaimAsync(claims, api, $"{_temp.FullName}//./fe//src/./x")).Granted);
+
+        Assert.Equal((fe, "src/x"), (grant.RepoRoot, grant.Path));
+    }
+
+    // Sessions register `git rev-parse --show-toplevel`: the physical path in its stored case. A claim
+    // through a symlinked folder, or in other case on a case-insensitive disk, must land on that same
+    // root, or the tree's sessions would never see it.
+    [Fact]
+    public async Task Claim_ThroughASymlinkOrInOtherCase_IsHeldUnderTheRootSessionsRegister()
+    {
+        var (peers, claims) = Create();
+        var fe = InitRepo("fe");
+        var api = await RegisterAsync(peers, "m-api", repo: "/api");
+        var feSession = await RegisterAsync(peers, "m-fe", repo: fe);
+        var alias = Path.Combine(_temp.FullName, "alias");
+        Directory.CreateSymbolicLink(alias, Path.Combine(_temp.FullName, "fe"));
+
+        var viaLink = Assert.Single((await ClaimAsync(claims, api, Path.Combine(alias, "src", "a.cs"))).Granted);
+        Assert.Equal((fe, "src/a.cs"), (viaLink.RepoRoot, viaLink.Path));
+        Assert.Equal(api, Assert.Single((await ClaimAsync(claims, feSession, "src/a.cs")).Conflicts).HolderPeerId);
+
+        var upper = Path.Combine(_temp.FullName, "FE");
+        if (!Directory.Exists(upper))
+            return; // A case-sensitive disk has no other-case spelling of the tree.
+        var otherCase = Assert.Single((await ClaimAsync(claims, api, Path.Combine(upper, "src", "b.cs"))).Granted);
+        Assert.Equal((fe, "src/b.cs"), (otherCase.RepoRoot, otherCase.Path));
+    }
+
+    // A worktree nested inside a repo (fe/.claude/worktrees/<name>) is its own tree: the nearest .git
+    // wins over the repo around it. Once that worktree is removed, releasing the same absolute path must
+    // still drop the claim, even though the path now resolves to the outer repo.
+    [Fact]
+    public async Task Claim_InANestedWorktree_IsHeldThere_AndReleasesAfterTheWorktreeIsRemoved()
+    {
+        var (peers, claims) = Create();
+        var outer = InitRepo("fe");
+        var nestedPath = Path.Combine(_temp.FullName, "fe", ".claude", "worktrees", "nested");
+        Git(outer, "worktree", "add", "-q", nestedPath);
+        var nested = Git(nestedPath, "rev-parse", "--show-toplevel");
+        var feSession = await RegisterAsync(peers, "m-fe", repo: outer);
+        var claimed = Path.Combine(nestedPath, "src", "x.cs");
+
+        var grant = Assert.Single((await ClaimAsync(claims, feSession, claimed)).Granted);
+        Assert.Equal((nested, "src/x.cs"), (grant.RepoRoot, grant.Path));
+
+        Git(outer, "worktree", "remove", "--force", nestedPath);
+        Assert.Equal(1, await ReleaseAsync(claims, feSession, claimed));
+        Assert.Empty((await claims.ListAsync(nested, CancellationToken.None)).Claims);
+    }
+
+    // Agents remove a sibling worktree at the end of a task, which is also when they release. With no
+    // .git left the path resolves nowhere, but the caller's own claim on it still matches.
+    [Fact]
+    public async Task Release_OfADeletedSiblingTree_StillDropsTheCallersClaim()
+    {
+        var (peers, claims) = Create();
+        InitRepo("fe");
+        var api = await RegisterAsync(peers, "m-api", repo: "/api");
+        var claimed = Path.Combine(_temp.FullName, "fe", "src", "x.cs");
+        await ClaimAsync(claims, api, claimed);
+
+        Directory.Delete(Path.Combine(_temp.FullName, "fe"), recursive: true);
+
+        Assert.Equal(1, await ReleaseAsync(claims, api, claimed));
+        var unknown = await claims.ReleaseAsync(new ReleaseClaimsRequest { PeerId = api, Paths = [claimed] }, CancellationToken.None);
+        Assert.True(unknown.IsFailed);
+        Assert.Contains("release without paths", unknown.Errors[0].Message);
     }
 
     [Fact]
@@ -275,5 +348,39 @@ public sealed class ClaimServiceTests : IDisposable
             await cmd.ExecuteNonQueryAsync();
         });
 
-    public void Dispose() => _db.Dispose();
+    private async Task<int> ReleaseAsync(ClaimService claims, string peerId, params string[] paths)
+    {
+        var result = await claims.ReleaseAsync(new ReleaseClaimsRequest { PeerId = peerId, Paths = paths }, CancellationToken.None);
+        Assert.True(result.IsSuccess, string.Join("; ", result.Errors.Select(e => e.Message)));
+        return result.Value.Released;
+    }
+
+    /// <summary>A real repository with one commit under the test's temp dir; returns its root as sessions register it.</summary>
+    private string InitRepo(string name)
+    {
+        var dir = Directory.CreateDirectory(Path.Combine(_temp.FullName, name)).FullName;
+        Git(dir, "init", "-q");
+        Git(dir, "-c", "user.name=test", "-c", "user.email=test@example.invalid", "-c", "commit.gpgsign=false",
+            "commit", "-q", "--no-verify", "--allow-empty", "-m", "base");
+        return Git(dir, "rev-parse", "--show-toplevel");
+    }
+
+    private static string Git(string cwd, params string[] args)
+    {
+        var start = new ProcessStartInfo("git") { RedirectStandardOutput = true, RedirectStandardError = true };
+        foreach (var arg in new[] { "-C", cwd }.Concat(args))
+            start.ArgumentList.Add(arg);
+        using var git = Process.Start(start)!;
+        var output = git.StandardOutput.ReadToEnd();
+        var error = git.StandardError.ReadToEnd();
+        git.WaitForExit();
+        Assert.True(git.ExitCode == 0, $"git {string.Join(' ', args)} failed: {error}");
+        return output.TrimEnd('\n');
+    }
+
+    public void Dispose()
+    {
+        _db.Dispose();
+        _temp.Delete(recursive: true);
+    }
 }

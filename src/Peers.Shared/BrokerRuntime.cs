@@ -48,8 +48,8 @@ public sealed record BrokerStatus
 /// 7: GET /channels/{id} is new; channel_clear and messages_remove by channel_id read it to confirm the
 /// channel's stored name. A pre-7 daemon 404s it, so every by-id deletion would report the channel missing.
 ///
-/// 8: claims resolve an absolute path outside the peer's repo to that path's own git working tree, and
-/// every grant and conflict carries its repo_root. A pre-8 daemon rejects those claims as outside the
+/// 8: claims resolve an absolute path to its nearest git working tree (keyed by git's toplevel), and
+/// every grant and conflict carries its repo_root. A pre-8 daemon rejects paths outside the session's
 /// repository, and its responses lack the now-required per-grant repo_root.
 /// </summary>
 public static class BrokerContract

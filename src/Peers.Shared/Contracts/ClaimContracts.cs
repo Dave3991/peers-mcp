@@ -6,9 +6,9 @@ namespace Peers.Shared.Contracts;
 /// already on that path so the caller can coordinate instead of discovering the collision in a diff.
 ///
 /// Scope is server-derived, never a value the caller supplies: the claiming peer's own repo_root for a
-/// relative path or an absolute path inside it, and otherwise the git working tree that holds the
-/// absolute path — so a session working across sibling worktrees claims each path where that tree's
-/// sessions look.
+/// relative path, and for an absolute path the nearest git working tree that holds it, keyed by the
+/// root git reports — so a session working across sibling or nested worktrees claims each path where
+/// that tree's sessions look.
 /// </summary>
 public sealed class ClaimPathsRequest
 {

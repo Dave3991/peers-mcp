@@ -146,11 +146,15 @@ A claim informs; it never blocks a write. A conflict names the holder (peer id, 
 two sessions can split the work — that is the whole mechanism. Claims lapse with their TTL (default 30
 minutes, max 4 hours) or with the holder's 2-minute lease, so a crashed session never holds a path
 hostage and `release` is a courtesy rather than a requirement. Scope is server-derived: a session
-claims under its own peer id. A relative path, or an absolute path inside the session's repository,
-is claimed in that repository. An absolute path in another git working tree is claimed in that
-tree, where the sessions of that tree see it. Each grant and conflict carries its `repo_root`.
-The broker finds that tree from the nearest parent directory with a `.git` entry.
-A path in no git working tree is rejected.
+claims under its own peer id. A relative path is claimed in the session's repository. An absolute
+path is claimed in the nearest git working tree that holds it, where the sessions of that tree see it.
+A worktree nested inside a repository (for example `fe/.claude/worktrees/<name>`) is its own tree.
+The broker finds the tree from the nearest parent directory with a `.git` entry. It keys the claim by
+the root that `git rev-parse --show-toplevel` reports, which is the root that sessions register.
+As a result, a path through a symlinked folder or in other case maps to the same claim.
+Each grant and conflict carries its `repo_root`. A path in no git working tree is rejected.
+`release` with an absolute path also matches the caller's own claim on that path after its worktree
+is removed.
 
 ### Retry a send without double-posting
 
@@ -310,7 +314,7 @@ dotnet build src/Peers.Broker/Peers.Broker.csproj -c Release
 dotnet build src/Peers.Mcp/Peers.Mcp.csproj -c Release
 ```
 
-Contract 8 records a claim on an absolute path outside the session's repository in that path's own git working tree, and adds `repo_root` to each grant and conflict.
+Contract 8 records a claim on an absolute path in the nearest git working tree that holds it, and adds `repo_root` to each grant and conflict.
 The broker also stops computing a push audience for `peer.updated`, because the roster never notifies.
 Contract 7 adds `GET /channels/{id}`, which deletion by `channel_id` reads to confirm the channel name.
 Contract 6 adds `NotifyPeers=false` for internal review parts, indexes, roots, and checkpoints.

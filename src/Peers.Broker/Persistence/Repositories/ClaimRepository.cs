@@ -69,6 +69,23 @@ public sealed class ClaimRepository(SqliteConnectionFactory db)
         }, ct);
     }
 
+    /// <summary>Every claim row <paramref name="peerId"/> holds, in any repo, expired or not: what a release can match.</summary>
+    public async Task<List<(string RepoRoot, string Path)>> ListForPeerAsync(string peerId, CancellationToken ct = default)
+    {
+        return await db.ReadAsync(async conn =>
+        {
+            using var cmd = conn.CreateCommand();
+            cmd.CommandText = "SELECT repo_root, path FROM claims WHERE peer_id = @peer";
+            cmd.Parameters.AddWithValue("@peer", peerId);
+
+            var rows = new List<(string RepoRoot, string Path)>();
+            await using var reader = await cmd.ExecuteReaderAsync(ct);
+            while (await reader.ReadAsync(ct))
+                rows.Add((reader.GetString(0), reader.GetString(1)));
+            return rows;
+        }, ct);
+    }
+
     /// <summary>Releases the peer's claims: the named (repo root, path) pairs, or all of them when <paramref name="targets"/> is null.</summary>
     public async Task<int> DeleteAsync(string peerId, IReadOnlyList<(string RepoRoot, string Path)>? targets, CancellationToken ct = default)
     {
