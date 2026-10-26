@@ -1,6 +1,7 @@
 using System.Text;
 using System.Text.Json;
 using ModelContextProtocol;
+using Peers.Shared;
 using Peers.Shared.Contracts;
 
 namespace Peers.Mcp.Reviews;
@@ -278,16 +279,41 @@ internal sealed partial class ReviewWorkflow(BrokerClient client, SessionState s
         round = packet.Manifest.Round, state = ledger.State, message_id = response?.MessageId,
         seq = response?.Seq, deduplicated = response?.Deduplicated, delivery = response?.Delivery,
     };
-    private static FileStream ExplicitFile(string field, string? path)
+    /// <summary>
+    /// Opens a plan/evidence input without following symlinks. Only the macOS system links /tmp, /var
+    /// and /etc (to /private/...) are resolved first, so a file under /tmp or $TMPDIR is accepted;
+    /// a symlink anywhere else in the path, or the file itself being one, still fails.
+    /// </summary>
+    internal static FileStream ExplicitFile(string field, string? path)
     {
-        ReviewJson.Require(path is not null && Path.IsPathFullyQualified(path), $"{field} is {ReviewJson.Show(path)}; it must be an absolute file path.");
-        var info = new FileInfo(path);
-        ReviewJson.Require(info.Exists && info.LinkTarget is null && (info.Attributes & (FileAttributes.Directory | FileAttributes.ReparsePoint)) == 0,
-            $"{field} is {ReviewJson.Show(path)}; it must be an existing regular file, never a directory or symlink.");
+        var shown = ReviewJson.Show(path, path: true);
+        ReviewJson.Require(path is not null && Path.IsPathFullyQualified(path), $"{field} is {shown}; it must be an absolute file path.");
+        var info = new FileInfo(SystemPaths.Canonicalize(path));
+        ReviewJson.Require(info.LinkTarget is null,
+            $"{field} is {shown}, a symlink to {ReviewJson.Show(info.LinkTarget, path: true)}; pass the absolute path of the real file (plan/evidence paths never follow symlinks).");
+        ReviewJson.Require(!Directory.Exists(info.FullName), $"{field} is {shown}, a directory; it must be a regular file.");
+        ReviewJson.Require(info.Exists, $"{field} is {shown}; no file exists there. Write the file first or correct the path.");
+        ReviewJson.Require((info.Attributes & FileAttributes.ReparsePoint) == 0, $"{field} is {shown}; it must be a regular file, not a reparse point.");
         for (var parent = info.Directory; parent is not null; parent = parent.Parent)
             ReviewJson.Require(parent.LinkTarget is null,
-                $"{field} is {ReviewJson.Show(path)}; its parent {ReviewJson.Show(parent.FullName)} is a symlink, and plan/evidence paths must not follow symlinks.");
-        return new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read);
+                $"{field} is {shown}; its parent {ReviewJson.Show(parent.FullName, path: true)} is a symlink to {ReviewJson.Show(parent.LinkTarget, path: true)}. Pass the path through the real directory: plan/evidence paths never follow symlinks (only /tmp, /var and /etc are resolved to /private).");
+        return new FileStream(info.FullName, FileMode.Open, FileAccess.Read, FileShare.Read);
+    }
+    /// <summary>What differs between this channel's pinned lineage and the current request, or null when nothing does.</summary>
+    private static string? LineageChange(ReviewLedger ledger, ReviewSourceSnapshot source, string? taskSha256)
+    {
+        var changes = new List<string>();
+        if (taskSha256 is not null && taskSha256 != ledger.TaskSha256)
+            changes.Add($"request.task has sha256 {taskSha256[..12]}…, the channel's task has {ledger.TaskSha256[..12]}… (the task text must be byte-identical in every round)");
+        if (source.BaseSha != ledger.BaseSha)
+            changes.Add($"base_sha resolves to {source.BaseSha}, the channel's base is {ledger.BaseSha}");
+        if (source.SourceRoot != ledger.SourceRoot)
+            changes.Add($"source root is {ReviewJson.Show(source.SourceRoot, path: true)}, the channel's is {ReviewJson.Show(ledger.SourceRoot, path: true)}");
+        if (source.GitDir != ledger.GitDir)
+            changes.Add($"git dir is {ReviewJson.Show(source.GitDir, path: true)}, the channel's is {ReviewJson.Show(ledger.GitDir, path: true)}");
+        return changes.Count == 0 ? null :
+            $"Review lineage changed: {string.Join("; ", changes)}. A review channel pins one task, base commit and source tree. " +
+            $"Reuse the channel's values (the original task text, base_sha {ledger.BaseSha}, source_root {ReviewJson.Show(ledger.SourceRoot, path: true)}), or create a new channel for different work.";
     }
     internal async Task<object> PublishAsync(ReviewRequest request, CancellationToken ct)
     {
@@ -352,8 +378,8 @@ internal sealed partial class ReviewWorkflow(BrokerClient client, SessionState s
             }
             ReviewJson.Require(ledger.DriverPeerId == PeerId, "Only the current driver may publish; use explicit resume to adopt offline work.");
             ReviewJson.Require(ledger.State != "completed" && ledger.Integrity == "intact", "Completed/withdrawn/unverifiable channels cannot publish new requests.");
-            ReviewJson.Require(ledger.TaskSha256 == ReviewJson.Hash(request.Task) && ledger.SourceRoot == source.SourceRoot &&
-                ledger.GitDir == source.GitDir && ledger.BaseSha == source.BaseSha, "Task/base/source lineage changed; create a new channel.");
+            var lineage = LineageChange(ledger, source, ReviewJson.Hash(request.Task));
+            ReviewJson.Require(lineage is null, lineage!);
             var existing = ledger.Packets.SingleOrDefault(p => p.Manifest.Phase == request.Phase && p.Manifest.Round == request.Round);
             if (existing is not null)
             {

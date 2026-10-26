@@ -593,37 +593,6 @@ public sealed class McpSubscriptionTests : IAsyncLifetime
     }
 
     // -------------------------------------------------------------------------
-    // The regression that started all this: `wait` with NO arguments must come back with a result
-    // inside the request budget a default-configured client gives it. An MCP client's deadline is
-    // one-shot — omp resolves 30s and never extends it on the 5s progress keepalives — so an
-    // advertised window above that budget turned every idle wait into a client-side transport error
-    // the caller could not tell apart from peer silence.
-    // -------------------------------------------------------------------------
-    [Fact]
-    public async Task PeerWait_DefaultWindow_ReturnsTimedOutInsideAThirtySecondClientBudget()
-    {
-        await RegisterAsync();
-
-        // The client deadline, modelled the way omp models it: fixed at the call, never extended.
-        using var budget = new CancellationTokenSource(TimeSpan.FromSeconds(30));
-        var ticks = new ProgressCollector();
-        var startedAt = Stopwatch.StartNew();
-
-        // Nothing is addressed to this peer, so only the default window can end the call.
-        var result = await _client.CallToolAsync("wait", progress: ticks, cancellationToken: budget.Token);
-        startedAt.Stop();
-
-        Assert.True(result.IsError is not true, TextOf(result));
-        Assert.True(JsonNode.Parse(TextOf(result))!["timed_out"]!.GetValue<bool>(),
-            $"the default window must report timed_out, not an error: {TextOf(result)}");
-        Assert.True(startedAt.Elapsed < TimeSpan.FromSeconds(30),
-            $"the default window took {startedAt.Elapsed.TotalSeconds:F1}s, past a 30s client budget");
-        // Keepalives still go out inside the shortened window, so a client that DOES reset on progress
-        // can still park for the full 120s maximum.
-        Assert.False(ticks.Values.IsEmpty, "no progress keepalive reached the client");
-    }
-
-    // -------------------------------------------------------------------------
     // A client that asks peer_wait for 120s and changes its mind gets: work stopped,
     // and NO response frame on the wire.
     // -------------------------------------------------------------------------
@@ -768,82 +737,34 @@ public sealed class McpSubscriptionTests : IAsyncLifetime
     }
 
     // -------------------------------------------------------------------------
-    // peers://peers actually fires. Several other resources/updated assertions in this
-    // file are on channel or inbox URIs, so the peer arm of ResourceUrisFor could be
-    // deleted with the suite still green — and peers://peers would go permanently
-    // silent, which is the whole point of the peer.updated event behind it.
-    // -------------------------------------------------------------------------
-    /// <summary>Registers a peer and has it ADDRESS this session in <paramref name="channelId"/>.
-    /// The mention is what makes them correspondents — the real protocol always carries `to`, and mere
-    /// co-authorship would not qualify (a fresh peer auto-announces into every channel in its repo).</summary>
-    private async Task<string> CorrespondentAsync(string channelId, string machine)
-    {
-        var partner = await _broker.RegisterAsync(new RegisterPeerRequest
-        {
-            Tool = "codex", MachineId = machine, RepoRoot = "/repo", Branch = "main",
-        });
-        await _broker.SendMessageAsync(channelId, new SendMessageRequest
-        {
-            AuthorPeerId = partner.PeerId, Content = "reviewer here", To = [_peerId!], Quiet = false,
-        });
-        return partner.PeerId;
-    }
-
-    // -------------------------------------------------------------------------
-    // A roster hint is only OUR business when it is somebody we correspond with.
-    // Unscoped, every presence call anywhere on the machine woke every subscribed
-    // session — and since progress reporting rides peer.updated, that became
-    // constant churn from unrelated pairs working in the same repo.
+    // Roster churn never notifies; directed messages still do. omp injects every
+    // resources/updated hint as a user-role turn, and presence, progress and
+    // registration hints were a third of them. The directed message at the end
+    // proves the silence is the roster rule, not a dead stream.
     // -------------------------------------------------------------------------
     [Fact]
-    public async Task PeerChange_NotifiesOnlyPeersWeCorrespondWith()
+    public async Task RosterChurn_NotifiesNobody_ButADirectedMessageStillNotifiesTheInbox()
     {
         await RegisterAsync();
-        var channel = await CreatePadAsync("roster-scope");
+        var channel = await CreatePadAsync("roster-quiet");
         await SubscribeAsync(PeerResources.PeersUri);
-        await AppendAsync(channel, "driver here");
+        await SubscribeAsync(PeerResources.InboxUri);
 
-        var partner = await CorrespondentAsync(channel, "partner-machine");
-        // Same repo, never addressed us: exactly the unrelated pair whose churn used to wake us.
-        var stranger = (await _broker.RegisterAsync(new RegisterPeerRequest
+        // A partner that has addressed us: the closest correspondent there is.
+        var partner = (await _broker.RegisterAsync(new RegisterPeerRequest
         {
-            Tool = "codex", MachineId = "stranger-machine", RepoRoot = "/repo", Branch = "main",
+            Tool = "codex", MachineId = "partner-machine", RepoRoot = "/repo", Branch = "main",
         })).PeerId;
-
+        await _broker.SendMessageAsync(channel, new SendMessageRequest
+        {
+            AuthorPeerId = partner, Content = "reviewer here", To = [_peerId!], Quiet = false,
+        });
         await DispatchBrokerEventsAsync();
         await Task.Delay(Settle);
         _notifications.Clear();
 
-        await _broker.HeartbeatAsync(stranger, new HeartbeatRequest { Summary = "unrelated work" });
-        await DispatchBrokerEventsAsync();
-        await Task.Delay(Settle);
-
-        Assert.DoesNotContain(_notifications, n => n.Method == NotificationMethods.ResourceUpdatedNotification);
-
-        // Same stream, a peer that did address us: the silence above was the scope filter, not a
-        // dead subscription.
-        await _broker.HeartbeatAsync(partner, new HeartbeatRequest { Summary = "now reviewing" });
-        await DispatchBrokerEventsAsync();
-
-        var update = await WaitForNotificationAsync(NotificationMethods.ResourceUpdatedNotification);
-        Assert.Equal(PeerResources.PeersUri, update["uri"]!.GetValue<string>());
-    }
-
-    // -------------------------------------------------------------------------
-    // A stranger STARTING a session in our repo must not wake us either.
-    // peer.registered carries recipient_peer_ids, which is the durable INBOX
-    // audience (every peer in the repo) — reusing it as a roster hint would be
-    // repo scoping wearing a disguise. The inbox still delivers it.
-    // -------------------------------------------------------------------------
-    [Fact]
-    public async Task PeerRegistration_DoesNotPushARosterHint()
-    {
-        await RegisterAsync();
-        await SubscribeAsync(PeerResources.PeersUri);
-        await DispatchBrokerEventsAsync();
-        await Task.Delay(Settle);
-        _notifications.Clear();
-
+        await _broker.HeartbeatAsync(partner, new HeartbeatRequest { Summary = "now reviewing", Role = "reviewing" });
+        await _broker.HeartbeatAsync(partner, new HeartbeatRequest { ProgressCurrent = 4, ProgressTotal = 9 });
         await _broker.RegisterAsync(new RegisterPeerRequest
         {
             Tool = "codex", MachineId = "newcomer-machine", RepoRoot = "/repo", Branch = "main",
@@ -852,41 +773,15 @@ public sealed class McpSubscriptionTests : IAsyncLifetime
         await Task.Delay(Settle);
 
         Assert.DoesNotContain(_notifications, n => n.Method == NotificationMethods.ResourceUpdatedNotification);
-    }
 
-    // -------------------------------------------------------------------------
-    // Progress is PULL-only: read from the roster, or off a wait keepalive. It must
-    // never wake a subscriber, even one we correspond with — a driver reporting every
-    // few seconds would otherwise notify its reviewer on every tick. The event still
-    // exists (the notifier's roster cache and the CLI both read it); it carries no
-    // audience.
-    // -------------------------------------------------------------------------
-    [Fact]
-    public async Task Progress_AloneNotifiesNobody()
-    {
-        await RegisterAsync();
-        var channel = await CreatePadAsync("progress-quiet");
-        await SubscribeAsync(PeerResources.PeersUri);
-        await AppendAsync(channel, "driver here");
-
-        var partner = await CorrespondentAsync(channel, "partner-machine");
-
-        await DispatchBrokerEventsAsync();
-        await Task.Delay(Settle);
-        _notifications.Clear();
-
-        await _broker.HeartbeatAsync(partner, new HeartbeatRequest { ProgressCurrent = 4, ProgressTotal = 9 });
-        await DispatchBrokerEventsAsync();
-        await Task.Delay(Settle);
-
-        Assert.DoesNotContain(_notifications, n => n.Method == NotificationMethods.ResourceUpdatedNotification);
-
-        // Same peer, a status change: proves progress was what stayed quiet, not the partner.
-        await _broker.HeartbeatAsync(partner, new HeartbeatRequest { Summary = "done thinking" });
+        await _broker.SendMessageAsync(channel, new SendMessageRequest
+        {
+            AuthorPeerId = partner, Content = "round 1 verdict", To = [_peerId!], Quiet = false,
+        });
         await DispatchBrokerEventsAsync();
 
         var update = await WaitForNotificationAsync(NotificationMethods.ResourceUpdatedNotification);
-        Assert.Equal(PeerResources.PeersUri, update["uri"]!.GetValue<string>());
+        Assert.Equal(PeerResources.InboxUri, update["uri"]!.GetValue<string>());
     }
 
     // -------------------------------------------------------------------------
@@ -1101,7 +996,7 @@ public sealed class McpSubscriptionTests : IAsyncLifetime
             "read",
             new Dictionary<string, object?> { ["channel"] = $"missing-{Guid.NewGuid():N}" });
         Assert.True(missingChannel.IsError is true, TextOf(missingChannel));
-        Assert.Contains("not found", TextOf(missingChannel));
+        Assert.Contains("No channel named or with channel_id", TextOf(missingChannel));
     }
 
     // End-to-end wiring for the claim surface: tool → HTTP → service → SQLite → back. The overlap and
@@ -1250,7 +1145,8 @@ public sealed class McpSubscriptionTests : IAsyncLifetime
     }
 
     // Observed 2026-10-22: a reviewer session in one repo got "Channel ... not found" for the driver's
-    // channel scoped to an API worktree. Names stay scoped; an explicit channel_id reaches any repo.
+    // channel scoped to an API worktree. Names stay scoped, but a miss names the channel_id that
+    // reaches it; an explicit channel_id reaches any repo, and so does an id passed as the name.
     [Fact]
     public async Task ChannelId_ReachesAnotherReposChannel_WhileNamesStayScoped()
     {
@@ -1263,12 +1159,16 @@ public sealed class McpSubscriptionTests : IAsyncLifetime
         var byName = await _client.CallToolAsync("send", new Dictionary<string, object?>
             { ["channel"] = name, ["content"] = "lost" });
         Assert.True(byName.IsError is true);
-        Assert.Contains($"Channel '{name}' not found.", TextOf(byName));
+        Assert.Contains($"Channel '{name}' is not in this session's repo_root '/repo' or the global scope", TextOf(byName));
+        Assert.Contains($"channel_id '{foreign.ChannelId}' (repo_root '/api-worktree')", TextOf(byName));
 
         var sent = await CallOkAsync("send", new() { ["channel_id"] = foreign.ChannelId, ["content"] = "reached" });
         Assert.Equal(foreign.ChannelId, Str(sent["channel_id"]));
         var read = await CallOkAsync("read", new() { ["channel_id"] = foreign.ChannelId });
         Assert.Equal("reached", Str(Assert.Single(read["messages"]!.AsArray())!["content"]));
+        // The id in the name field: unambiguous, so it reaches the channel instead of failing the lookup.
+        var idAsName = await CallOkAsync("read", new() { ["channel"] = foreign.ChannelId });
+        Assert.Equal("reached", Str(Assert.Single(idAsName["messages"]!.AsArray())!["content"]));
 
         // Name lookup is unchanged: the same name now resolves to this repo's own channel.
         var own = await CallOkAsync("channel_create", new() { ["name"] = name });
@@ -1290,6 +1190,26 @@ public sealed class McpSubscriptionTests : IAsyncLifetime
             Assert.Contains("Pass exactly one of `channel` (name) or `channel_id`.", TextOf(rejected));
         }
         Assert.Single((await _broker.ReadChannelMessagesAsync(foreign.ChannelId, _peerId))!.Messages);
+    }
+
+    // Observed 2026-10-26: a notice channel meant for every repo was created without repo_root, which
+    // scoped it to the creator's repo, and sessions elsewhere could not reach it by name.
+    [Fact]
+    public async Task GlobalChannelCreate_IsReachableByNameFromAnotherRepo()
+    {
+        await RegisterAsync();
+        _state.RepoRoot = "/repo";
+        var name = $"notices-{Guid.NewGuid():N}";
+        var created = await CallOkAsync("channel_create", new() { ["name"] = name, ["global"] = true });
+        Assert.Null(created["repo_root"]);
+
+        _state.RepoRoot = "/another-repo";
+        var sent = await CallOkAsync("send", new() { ["channel"] = name, ["content"] = "notice" });
+        Assert.Equal(Str(created["channel_id"]), Str(sent["channel_id"]));
+
+        var both = await _client.CallToolAsync("channel_create", new Dictionary<string, object?>
+            { ["name"] = $"{name}-x", ["global"] = true, ["repo_root"] = "/repo" });
+        Assert.True(both.IsError is true, TextOf(both));
     }
 
     // An id reaches any repo, so deleting by id must also name the channel: confirm_channel is checked

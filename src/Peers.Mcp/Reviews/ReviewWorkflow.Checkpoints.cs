@@ -29,8 +29,8 @@ internal sealed partial class ReviewWorkflow
     private async Task<ReviewSourceSnapshot> SourceAsync(ReviewLedger ledger, string? root, CancellationToken ct)
     {
         var source = await ReviewSnapshot.CaptureAsync(root ?? ledger.SourceRoot, ledger.BaseSha, ct);
-        ReviewJson.Require(source.SourceRoot == ledger.SourceRoot && source.GitDir == ledger.GitDir && source.BaseSha == ledger.BaseSha,
-            "Source root/git-dir/base lineage mismatch.");
+        var lineage = LineageChange(ledger, source, taskSha256: null);
+        ReviewJson.Require(lineage is null, lineage!);
         if (ledger.State != "completed" && Latest(ledger)?.Manifest is { Phase: "CODE" } packet &&
             source.RevisionSha256 != packet.RevisionSha256)
         {
@@ -76,7 +76,8 @@ internal sealed partial class ReviewWorkflow
         if (ledger is null)
         {
             ReviewJson.Require(action is "status" or "sync", "No managed review exists for this channel.");
-            ReviewJson.Require(ackIds is null || ackIds.Length == 0, "No previously handled receipts exist for this channel.");
+            ReviewJson.Require(ackIds is null || ackIds.Length == 0,
+                $"ack_inbox_ids lists {ackIds?.Length} ID(s), but this channel has no managed review yet, so no receipt was handled here. Omit ack_inbox_ids; acknowledge inbox items with wait ack_inbox_ids.");
             await MessagesAsync(); // Require an actual existing channel, even before its first request.
             var source = await ReviewSnapshot.CaptureAsync(sourceRoot ?? session.RepoRoot ?? Directory.GetCurrentDirectory(), "HEAD", ct);
             return new { state = "not_started", revision_sha256 = source.RevisionSha256, source_root = source.SourceRoot,
@@ -201,8 +202,7 @@ internal sealed partial class ReviewWorkflow
             var acknowledged = new List<string>();
             if (ackIds is not null)
             {
-                ReviewJson.Require(ackIds.Distinct(StringComparer.Ordinal).Count() == ackIds.Length &&
-                    ackIds.All(id => state.Receipts.Any(r => r.PeerId == PeerId && r.InboxId == id)), "Unknown inbox ID; acknowledge only this peer's previous durable handled result.");
+                RequireHandledReceipts(state, ackIds);
                 // Persisted handled state precedes this RPC; replay repeats explicit IDs, never a transition or ack-all.
                 await client.AckInboxAsync(PeerId, ackIds, cancellationToken: ct);
                 for (var i = 0; i < state.Receipts.Count; i++)
@@ -245,6 +245,29 @@ internal sealed partial class ReviewWorkflow
             }
             state.Projection = ledger; store.Save(state);
             return StatusResult(ledger, source, unrelated.ToArray(), ready.ToArray(), acknowledged.ToArray());
+        }
+    }
+    /// <summary>
+    /// Managed acknowledgement takes only receipts an earlier sync of this peer recorded as handled (its
+    /// ready_to_ack). Every other inbox item is an unrelated receipt, acknowledged through ordinary wait.
+    /// </summary>
+    private void RequireHandledReceipts(ReviewPeerState state, string[] ackIds)
+    {
+        var mine = state.Receipts.Where(r => r.PeerId == PeerId).ToList();
+        var pending = mine.Where(r => !r.Acknowledged).Select(r => r.InboxId).Take(20).ToList();
+        var seen = new HashSet<string>(StringComparer.Ordinal);
+        for (var i = 0; i < ackIds.Length; i++)
+        {
+            var id = ackIds[i];
+            ReviewJson.Require(!string.IsNullOrWhiteSpace(id),
+                $"ack_inbox_ids[{i}] is {ReviewJson.Show(id)}; pass inbox_id strings from a previous sync's ready_to_ack.");
+            ReviewJson.Require(seen.Add(id), $"ack_inbox_ids[{i}] repeats {ReviewJson.Show(id)}; pass each ID once.");
+            ReviewJson.Require(mine.Any(r => r.InboxId == id),
+                $"ack_inbox_ids[{i}] is {ReviewJson.Show(id)}, which no earlier review_checkpoint sync of this peer on this channel returned in ready_to_ack " +
+                (pending.Count == 0
+                    ? "(nothing is pending: call sync without ack_inbox_ids first, then pass its ready_to_ack IDs). "
+                    : $"(pending: {string.Join(", ", pending)}). ") +
+                "Acknowledge unrelated_receipts and other inbox items with wait ack_inbox_ids instead.");
         }
     }
     private static bool Holds(ReviewLedger ledger, string messageId) =>

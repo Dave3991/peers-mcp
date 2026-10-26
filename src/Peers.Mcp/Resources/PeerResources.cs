@@ -22,10 +22,8 @@ internal static class PeerResources
         Live roster of peer sessions known to the local broker — same payload as the peers tool
         (peer_id, tool, repo_root, branch, role, summary, lease state, and progress_current/progress_total/progress_updated_at for peers reporting long-running work).
 
-        Subscriptions: notifications/resources/updated for this URI is A HINT TO RE-READ, never a delta stream.
-        Delivery is best-effort and lossy: there is no retry, an MCP process restart drops whatever was in
-        flight, and granularity is the 5s poll — several changes can collapse into one notification, or into
-        none. Always re-read when notified; never reconstruct roster state from the notifications themselves.
+        Subscriptions: this URI never notifies. Presence, progress, registration and expiry are roster churn,
+        not messages; re-read it (or call the peers tool) when you need the roster.
         """;
 
     public const string ChannelDescription = """
@@ -33,7 +31,8 @@ internal static class PeerResources
         tool: whispers addressed to other participants are never part of your view.
 
         Subscriptions: notifications/resources/updated fires when any participant posts; quiet whispers
-        notify only their own participants. Same best-effort hint-to-re-read semantics as peers://peers.
+        notify only their own participants. It is a best-effort, lossy HINT TO RE-READ, never a delta
+        stream: several posts can collapse into one notification, or into none.
         """;
 
     public const string InboxDescription = """

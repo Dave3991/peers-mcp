@@ -156,7 +156,7 @@ public sealed class PeerServiceTests : IDisposable
         Assert.NotEqual(respB.PeerId, resumed.PeerId);
     }
 
-    // A session that changes role must be visible to peers://peers subscribers, and an idle session must
+    // A session that changes role must refresh the roster other MCP servers cache, and an idle session must
     // stay silent: the background heartbeat fires every 30s with an all-null request, so emitting on every
     // heartbeat would put every peer at a permanent 2 events/min floor.
     [Fact]

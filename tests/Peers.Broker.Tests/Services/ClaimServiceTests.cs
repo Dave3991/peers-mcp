@@ -1,6 +1,7 @@
 using Peers.Broker.Persistence.Repositories;
 using Peers.Broker.Services;
 using Peers.Broker.Tests.Helpers;
+using Peers.Shared;
 using Peers.Shared.Contracts;
 using Xunit;
 
@@ -149,6 +150,37 @@ public sealed class ClaimServiceTests : IDisposable
             new ClaimPathsRequest { PeerId = me, Paths = ["../../etc/passwd"] }, CancellationToken.None);
         Assert.True(escaping.IsFailed);
         Assert.Contains("escapes", escaping.Errors[0].Message);
+    }
+
+    // Observed 2026-10-26: an API session editing a fe worktree got "outside this session's repository".
+    // An absolute path in another working tree is held in that tree, where the tree's own sessions look,
+    // whichever spelling of the macOS /var link the caller used, and it is released by the same path.
+    [Fact]
+    public async Task Claim_AbsolutePathInAnotherWorkTree_IsHeldInThatTree()
+    {
+        var (peers, claims) = Create();
+        var temp = Directory.CreateTempSubdirectory("peers-claims-"); // $TMPDIR: /var/folders/... on macOS
+        try
+        {
+            var tree = Directory.CreateDirectory(Path.Combine(temp.FullName, "fe-worktree")).FullName;
+            File.WriteAllText(Path.Combine(tree, ".git"), "gitdir: /elsewhere/.git/worktrees/fe"); // a linked worktree's .git file
+            var gitRoot = SystemPaths.Canonicalize(tree); // as `git rev-parse --show-toplevel` reports it
+            var api = await RegisterAsync(peers, "m-api", repo: "/api");
+            var fe = await RegisterAsync(peers, "m-fe", repo: gitRoot);
+            var claimed = Path.Combine(tree, "src", "PowerAi");
+
+            var grant = Assert.Single((await ClaimAsync(claims, api, claimed)).Granted);
+            Assert.Equal((gitRoot, "src/PowerAi"), (grant.RepoRoot, grant.Path));
+            Assert.Empty((await claims.ListAsync("/api", CancellationToken.None)).Claims);
+
+            var conflict = Assert.Single((await ClaimAsync(claims, fe, "src/PowerAi/view.vue")).Conflicts);
+            Assert.Equal(api, conflict.HolderPeerId);
+
+            var released = await claims.ReleaseAsync(new ReleaseClaimsRequest { PeerId = api, Paths = [claimed] }, CancellationToken.None);
+            Assert.Equal(1, released.Value.Released);
+            Assert.Empty((await ClaimAsync(claims, fe, "src/PowerAi/view.vue")).Conflicts);
+        }
+        finally { temp.Delete(recursive: true); }
     }
 
     [Fact]

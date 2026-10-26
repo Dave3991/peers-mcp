@@ -101,6 +101,22 @@ public sealed class BrokerFlowTests : IAsyncLifetime
         ok.EnsureSuccessStatusCode();
     }
 
+    // Observed 2026-10-26: a null inbox id reached SQLite as an unset parameter and came back as a 500
+    // "Value must be set.". It is the caller's input, so it is a 400 that names the index.
+    [Fact]
+    public async Task InboxAck_NullOrBlankId_Returns400NamingTheIndex()
+    {
+        var peerId = await RegisterPeerAsync("m-ack");
+
+        var nullId = await _http.PostAsJsonAsync($"/peers/{peerId}/inbox/ack", new { inboxIds = new[] { "ib1", null } }, JsonOpts);
+        Assert.Equal(HttpStatusCode.BadRequest, nullId.StatusCode);
+        Assert.Contains("inbox_ids[1] is null", await nullId.Content.ReadAsStringAsync());
+
+        var blankId = await _http.PostAsJsonAsync($"/peers/{peerId}/inbox/ack", new { inboxIds = new[] { " " } }, JsonOpts);
+        Assert.Equal(HttpStatusCode.BadRequest, blankId.StatusCode);
+        Assert.Contains("inbox_ids[0] is blank", await blankId.Content.ReadAsStringAsync());
+    }
+
     [Fact]
     public async Task Status_Returns200()
     {

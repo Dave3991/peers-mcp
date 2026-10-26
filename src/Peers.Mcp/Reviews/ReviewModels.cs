@@ -31,8 +31,10 @@ internal static class ReviewJson
     // Input validation names the field, the value it got, and what it accepts: an agent can only fix a
     // call whose error says which value to change. A bare "Invalid review finding" made agents guess.
     private static readonly JsonSerializerOptions ShowOptions = new() { Encoder = System.Text.Encodings.Web.JavaScriptEncoder.UnsafeRelaxedJsonEscaping };
-    internal static string Show(string? value) => value is null ? "null" :
-        JsonSerializer.Serialize(value.Length <= 80 ? value : value[..80] + "…", ShowOptions);
+    /// <summary>The value as a JSON string, cut at 80 characters unless <paramref name="path"/>: a path's
+    /// informative part is its tail, and macOS temp paths alone run past 80.</summary>
+    internal static string Show(string? value, bool path = false) => value is null ? "null" :
+        JsonSerializer.Serialize(path || value.Length <= 80 ? value : value[..80] + "…", ShowOptions);
     // A missing input property binds as "" (the DTOs mark required fields for the schema only), so
     // missing and empty read the same.
     private static string Got(string? value) => string.IsNullOrEmpty(value) ? "missing or empty" : Show(value);

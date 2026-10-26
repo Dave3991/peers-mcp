@@ -724,7 +724,7 @@ public class PeerWaitTests
     // argument at all means the default window. Pinned at the broker boundary, the only place the
     // effective window is observable.
     [Theory]
-    [InlineData(null, 25)]         // no argument -> the default window
+    [InlineData(null, 120)]        // no argument -> the default window
     [InlineData(1, 1)]
     [InlineData(0, 1)]             // below the floor
     [InlineData(-30, 1)]
@@ -741,11 +741,11 @@ public class PeerWaitTests
         Assert.Equal(expected, recorder.RequestedSeconds);
     }
 
-    // The defect this guards was never in the wait loop: the tool ADVERTISED a 60s default and a 120s
-    // park that no default-configured client could deliver, and the overrun surfaced as a transport
-    // error indistinguishable from peer silence. So the advertised text is held against the behaviour,
-    // and the default against the request budget clients ship with. The numbers are READ OUT of the
-    // description, so drifting either half of the pair — text or clamp — fails here.
+    // The defect this guards was never in the wait loop: the tool once ADVERTISED a window it did not
+    // enforce, and an overrun surfaced as a transport error indistinguishable from peer silence. So the
+    // advertised text is held against the behaviour. The numbers are READ OUT of the description, so
+    // drifting either half of the pair — text or clamp — fails here. The client request budget the
+    // default needs (omp: timeout 130000 on the peers entry) is client configuration, documented in README.
     [Fact]
     public async Task Wait_EnforcesExactlyTheWindowItAdvertises()
     {
@@ -760,10 +760,6 @@ public class PeerWaitTests
             .GetProperty("properties").GetProperty("timeout_seconds").GetProperty("description").GetString();
         Assert.Contains($"default {defaultSeconds}, max {maxSeconds}", parameter);
 
-        // A client's request timeout is one-shot: omp resolves 30s by default and never extends it on the
-        // 5s progress keepalives, so a default at or above 30 is a transport error waiting to happen.
-        Assert.True(defaultSeconds < 30, $"default window {defaultSeconds}s does not fit a 30s client request budget");
-
         var byDefault = new WindowRecorder();
         await Wait(byDefault.Client, new SessionState { PeerId = "p" });
         Assert.Equal(defaultSeconds, byDefault.RequestedSeconds);
@@ -771,5 +767,23 @@ public class PeerWaitTests
         var overMax = new WindowRecorder();
         await Wait(overMax.Client, new SessionState { PeerId = "p" }, maxSeconds + 1);
         Assert.Equal(maxSeconds, overMax.RequestedSeconds);
+    }
+
+    // Observed 2026-10-26: `ack_inbox_ids: [null]` reached SQLite as an unset parameter and came back as a
+    // broker 500. A null or blank id is the caller's input: a tool error naming the index, with nothing
+    // acknowledged and no long poll started, so the valid ids in the same call are not half-applied.
+    [Theory]
+    [InlineData(null)]
+    [InlineData(" ")]
+    public async Task Wait_NullOrBlankAckId_IsAToolError_AndReachesNoBroker(string? bad)
+    {
+        var handler = new ScriptedHandler(_ => Json(HttpStatusCode.OK, EmptyTimedOutBody()));
+        var client = new BrokerClient(new HttpClient(handler) { BaseAddress = new Uri("http://localhost") });
+
+        var error = await Assert.ThrowsAsync<McpException>(() =>
+            Wait(client, new SessionState { PeerId = "p" }, 1, ["ib1", bad!]));
+
+        Assert.Contains("ack_inbox_ids[1] is", error.Message);
+        Assert.Empty(handler.Requests);
     }
 }
