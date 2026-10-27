@@ -79,17 +79,20 @@ so `wait` returns as soon as it arrives.
 
 `send`, `read`, `channel_clear`, and `messages_remove` take exactly one of `channel` (name) or
 `channel_id`. For `send` and `read`, a name resolves in this session's repository first, then the
-global scope — never an unrelated repository. A `channel_id` (from `channels`, `channel_create`, a
-message, or an inbox item) reaches a channel scoped to any repository, e.g. a reviewer in one repo
+global scope — never an unrelated repository. A `channel_id` (from `channels`, a message, or an
+inbox item) reaches a channel scoped to any repository, e.g. a reviewer in one repo
 answering a driver's channel scoped to another worktree. If `send` or `read` gets a channel ID in
 `channel`, it uses that channel. If the name exists only in another repository, the error gives the
 `channel_id` and `repo_root` of each match.
 
-`channel_create` scopes a channel to this session's repository by default, or to `repo_root`.
-Pass `global: true` for a channel that sessions in every repository can reach by name, for example
-a notice channel for several repositories.
+`channels` with action `list` lists every channel. Action `create` scopes a new channel to this
+session's repository by default, or to `repo_root`. Pass `global: true` for a channel that sessions in
+every repository can reach by name, for example a notice channel for several repositories.
 
 ### Clear history or remove selected messages
+
+`channel_clear` and `messages_remove` are opt-in tools: the server lists them only when it starts with
+`PEERS_MCP_TOOL_PROFILE=all` (see [Tool profiles](#tool-profiles)).
 
 `channel_clear(channel)` permanently removes all messages while keeping the channel usable.
 `messages_remove(channel, message_ids)` removes 1..200 selected message IDs returned by `send` or
@@ -137,7 +140,7 @@ rejected, because nothing could ever see it.
 
 ### Claim the paths you are editing
 
-`claim` tells the broker which paths this session is working on and answers the question that matters
+`claims` with action `claim` tells the broker which paths this session is working on and answers the question that matters
 before an edit: is another live session already on them? A directory claims everything under it, and
 overlap is reported both ways — claiming `src/` collides with a held `src/foo.ts`, and vice versa.
 Grants are per path, so one contested file never blocks the three nobody is contesting.
@@ -145,7 +148,7 @@ Grants are per path, so one contested file never blocks the three nobody is cont
 A claim informs; it never blocks a write. A conflict names the holder (peer id, role, summary) so the
 two sessions can split the work — that is the whole mechanism. Claims lapse with their TTL (default 30
 minutes, max 4 hours) or with the holder's 2-minute lease, so a crashed session never holds a path
-hostage and `release` is a courtesy rather than a requirement. Scope is server-derived: a session
+hostage and action `release` is a courtesy rather than a requirement. Scope is server-derived: a session
 claims under its own peer id. A relative path is claimed in the session's repository. An absolute
 path is claimed in the nearest git working tree that holds it, where the sessions of that tree see it.
 A worktree nested inside a repository (for example `fe/.claude/worktrees/<name>`) is its own tree.
@@ -153,8 +156,8 @@ The broker finds the tree from the nearest parent directory with a `.git` entry.
 the root that `git rev-parse --show-toplevel` reports, which is the root that sessions register.
 As a result, a path through a symlinked folder or in other case maps to the same claim.
 Each grant and conflict carries its `repo_root`. A path in no git working tree is rejected.
-`release` with an absolute path also matches the caller's own claim on that path after its worktree
-is removed.
+Action `release` with an absolute path also matches the caller's own claim on that path after its
+worktree is removed. Action `list` returns the whole claim map for this repository, with holders.
 
 ### Retry a send without double-posting
 
@@ -166,12 +169,15 @@ request.
 ### Share artifacts
 
 Publish versioned artifacts — diffs, type definitions, API specs, test reports — that other sessions
-retrieve by name. Artifacts are versioned per namespace and content-hashed for integrity.
+retrieve by name. Artifacts are versioned per namespace and content-hashed for integrity. The
+`artifacts` tool has three actions: `publish`, `get` (by `artifact_id`, or the latest version by
+`namespace` and `name`, in pages with `offset` and `max_chars`), and `list`.
 
 ### Hand off to Codex
 
 The context bridge exports a session's state (peers, channels, artifacts, task) as a markdown packet
-another tool can import, and vice versa.
+another tool can import, and vice versa. `context_export` and `context_import` are opt-in tools
+(`PEERS_MCP_TOOL_PROFILE=all`).
 
 ### Durable delivery
 
@@ -197,30 +203,39 @@ by `wait` until you echo their ids back as `ack_inbox_ids`.
 
 ## MCP Tools Reference
 
+The default (core) profile lists these 10 tools:
+
 | Tool | Purpose |
 |------|---------|
 | `peers` | Live roster of sessions: who is working where, on what, with which role |
 | `presence` | Update this session's role, summary, capabilities, focus paths, and progress on long-running work |
-| `channels` | List channels and their repo scope + message counts |
-| `channel_create` | Create a channel (`name`, optional `repo_root` or `global: true`; names unique per scope) |
-| `channel_clear` | Permanently clear a channel's history and pending deliveries; keep the channel (`channel` in this session's repo only, or `channel_id` with `confirm_channel`) |
-| `messages_remove` | Permanently remove selected `message_ids` from a channel (1..200; `channel` in this session's repo only, or `channel_id` with `confirm_channel`) |
+| `channels` | Action `list`: channels and their repo scope + message counts. Action `create`: a channel (`name`, optional `repo_root` or `global: true`; names unique per scope) |
 | `send` | Post to a channel (`channel` name or `channel_id`): `content`, optional `to` mentions, optional `quiet` whisper |
 | `read` | Read a channel (`channel` name or `channel_id`) from `since_seq`; whispers addressed to others are filtered out |
 | `wait` | Long-poll for directed messages (default and max 120s); echo `ack_inbox_ids` to acknowledge receipts |
-| `claim` | Announce the paths this session is editing (in this repository or another git working tree); reports any live peer already holding them |
-| `claims` | The whole claim map for this repository, with holders |
-| `release` | Give back claims (named paths, or all of them) |
-| `artifact_publish` | Publish a versioned, content-hashed artifact |
-| `artifact_get` | Retrieve an artifact by ID or namespace+name (latest version) |
-| `artifact_list` | List artifact metadata, filter by type/repo/namespace |
+| `claims` | Action `claim`: announce the paths this session is editing (in this repository or another git working tree) and report any live peer already holding them. Action `list`: the claim map for this repository. Action `release`: give back claims (named paths, or all of them) |
+| `artifacts` | Action `publish`: a versioned, content-hashed artifact. Action `get`: an artifact by ID or namespace+name (latest version). Action `list`: artifact metadata, filtered by type/repo/namespace |
 | `review_packet` | Publish complete immutable PLAN/CODE packets, fetch private evidence files, or reply as the selected independent reviewer |
 | `review_checkpoint` | Restore history, obtain a source revision, sync handled receipts, pause/resume, adopt an offline driver, or gate terminal completion |
-| `review_lesson` | Freeze one explicit supported lesson and record/reconcile its single save grant through existing Aletheia tools |
+
+The `all` profile adds these 5 opt-in tools:
+
+| Tool | Purpose |
+|------|---------|
+| `channel_clear` | Permanently clear a channel's history and pending deliveries; keep the channel (`channel` in this session's repo only, or `channel_id` with `confirm_channel`) |
+| `messages_remove` | Permanently remove selected `message_ids` from a channel (1..200; `channel` in this session's repo only, or `channel_id` with `confirm_channel`) |
 | `context_export` | Export session state for a Codex handoff |
 | `context_import` | Import a context packet from Codex |
+| `review_lesson` | Freeze one explicit supported lesson and record/reconcile its single save grant through existing Aletheia tools |
 
 There is no register or heartbeat tool: the MCP server does both for you.
+
+Three tools replace eight older ones: `channels` replaces `channels` and `channel_create`, `claims`
+replaces `claim`, `claims`, and `release`, and `artifacts` replaces `artifact_publish`, `artifact_get`,
+and `artifact_list`. Each action keeps the parameter names and result shape of the tool that it
+replaced. In every tool with an `action` parameter, an unknown or missing action fails with an error
+that lists the allowed actions. A missing field fails with an error that names the field and the
+action that requires it.
 
 Input, lock, lookup, and broker failures are MCP errors with `isError: true`.
 A blocked managed completion is different: it returns `completed: false`, `state`, and `reason` as a successful tool result.
@@ -239,6 +254,19 @@ Claude Code's default tool-call timeout is several minutes. Codex allows 60s unl
 `tool_timeout_sec = 130` is set on `[mcp_servers.peers]`. A client with a smaller budget must pass a
 smaller `timeout_seconds`. Otherwise the wait fails as a client-side transport error that looks
 exactly like broker silence, and silence is never a verdict.
+
+### Tool profiles
+
+Each listed tool adds its name, description, and input schema to every request of every session.
+`PEERS_MCP_TOOL_PROFILE` selects the profile when the MCP server starts, with the same rules as
+Aletheia's `ALETHEIA_MCP_TOOL_PROFILE`:
+
+- Unset, blank, `core`, or any other value: the 10 core tools.
+- `all` (any case): the 10 core tools and the 5 opt-in tools.
+
+A running session keeps the profile that it started with. To change the profile, set the variable
+in the `env` of the peers MCP server entry, then restart the session. Operators can also clear a
+channel or remove messages with the CLI (`channel-clear`, `messages-remove`), which needs no profile.
 
 ## Managed independent review
 
@@ -299,6 +327,8 @@ One frozen lesson uses literal before/after quotes from retained evidence. Confo
 A durable grant permits one helper dispatch. Ambiguous responses require marker reconciliation rather than another save.
 Visible duplicates produce `duplicate`, not `saved`. Transport retries mean that storage is not atomically exactly-once.
 The helper adds no runtime MCP connection, background learner, execution engine, commit, or deployment.
+`review_lesson` is an opt-in tool. Start the peers MCP server with `PEERS_MCP_TOOL_PROFILE=all` before you promote a lesson.
+If the tool is not mounted, the helper stops with an error that names this setting.
 
 This is a local coordination protocol, not authentication. A deliberate client can forge broker authors.
 Evidence loss blocks authorization. Deleted or ambiguous review rounds are not silently recreated.
@@ -318,10 +348,11 @@ Contract 8 records a claim on an absolute path in the nearest git working tree t
 The broker also stops computing a push audience for `peer.updated`, because the roster never notifies.
 Contract 7 adds `GET /channels/{id}`, which deletion by `channel_id` reads to confirm the channel name.
 Contract 6 adds `NotifyPeers=false` for internal review parts, indexes, roots, and checkpoints.
-Ordinary `artifact_publish` keeps its normal notifications. SQLite schema v6 does not change.
+Ordinary `artifacts` action `publish` keeps its normal notifications. SQLite schema v6 does not change.
 Broker startup checks the reported contract after either readiness path.
 A stale selected build reports its actual/required contract and launch path instead of repeated replacement.
 Existing MCP sessions need a restart to expose new tools.
+The merged `channels`, `claims`, and `artifacts` tools and the tool profiles change the MCP server only. The broker contract stays 8.
 A new `dotnet run` session during source/build cutover can cause one transient broker replacement.
 The existing process-name kill guard remains in force.
 
@@ -336,6 +367,7 @@ node scripts/smoke-review-workflow.mjs --with-aletheia --with-omp
 ```
 
 The runner uses private peers state, a fixture Git repository, and an unused broker port.
+It starts the MCP server with `PEERS_MCP_TOOL_PROFILE=all`, because the smoke calls `review_lesson`.
 The memory modes require the existing Aletheia Release executable and the documented Docker PostgreSQL service.
 They create and delete only a runner-owned database. SQL proves isolation before the runner claims a daemon PID.
 The omp mode uses normal profile authentication, project-only MCP configuration, and the installed peers skill's exact promotion block.
@@ -386,6 +418,7 @@ Channel records and pinned artifacts remain authoritative after local state loss
 | `PEERS_DB_PATH` | `~/.peers/peers.db` | SQLite database path |
 | `PEERS_BROKER_PROJECT` | *(auto-detected)* | Path to `Peers.Broker.csproj` |
 | `PEERS_MAX_TOOL_RESULT_CHARS` | `30000` | Max characters returned by tool results before truncation |
+| `PEERS_MCP_TOOL_PROFILE` | `core` | MCP tool profile, read at startup: `core` lists 10 tools, `all` adds `channel_clear`, `messages_remove`, `context_export`, `context_import`, and `review_lesson` |
 
 ## Running the Broker Manually
 

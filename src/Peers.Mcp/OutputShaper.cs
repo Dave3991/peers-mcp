@@ -17,7 +17,7 @@ public static class OutputShaper
     }
 
     /// <summary>
-    /// Shape an <see cref="Artifact"/> for the artifact_get tool.
+    /// Shape an <see cref="Artifact"/> for the artifacts tool's get action.
     /// Returns the full serialization unchanged when no range is requested and it fits (back-compat).
     /// On overflow or explicit range, returns a paged envelope with offset/next_offset/total_chars.
     /// </summary>
@@ -73,7 +73,7 @@ public static class OutputShaper
                 : start + chunk.Length;
             var truncated = nextOffset != null;
             var message = truncated
-                ? $"Returned chars {start}-{start + chunk.Length} of {result.Content.Length}. Call artifact_get again with offset={nextOffset} for more."
+                ? $"Returned chars {start}-{start + chunk.Length} of {result.Content.Length}. Call artifacts action get again with offset={nextOffset} for more."
                 : (string?)null;
 
             envelope = JsonSerializer.Serialize(new

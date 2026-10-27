@@ -6,6 +6,17 @@ const routes = Object.freeze({
   save: 'xd://mcp__aletheia_save_observation',
 });
 
+// review_lesson is opt-in: the peers server lists it only with PEERS_MCP_TOOL_PROFILE=all. omp answers a
+// missing device with "No such tool: xd://mcp__peers_review_lesson", an MCP server with "Unknown tool: 'review_lesson'".
+const missingReviewTool = /(No such tool|Unknown tool): ['"]?(xd:\/\/mcp__peers_)?review_lesson\b/;
+const missingReviewToolMessage = 'The peers review_lesson tool is not mounted. Set PEERS_MCP_TOOL_PROFILE=all in the env of the peers MCP server ' +
+  '(the default core profile hides review_lesson), restart the session, and run the promotion again.';
+
+function isMissingReviewTool(value) {
+  const text = typeof value === 'string' ? value : value?.text ?? value?.message;
+  return typeof text === 'string' && missingReviewTool.test(text);
+}
+
 function normalize(value) {
   for (let depth = 0; depth < 8; depth++) {
     if (typeof value === 'string') {
@@ -26,7 +37,13 @@ export async function promoteLesson(callTool, input) {
   if (typeof callTool !== 'function' || !input || typeof input.channel_id !== 'string' || !input.proposal)
     throw new Error('promoteLesson requires callTool and {channel_id,proposal}');
   const call = async (route, args) => normalize(await callTool(route, args));
-  const review = args => call(routes.review, { channel_id: input.channel_id, ...args });
+  const review = async args => {
+    let result;
+    try { result = await callTool(routes.review, { channel_id: input.channel_id, ...args }); }
+    catch (error) { throw isMissingReviewTool(error) ? new Error(missingReviewToolMessage) : error; }
+    if (isMissingReviewTool(result)) throw new Error(missingReviewToolMessage);
+    return normalize(result);
+  };
   let prepared = await review({ action: 'prepare', proposal: input.proposal });
   if (prepared.status === 'no_entry') return prepared;
   if (!['prepared', 'saving', 'unknown', 'saved', 'duplicate'].includes(prepared.status) ||

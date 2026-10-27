@@ -34,8 +34,9 @@ async function unusedPort() {
   return port;
 }
 const port = await unusedPort();
+// PEERS_MCP_TOOL_PROFILE=all: the smoke drives review_lesson, an opt-in tool.
 const peersEnv = { ...process.env, PEERS_STATE_DIR: state, PEERS_DB_PATH: join(state, 'peers.db'), PEERS_PORT: String(port),
-  PEERS_BROKER_PROJECT: join(B, 'src/Peers.Broker/Peers.Broker.csproj') };
+  PEERS_BROKER_PROJECT: join(B, 'src/Peers.Broker/Peers.Broker.csproj'), PEERS_MCP_TOOL_PROFILE: 'all' };
 delete peersEnv.PEERS_HOME;
 // The broker under test is built from this checkout, so its /health contract must be BrokerContract.Current here.
 const contract = Number(/const int Current = (\d+);/.exec(await readFile(join(B, 'src/Peers.Shared/BrokerRuntime.cs'), 'utf8'))?.[1]);
@@ -148,7 +149,7 @@ async function runOmp(channelId, packetId, proposal, memoryInfo, expectedMarker)
   await driver.close(); // Explicit adoption is required; never impersonate the scripted driver.
   await mkdir(join(repo, '.omp'), { recursive: true });
   // Persist only fixture overrides, never inherited provider credentials or the user's auth profile.
-  const fixturePeersEnv = Object.fromEntries(['PEERS_STATE_DIR', 'PEERS_DB_PATH', 'PEERS_PORT', 'PEERS_BROKER_PROJECT'].map(key => [key, peersEnv[key]]));
+  const fixturePeersEnv = Object.fromEntries(['PEERS_STATE_DIR', 'PEERS_DB_PATH', 'PEERS_PORT', 'PEERS_BROKER_PROJECT', 'PEERS_MCP_TOOL_PROFILE'].map(key => [key, peersEnv[key]]));
   await writeFile(join(repo, '.omp/mcp.json'), JSON.stringify({ mcpServers: {
     peers: { type: 'stdio', command: peersBin, cwd: repo, env: fixturePeersEnv, timeout: 120000 },
     aletheia: { type: 'stdio', command: memoryInfo.bin, args: ['--mcp'], cwd: repo, env: aletheiaEnv, timeout: 120000 },
@@ -232,7 +233,7 @@ try {
   const roster = await driver.call('peers');
   const driverId = roster.find(p => p.tool === 'peers-review-smoke-driver').peer_id;
   const reviewerId = roster.find(p => p.tool === 'peers-review-smoke-reviewer').peer_id;
-  const channel = await driver.call('channel_create', { name: 'review-smoke', repo_root: repo }); const channelId = channel.channel_id;
+  const channel = await driver.call('channels', { action: 'create', name: 'review-smoke', repo_root: repo }); const channelId = channel.channel_id;
   broker = JSON.parse(await readFile(join(state, 'broker.json'), 'utf8'));
   assert.equal(broker.port, port); await access(join(state, 'peers.db'));
   const brokerPath = execFileSync('ps', ['-ww', '-p', String(broker.pid), '-o', 'comm='], { encoding: 'utf8' }).trim();

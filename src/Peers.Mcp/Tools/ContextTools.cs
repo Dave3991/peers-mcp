@@ -15,9 +15,7 @@ public sealed partial class ContextTools
     private static readonly JsonSerializerOptions JsonOptsIndented = new() { PropertyNamingPolicy = JsonNamingPolicy.SnakeCaseLower, WriteIndented = true };
 
     [McpServerTool(Name = "context_export"), Description(
-        "Export the current session's context as a peers-context:v1 markdown packet, suitable for pasting into Codex or another tool during a handoff.\n" +
-        "Includes (toggleable): active peers, channels, artifact list, optional task description, and free-form notes.\n" +
-        "Returns: a markdown string starting with '<!-- peers-context:v1 -->' and a single ```json block. Recommended Claude<->Codex handoff format.")]
+        "Export this session's context as a peers-context:v1 markdown packet for a Codex or tool handoff.")]
     public static async Task<string> Export(
         BrokerClient client,
         SessionState state,
@@ -27,7 +25,9 @@ public sealed partial class ContextTools
         [Description("Include channel list")] bool include_channels = true,
         [Description("Include artifact list")] bool include_artifacts = true,
         [Description("Custom task description to include")] string? task = null,
-        [Description("Custom notes to include (JSON array of strings)")] string? notes = null)
+        [Description(
+            "Custom notes to include (JSON array of strings). The result is a markdown string that starts with '<!-- peers-context:v1 -->' " +
+            "and holds a single ```json block: the recommended Claude<->Codex handoff format")] string? notes = null)
     {
         await SessionRegistration.EnsureRegisteredAsync(client, state, server, loggerFactory);
         try
@@ -93,12 +93,12 @@ public sealed partial class ContextTools
     }
 
     [McpServerTool(Name = "context_import"), Description(
-        "Parse a peers-context:v1 markdown packet (typically produced by context_export on a peer) into a typed JSON object: task, session, peers, channels, artifacts, notes, changes.\n" +
-        "Accepts a ```json block (current format) or the legacy ```yaml block.\n" +
-        "If no recognizable peers-context:v1 block is found, returns { raw, warning } with the original markdown unparsed.\n" +
-        "Returns: a JSON object keyed by section name.")]
+        "Parse a peers-context:v1 markdown packet (from context_export) into a JSON object by section.")]
     public static Task<string> Import(
-        [Description("Structured markdown context packet")] string markdown)
+        [Description(
+            "Structured markdown context packet, typically from context_export on a peer: a ```json block (current format) or the legacy ```yaml block. " +
+            "Returns a JSON object keyed by section: task, session, peers, channels, artifacts, notes, changes. " +
+            "Without a recognizable peers-context:v1 block, returns { raw, warning } with the markdown unparsed")] string markdown)
     {
         // Try to parse the current JSON format first
         var markerIdx = markdown.IndexOf("<!-- peers-context:v1 -->", StringComparison.Ordinal);

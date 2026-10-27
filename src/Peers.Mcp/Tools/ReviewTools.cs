@@ -13,21 +13,29 @@ namespace Peers.Mcp.Tools;
 internal sealed class ReviewTools
 {
     [McpServerTool(Name = "review_packet"), Description(
-        "Managed independent review: publish a complete immutable PLAN/CODE packet, fetch its verified private evidence files, or reply as its exact selected reviewer. PLAN approval precedes CODE. Fetch never approves; evidence claims are not executed. Non-ignored untracked files are captured up to 1 MiB each and 4 MiB in total; a larger one fails the capture and names the file. So does an untracked file that looks like a secret: .env, .envrc, .env.* (not *.example/*.sample/*.template), *.env, *.pem, *.key, *.p12, *.pfx, id_rsa*, id_ed25519*, or content containing 'PRIVATE KEY-----' or 'PRIVATE KEY BLOCK-----'.")]
+        "Managed review: publish a PLAN/CODE packet, fetch its evidence, or reply as the selected reviewer.")]
     public static async Task<string> Packet(BrokerClient client, SessionState state, McpServer server,
         ILoggerFactory loggerFactory, ReviewStorageOptions storage,
-        [Description("publish (driver: needs request), fetch (needs packet_id), or reply (selected reviewer: needs packet_id and reply). Exact, lowercase."), AllowedValues("publish", "fetch", "reply")] string action,
+        [Description(
+            "publish (driver: needs request): publish a complete, immutable PLAN or CODE packet for independent review. PLAN approval precedes CODE.\n" +
+            "fetch (needs packet_id): fetch the packet's verified private evidence files. A fetch never approves; evidence claims are not executed.\n" +
+            "reply (selected reviewer: needs packet_id and reply): answer the packet as its exact selected reviewer.\n" +
+            "Exact, lowercase."), AllowedValues("publish", "fetch", "reply")] string action,
         [Description("The review channel's channel_id.")] string channel_id,
         [Description("fetch/reply: the packet_id to fetch or answer; reply answers only the latest packet.")] string? packet_id = null,
-        [Description("publish only: the PLAN or CODE request. evidence[].kind is build, test, smoke, or other.")] ReviewRequest? request = null,
+        [Description(
+            "publish only: the PLAN or CODE request. evidence[].kind is build, test, smoke, or other. " +
+            "The capture includes non-ignored untracked files up to 1 MiB each and 4 MiB in total; a larger one fails the capture and names the file. " +
+            "So does an untracked file that looks like a secret: .env, .envrc, .env.* (not *.example/*.sample/*.template), *.env, *.pem, *.key, *.p12, *.pfx, id_rsa*, id_ed25519*, " +
+            "or content containing 'PRIVATE KEY-----' or 'PRIVATE KEY BLOCK-----'.")] ReviewRequest? request = null,
         [Description("reply only: verdict APPROVE or CHANGES and findings whose severity is HIGH, MED, or LOW (both case-insensitive).")] ReviewReply? reply = null,
         CancellationToken cancellationToken = default)
     {
         ReviewJson.RequireText("channel_id", channel_id);
-        ReviewJson.RequireOneOf("action", action, PacketActions);
-        RequirePayload(action, "request", request is not null, required: action == "publish");
-        RequirePayload(action, "packet_id", packet_id is not null, required: action is "fetch" or "reply");
-        RequirePayload(action, "reply", reply is not null, required: action == "reply");
+        ToolArgs.RequireAction(action, PacketActions);
+        ToolArgs.RequirePayload(action, "request", request is not null, required: action == "publish");
+        ToolArgs.RequirePayload(action, "packet_id", packet_id is not null, required: action is "fetch" or "reply");
+        ToolArgs.RequirePayload(action, "reply", reply is not null, required: action == "reply");
         await SessionRegistration.EnsureRegisteredAsync(client, state, server, loggerFactory, cancellationToken);
         try
         {
@@ -46,16 +54,18 @@ internal sealed class ReviewTools
     }
 
     private static readonly string[] PacketActions = ["publish", "fetch", "reply"];
-    private static void RequirePayload(string action, string field, bool present, bool required) =>
-        ReviewJson.Require(present == required, required
-            ? $"{field} is missing; action \"{action}\" requires it."
-            : $"{field} is set, but action \"{action}\" takes no {field}; omit it.");
 
     [McpServerTool(Name = "review_checkpoint"), Description(
-        "Restore managed review state from authoritative channel history, inspect source revision, sync explicitly handled receipts, pause/resume (including explicit offline-driver adoption), or gate terminal CODE completion. A blocked gate returns completed:false; input/lock/broker faults are tool errors. Completion after CHANGES rounds adds a non-authoritative lesson_hint that saves nothing.")]
+        "Managed review state: status, receipt sync, pause/resume, or completion of the approved CODE.")]
     public static async Task<string> Checkpoint(BrokerClient client, SessionState state, McpServer server,
         ILoggerFactory loggerFactory, ReviewStorageOptions storage,
-        [Description("status, sync, complete, pause, or resume. Exact, lowercase."), AllowedValues("status", "sync", "complete", "pause", "resume")] string action,
+        [Description(
+            "status: restore managed review state from authoritative channel history and report the source revision.\n" +
+            "sync: sync explicitly handled receipts.\n" +
+            "complete (needs expected_packet_id): gate terminal completion of the approved CODE packet. A blocked gate returns completed:false; input, lock, and broker faults are tool errors. " +
+            "Completion after CHANGES rounds adds a non-authoritative lesson_hint that saves nothing.\n" +
+            "pause (needs reason). resume: give a reason to explicitly adopt an offline driver.\n" +
+            "Exact, lowercase."), AllowedValues("status", "sync", "complete", "pause", "resume")] string action,
         [Description("The review channel's channel_id.")] string channel_id,
         [Description("Optional Git working tree of the review (default: this session's repo).")] string? source_root = null,
         [Description("complete only (required there): the approved CODE packet_id.")] string? expected_packet_id = null,
@@ -64,13 +74,13 @@ internal sealed class ReviewTools
         CancellationToken cancellationToken = default)
     {
         ReviewJson.RequireText("channel_id", channel_id);
-        ReviewJson.RequireOneOf("action", action, CheckpointActions);
-        RequirePayload(action, "expected_packet_id", expected_packet_id is not null, required: action == "complete");
+        ToolArgs.RequireAction(action, CheckpointActions);
+        ToolArgs.RequirePayload(action, "expected_packet_id", expected_packet_id is not null, required: action == "complete");
         ReviewJson.Require(ack_inbox_ids is null || action == "sync",
             $"ack_inbox_ids lists {ack_inbox_ids?.Length} ID(s), but action \"{action}\" takes none; omit it. " +
             "Acknowledge ready_to_ack IDs with a separate review_checkpoint action \"sync\" call, and other receipts with wait ack_inbox_ids.");
         if (action == "pause") ReviewJson.RequireText("reason", reason);
-        else if (action != "resume") RequirePayload(action, "reason", reason is not null, required: false);
+        else if (action != "resume") ToolArgs.RequirePayload(action, "reason", reason is not null, required: false);
         await SessionRegistration.EnsureRegisteredAsync(client, state, server, loggerFactory, cancellationToken);
         try
         {
@@ -85,9 +95,17 @@ internal sealed class ReviewTools
     private static readonly string[] CheckpointActions = ["status", "sync", "complete", "pause", "resume"];
 
     [McpServerTool(Name = "review_lesson"), Description(
-        "Explicit optional promotion after intact terminal CODE review. prepare freezes one supported before/after lesson; begin_save grants one durable dispatch through existing Aletheia tools; record and reconcile handle ambiguity and visible duplicates. Never saves memory itself or promises exactly-once storage.")]
+        "Promote one reviewed lesson after intact CODE completion: prepare, begin_save, record, reconcile.")]
     public static async Task<string> Lesson(BrokerClient client, SessionState state, McpServer server,
-        ILoggerFactory loggerFactory, ReviewStorageOptions storage, string action, string channel_id,
+        ILoggerFactory loggerFactory, ReviewStorageOptions storage,
+        [Description(
+            "Explicit, optional promotion after intact terminal CODE review.\n" +
+            "prepare (needs proposal): freeze one supported before/after lesson.\n" +
+            "begin_save (needs binding_result): grant one durable dispatch through the existing Aletheia tools.\n" +
+            "record (needs attempt_id and result) and reconcile (needs binding_result and result.observations): handle ambiguity and visible duplicates.\n" +
+            "The tool never saves memory itself and does not promise exactly-once storage."),
+         AllowedValues("prepare", "begin_save", "record", "reconcile")] string action,
+        string channel_id,
         ReviewLessonProposal? proposal = null, JsonElement? binding_result = null, string? attempt_id = null,
         ReviewLessonResult? result = null, CancellationToken cancellationToken = default)
     {
