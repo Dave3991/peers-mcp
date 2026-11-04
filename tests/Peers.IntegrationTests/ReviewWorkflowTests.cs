@@ -377,7 +377,8 @@ public sealed class ReviewWorkflowTests
         Assert.Equal(changes, before["verdict_message_id"]!.GetValue<string>());
         Assert.Equal("1. HIGH verification: Missing coverage Fix: Run intended checks", Assert.Single(before["findings"]!.AsArray())!.GetValue<string>());
         Assert.Equal(c2, hint["after"]!.GetValue<string>());
-        Assert.Equal("Optional: run review_lesson prepare with a cue and lesson based on these findings; nothing is saved automatically.", hint["next_action"]!.GetValue<string>());
+        Assert.Equal("Optional: run review_lesson prepare with a cue and lesson based on these findings; nothing is saved automatically. " +
+            "review_lesson exists only when the peers server starts with PEERS_MCP_TOOL_PROFILE=all.", hint["next_action"]!.GetValue<string>());
         // Read-only: no lesson intent exists to save, and a repeated completion reports the same hint.
         Assert.Contains("Prepare a supported lesson", await f.Driver.Error("review_lesson", new { action = "begin_save", channel_id = f.ChannelId,
             binding_result = new { workspaceBindingId = "wb_" + new string('1', 32), identityConfidence = "low", bindingStatus = "observed" } }));
@@ -488,7 +489,8 @@ internal sealed class ReviewTestPeer : IAsyncDisposable
     {
         var peer = new ReviewTestPeer { Id = id, _state = new SessionState { PeerId = id, RepoRoot = root } };
         var services = new ServiceCollection(); services.AddLogging(); services.AddSingleton(broker); services.AddSingleton(peer._state); services.AddSingleton(new ReviewStorageOptions(storage));
-        peer._services = services.BuildServiceProvider(); var options = ServerOptionsFactory.Create(peer._services);
+        // The "all" profile: these peers also drive review_lesson.
+        peer._services = services.BuildServiceProvider(); var options = ServerOptionsFactory.Create(peer._services, allTools: true);
         var input = new Pipe(); var output = new Pipe();
         var transport = new StreamServerTransport(input.Reader.AsStream(), output.Writer.AsStream(), "review-fixture", loggerFactory: null);
         peer._server = McpServer.Create(transport, options, loggerFactory: null, peer._services); peer._run = peer._server.RunAsync();

@@ -28,11 +28,16 @@ If you start Claude normally, directed peer messages are still available through
 
 ## Peer Workflow Contract
 
-The whole agent-facing surface, and the only tools that exist:
+The whole agent-facing surface, and the only tools that exist. The default (`core`) profile lists 10 tools:
 
-`peers` · `presence` · `channels` · `channel_create` · `channel_clear` · `messages_remove` · `send` · `read` · `wait` ·
-`claim` / `claims` / `release` · `artifact_publish` / `artifact_get` / `artifact_list` · `context_export` / `context_import` ·
-`review_packet` / `review_checkpoint` / `review_lesson`
+`peers` · `presence` · `channels` (action `list` / `create`) · `send` · `read` · `wait` ·
+`claims` (action `claim` / `list` / `release`) · `artifacts` (action `publish` / `get` / `list`) ·
+`review_packet` / `review_checkpoint`
+
+`PEERS_MCP_TOOL_PROFILE=all` (read when the MCP server starts) adds 5 opt-in tools:
+`channel_clear` · `messages_remove` · `context_export` / `context_import` · `review_lesson`.
+Each action of a merged tool keeps the parameter names and result shape of the old tool it replaced.
+Every top-level tool description is at most 100 characters; details go into parameter descriptions.
 
 `channel_clear` and `messages_remove` permanently delete shared history and its inbox deliveries.
 Clearing keeps the channel; neither operation resets message sequences. Already-read content cannot
@@ -47,13 +52,13 @@ When participating in a multi-session workflow with this MCP server:
 
 1. **There is no registration step**: your first tool call registers this session automatically, deriving identity from the client name and the git repo/branch. Shape how you appear to others with `presence` (role, summary, capabilities, focus paths, and progress on long-running work)
 2. **Check for directed messages**: `wait` blocks until a mention lands (default and max 120s) and returns immediately when one does. Call it without `timeout_seconds`: a shorter window only adds empty polls. The client's MCP request timeout must be more than 120s (omp: `"timeout": 130000` on the peers entry). Acknowledge what you handled by passing the previous result's `inbox_id`s as `ack_inbox_ids` — anything you do not echo is delivered again
-3. **Review requests**: a review thread is a channel — `channel_create` one per thread, then `send` each round with `to` naming the reviewer. If a channel scoped to your repo mentions you, prioritize reading and responding. Channel names resolve only in your repo or the global scope; address a channel scoped to another repo by its `channel_id` (from the mention's inbox payload, `channels`, or the error of a name lookup). Create a channel for several repos with `channel_create` `global: true`
-4. **Share artifacts**: Publish meaningful outputs (types, specs, diffs) as artifacts instead of pasting large blobs into channel messages
+3. **Review requests**: a review thread is a channel — `channels` action `create` one per thread, then `send` each round with `to` naming the reviewer. If a channel scoped to your repo mentions you, prioritize reading and responding. Channel names resolve only in your repo or the global scope; address a channel scoped to another repo by its `channel_id` (from the mention's inbox payload, `channels` action `list`, or the error of a name lookup). Create a channel for several repos with `channels` action `create`, `global: true`
+4. **Share artifacts**: Publish meaningful outputs (types, specs, diffs) with `artifacts` action `publish` instead of pasting large blobs into channel messages
 5. **Report long work**: call `presence` with `progress_current` / `progress_total` as you go. Progress is PULL-only — it never notifies anyone. Peers see it by calling `peers`, by re-reading `peers://peers`, or on a `wait` keepalive while they are parked. Omit `progress_total` for an open-ended count. There is no clear step — signal completion with `progress_current = progress_total`, otherwise a finished task keeps reading as its last count (annotated with its age once stale)
-6. **Context bridge**: Use `context_export` before handing off to Codex, and `context_import` when receiving from Codex
+6. **Context bridge**: Use `context_export` before handing off to Codex, and `context_import` when receiving from Codex (both need `PEERS_MCP_TOOL_PROFILE=all`)
 7. **Resources**: `peers://peers` (same payload as `peers`) and `peers://inbox` (same as the `wait` tool) are readable on any MCP revision and inert until registration. Subscribing uses the standard `resources/subscribe` pair; `resources/updated` is a hint to re-read, never a delta stream. Reading `peers://inbox` acknowledges nothing — ack only via `ack_inbox_ids`
 8. **Only messages notify**: `peers://inbox` and `peers://channel/{id}` notify on channel traffic. `peers://peers` never notifies: presence, progress, registration and expiry are roster changes, and omp injects every hint as a user turn. Registration and expiry still arrive durably in the inbox
-9. **Claims across worktrees**: `claim` takes repo-relative paths or absolute paths. An absolute path in another git working tree is claimed in that tree, so its sessions see it
+9. **Claims across worktrees**: `claims` action `claim` takes repo-relative paths or absolute paths. An absolute path in another git working tree is claimed in that tree, so its sessions see it
 
 ## Architecture
 

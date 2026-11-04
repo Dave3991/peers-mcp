@@ -648,7 +648,7 @@ public class PeerWaitTests
         collection.AddSingleton(new Peers.Mcp.Reviews.ReviewStorageOptions(Path.Combine(Path.GetTempPath(), "peers-review-wait-" + Guid.NewGuid().ToString("N"))));
         var services = collection.BuildServiceProvider();
 
-        var options = ServerOptionsFactory.Create(services);
+        var options = ServerOptionsFactory.Create(services, allTools: false);
         return Assert.Single(options.ToolCollection!, t => t.ProtocolTool.Name == toolName);
     }
 
@@ -743,22 +743,20 @@ public class PeerWaitTests
 
     // The defect this guards was never in the wait loop: the tool once ADVERTISED a window it did not
     // enforce, and an overrun surfaced as a transport error indistinguishable from peer silence. So the
-    // advertised text is held against the behaviour. The numbers are READ OUT of the description, so
-    // drifting either half of the pair — text or clamp — fails here. The client request budget the
-    // default needs (omp: timeout 130000 on the peers entry) is client configuration, documented in README.
+    // advertised text is held against the behaviour. The numbers are READ OUT of the timeout_seconds
+    // description, which is what a model reads when it picks a value, so drifting either half of the
+    // pair — text or clamp — fails here. The client request budget the default needs (omp: timeout
+    // 130000 on the peers entry) is client configuration, documented in README.
     [Fact]
     public async Task Wait_EnforcesExactlyTheWindowItAdvertises()
     {
         var tool = ProductionTool("wait");
-        var advertised = Regex.Match(tool.ProtocolTool.Description ?? "", @"default (\d+), max (\d+)");
-        Assert.True(advertised.Success, $"the description no longer states its window: {tool.ProtocolTool.Description}");
-        var defaultSeconds = int.Parse(advertised.Groups[1].Value);
-        var maxSeconds = int.Parse(advertised.Groups[2].Value);
-
-        // The parameter description is what a model reads when it picks a value: same pair, or one of them lies.
         var parameter = tool.ProtocolTool.InputSchema
             .GetProperty("properties").GetProperty("timeout_seconds").GetProperty("description").GetString();
-        Assert.Contains($"default {defaultSeconds}, max {maxSeconds}", parameter);
+        var advertised = Regex.Match(parameter ?? "", @"default (\d+), max (\d+)");
+        Assert.True(advertised.Success, $"timeout_seconds no longer states its window: {parameter}");
+        var defaultSeconds = int.Parse(advertised.Groups[1].Value);
+        var maxSeconds = int.Parse(advertised.Groups[2].Value);
 
         var byDefault = new WindowRecorder();
         await Wait(byDefault.Client, new SessionState { PeerId = "p" });

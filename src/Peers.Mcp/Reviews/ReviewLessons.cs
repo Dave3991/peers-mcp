@@ -102,7 +102,8 @@ internal sealed partial class ReviewWorkflow
         return before.Count == 0 ? null : new
         {
             before, after = ledger.LatestPacketId,
-            next_action = "Optional: run review_lesson prepare with a cue and lesson based on these findings; nothing is saved automatically.",
+            next_action = "Optional: run review_lesson prepare with a cue and lesson based on these findings; nothing is saved automatically. " +
+                "review_lesson exists only when the peers server starts with PEERS_MCP_TOOL_PROFILE=all.",
         };
     }
     // ReplyAsync renders one line per finding: "{n}. [OPTIONAL ]{SEVERITY} {location}: {finding} Fix: {fix}".

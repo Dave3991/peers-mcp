@@ -1,4 +1,5 @@
 using System.ComponentModel;
+using System.ComponentModel.DataAnnotations;
 using System.Text.Json;
 using Microsoft.Extensions.Logging;
 using ModelContextProtocol;
@@ -22,78 +23,53 @@ namespace Peers.Mcp.Tools;
 public sealed class ClaimTools
 {
     private static readonly JsonSerializerOptions JsonOpts = new() { PropertyNamingPolicy = JsonNamingPolicy.SnakeCaseLower };
-
-    [McpServerTool(Name = "claim"), Description(
-        "Announce that this session is working on these paths, and find out who else already is.\n" +
-        "When to use: before editing, in any repo where another session is live — a granted claim is how a peer learns to stay off your files.\n" +
-        "A directory claims everything under it. Re-claiming a path you hold extends it; TTL defaults to 30 minutes (60s..4h).\n" +
-        "An absolute path in another git working tree (for example a sibling worktree) is claimed in that tree, where its sessions see it.\n" +
-        "Returns: { repo_root, granted:[{path, repo_root, expires_at}], conflicts:[{path, repo_root, held_path, holder_peer_id, holder_role, holder_summary, expires_at}] }.\n" +
-        "Conflicts wrote nothing: coordinate with the holder (send them a mention) or work elsewhere. Nothing is blocked for you — the report is the point.")]
-    public static async Task<string> Claim(
-        BrokerClient client,
-        SessionState state,
-        McpServer server,
-        ILoggerFactory loggerFactory,
-        [Description("Repo-relative paths in this repository, or absolute paths in any git working tree; a directory covers its contents")] string[] paths,
-        [Description("Seconds to hold the claim (default 1800, clamped to 60..14400)")] int? ttl_seconds = null,
-        CancellationToken cancellationToken = default)
-    {
-        await SessionRegistration.EnsureRegisteredAsync(client, state, server, loggerFactory, cancellationToken);
-        try
-        {
-            var resp = await client.ClaimPathsAsync(new ClaimPathsRequest
-            {
-                PeerId = state.PeerId!,
-                Paths = paths,
-                TtlSeconds = ttl_seconds,
-            }, cancellationToken);
-            return JsonSerializer.Serialize(resp, JsonOpts);
-        }
-        catch (BrokerApiException ex) { throw new McpException(ex.Message, ex); }
-    }
-
-    [McpServerTool(Name = "release"), Description(
-        "Release path claims this session holds — call it when a phase ends, so a peer waiting on those files does not wait out the TTL.\n" +
-        "Omit paths to release everything. Claims also lapse on their own with the TTL or when this session's lease expires.\n" +
-        "Returns: { released } — the number of claims dropped.")]
-    public static async Task<string> Release(
-        BrokerClient client,
-        SessionState state,
-        McpServer server,
-        ILoggerFactory loggerFactory,
-        [Description("Paths to release, as given to claim; omit to release every claim this session holds")] string[]? paths = null,
-        CancellationToken cancellationToken = default)
-    {
-        await SessionRegistration.EnsureRegisteredAsync(client, state, server, loggerFactory, cancellationToken);
-        try
-        {
-            var resp = await client.ReleaseClaimsAsync(new ReleaseClaimsRequest
-            {
-                PeerId = state.PeerId!,
-                Paths = paths,
-            }, cancellationToken);
-            return JsonSerializer.Serialize(resp, JsonOpts);
-        }
-        catch (BrokerApiException ex) { throw new McpException(ex.Message, ex); }
-    }
+    private static readonly string[] Actions = ["claim", "list", "release"];
 
     [McpServerTool(Name = "claims"), Description(
-        "Every path claim currently held in this repository, with its holder.\n" +
-        "Use to see the work map before splitting a task; `claim` already reports the conflicts that concern you.\n" +
-        "Returns: array of { path, repo_root, peer_id, holder_role, holder_summary, expires_at }.")]
+        "Claim paths before you edit them, list this repo's claims, or release yours. Claims never block.")]
     public static async Task<string> Claims(
         BrokerClient client,
         SessionState state,
         McpServer server,
         ILoggerFactory loggerFactory,
+        [Description(
+            "claim (needs paths): announce that this session works on these paths and find out who else already does. " +
+            "Use it before editing in any repo where another session is live: a granted claim is how a peer learns to stay off your files. " +
+            "Returns { repo_root, granted:[{path, repo_root, expires_at}], conflicts:[{path, repo_root, held_path, holder_peer_id, holder_role, holder_summary, expires_at}] }. " +
+            "A conflict wrote nothing: coordinate with the holder (send them a mention) or work elsewhere. Nothing is blocked for you; the report is the point.\n" +
+            "list: every claim held in this repository, with its holder, to see the work map before you split a task (claim already reports the conflicts that concern you). " +
+            "Returns { claims:[{path, repo_root, peer_id, holder_role, holder_summary, expires_at}] }.\n" +
+            "release: give back claims this session holds when a phase ends, so a peer waiting on those files does not wait out the TTL. " +
+            "Claims also lapse with their TTL or when this session's lease expires. Returns { released }, the number of claims dropped.\n" +
+            "Exact, lowercase."),
+         AllowedValues("claim", "list", "release")] string action,
+        [Description(
+            "claim (required): repo-relative paths in this repository, or absolute paths in any git working tree. " +
+            "A directory covers its contents. An absolute path in another git working tree (for example a sibling worktree) is claimed in that tree, where its sessions see it. " +
+            "release: paths as given to claim; omit to release every claim this session holds")] string[]? paths = null,
+        [Description("claim only: seconds to hold the claim (default 1800, clamped to 60..14400). Claiming a path you hold again extends it")] int? ttl_seconds = null,
         CancellationToken cancellationToken = default)
     {
+        action = ToolArgs.RequireAction(action, Actions);
+        if (action == "claim") ToolArgs.RequirePayload(action, "paths", paths is not null, required: true);
         await SessionRegistration.EnsureRegisteredAsync(client, state, server, loggerFactory, cancellationToken);
         try
         {
-            var resp = await client.ListClaimsAsync(state.PeerId!, cancellationToken);
-            return JsonSerializer.Serialize(resp, JsonOpts);
+            return action switch
+            {
+                "claim" => JsonSerializer.Serialize(await client.ClaimPathsAsync(new ClaimPathsRequest
+                {
+                    PeerId = state.PeerId!,
+                    Paths = paths!,
+                    TtlSeconds = ttl_seconds,
+                }, cancellationToken), JsonOpts),
+                "release" => JsonSerializer.Serialize(await client.ReleaseClaimsAsync(new ReleaseClaimsRequest
+                {
+                    PeerId = state.PeerId!,
+                    Paths = paths,
+                }, cancellationToken), JsonOpts),
+                _ => JsonSerializer.Serialize(await client.ListClaimsAsync(state.PeerId!, cancellationToken), JsonOpts),
+            };
         }
         catch (BrokerApiException ex) { throw new McpException(ex.Message, ex); }
     }

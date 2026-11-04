@@ -109,7 +109,7 @@ public sealed class DiscoveryTests : IDisposable
         Assert.DoesNotContain(repoOnly.Channels, c => c.Name == "other-scope");
     }
 
-    // ── artifact_list: pagination + stable order ──────────────────────────────
+    // ── artifacts list: pagination + stable order ─────────────────────────────
 
     [Fact]
     public async Task ArtifactList_Pagination_NewestFirstDisjointPages()

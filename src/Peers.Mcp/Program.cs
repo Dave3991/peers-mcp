@@ -18,7 +18,8 @@ services.AddSingleton(new Peers.Mcp.Reviews.ReviewStorageOptions(Peers.Shared.Pe
 
 using var serviceProvider = services.BuildServiceProvider();
 
-var options = ServerOptionsFactory.Create(serviceProvider);
+var options = ServerOptionsFactory.Create(serviceProvider,
+    allTools: ServerOptionsFactory.AllToolsRequested(Environment.GetEnvironmentVariable(ServerOptionsFactory.ToolProfileVariable)));
 
 var transport = new StdioServerTransport(options, loggerFactory: null);
 // No `await using`: McpHost.RunUntilTransportClosedAsync takes ownership and disposes it, and disposal

@@ -83,8 +83,9 @@ public sealed class McpSubscriptionTests : IAsyncLifetime
         services.AddSingleton(new Peers.Mcp.Reviews.ReviewStorageOptions(Path.Combine(Path.GetTempPath(), "peers-review-sub-" + Guid.NewGuid().ToString("N"))));
         _services = services.BuildServiceProvider();
 
-        // The real production wiring — not a second copy that can pass while production is broken.
-        var options = ServerOptionsFactory.Create(_services);
+        // The real production wiring — not a second copy that can pass while production is broken. The
+        // "all" profile, because these tests also drive the opt-in tools.
+        var options = ServerOptionsFactory.Create(_services, allTools: true);
 
         var clientToServer = new Pipe();
         var serverToClient = new Pipe();
@@ -861,8 +862,8 @@ public sealed class McpSubscriptionTests : IAsyncLifetime
         Assert.Contains("peer_id", TextOf(peers));
 
         var padId = JsonNode.Parse(TextOf(await legacy.Client.CallToolAsync(
-            "channel_create",
-            new Dictionary<string, object?> { ["name"] = $"legacy-read-{Guid.NewGuid():N}" })))!["channel_id"]!.GetValue<string>();
+            "channels",
+            new Dictionary<string, object?> { ["action"] = "create", ["name"] = $"legacy-read-{Guid.NewGuid():N}" })))!["channel_id"]!.GetValue<string>();
         var channel = await legacy.Client.ReadResourceAsync(PeerResources.ChannelUri(padId));
         Assert.Contains("messages", TextOf(channel));
 
@@ -890,7 +891,7 @@ public sealed class McpSubscriptionTests : IAsyncLifetime
 
     /// <summary>
     /// A second MCP session against the same broker, pinned to 2025-11-25 — its own SessionState, built by
-    /// the same production ServerOptionsFactory as everything else.
+    /// the same production ServerOptionsFactory as everything else, with the default (core) tool profile.
     /// </summary>
     private sealed class LegacySession(
         ServiceProvider services, SessionState state, McpServer server, Task serverTask, McpClient client)
@@ -918,8 +919,9 @@ public sealed class McpSubscriptionTests : IAsyncLifetime
         collection.AddSingleton(new Peers.Mcp.Reviews.ReviewStorageOptions(Path.Combine(Path.GetTempPath(), "peers-review-sub-" + Guid.NewGuid().ToString("N"))));
         var services = collection.BuildServiceProvider();
 
-        // The real production wiring again — the point of this test is that it is not a second copy.
-        var options = ServerOptionsFactory.Create(services);
+        // The real production wiring again — the point of this test is that it is not a second copy. Core
+        // profile: production's default when PEERS_MCP_TOOL_PROFILE is unset.
+        var options = ServerOptionsFactory.Create(services, allTools: false);
 
         var clientToServer = new Pipe();
         var serverToClient = new Pipe();
@@ -942,10 +944,10 @@ public sealed class McpSubscriptionTests : IAsyncLifetime
     // ServerOptionsFactory never registered, so it never appeared in tools/list — and its unit tests
     // passed the whole time by calling the static method directly. A hard-coded expected list would
     // NOT have caught that (the tool was missing from both sides), so the expectation is derived from
-    // the assembly: every [McpServerTool] that EXISTS must be REACHABLE.
+    // the assembly: every [McpServerTool] that EXISTS must be REACHABLE with the "all" profile.
     // -------------------------------------------------------------------------
     [Fact]
-    public async Task ToolsList_ExposesEveryToolDeclaredInTheAssembly()
+    public async Task ToolsList_AllProfile_ExposesEveryToolDeclaredInTheAssembly()
     {
         var declared = DeclaredToolNames();
         var listed = (await _client.ListToolsAsync()).Select(t => t.Name).Order().ToArray();
@@ -957,14 +959,43 @@ public sealed class McpSubscriptionTests : IAsyncLifetime
         Assert.Equal(
             new[]
             {
-                "artifact_get", "artifact_list", "artifact_publish",
-                "channel_clear", "channel_create", "channels", "claim", "claims",
+                "artifacts", "channel_clear", "channels", "claims",
                 "context_export", "context_import", "messages_remove",
-                "peers", "presence", "read", "release",
+                "peers", "presence", "read",
                 "review_checkpoint", "review_lesson", "review_packet",
                 "send", "wait",
             },
             listed);
+    }
+
+    // The default profile: every tool cost context in every request of every session, so the rare and
+    // destructive ones are listed only with PEERS_MCP_TOOL_PROFILE=all.
+    [Fact]
+    public async Task ToolsList_CoreProfile_HidesTheOptInTools()
+    {
+        await using var core = await StartLegacySessionAsync();
+        var listed = (await core.Client.ListToolsAsync()).Select(t => t.Name).Order().ToArray();
+
+        Assert.Equal(DeclaredToolNames().Except(ServerOptionsFactory.OptInTools).ToArray(), listed);
+        Assert.Equal(
+            new[] { "artifacts", "channels", "claims", "peers", "presence", "read", "review_checkpoint", "review_packet", "send", "wait" },
+            listed);
+        var hidden = await Assert.ThrowsAsync<McpProtocolException>(() => core.Client.CallToolAsync("channel_clear",
+            new Dictionary<string, object?> { ["channel_id"] = "x", ["confirm_channel"] = "x" }).AsTask());
+        Assert.Contains("Unknown tool: 'channel_clear'", hidden.Message);
+        // The instructions name the profile that lists the hidden tools, and explain review_lesson only where it exists.
+        Assert.EndsWith("Opt-in tools, listed only when the server starts with PEERS_MCP_TOOL_PROFILE=all: " +
+            "`channel_clear`, `messages_remove`, `context_export`, `context_import`, `review_lesson`.", core.Client.ServerInstructions);
+        Assert.DoesNotContain("`review_lesson` freezes", core.Client.ServerInstructions);
+        Assert.Contains("`review_lesson` freezes", _client.ServerInstructions);
+    }
+
+    // A top-level description is in the context of every request; details belong to the parameters.
+    [Fact]
+    public async Task ToolDescriptions_AreAtMost100Characters()
+    {
+        foreach (var tool in await _client.ListToolsAsync())
+            Assert.True(tool.Description!.Length <= 100, $"{tool.Name}: {tool.Description.Length} chars");
     }
 
     // An agent can only send an allowed value it can see: the review_packet schema lists the allowed
@@ -988,7 +1019,7 @@ public sealed class McpSubscriptionTests : IAsyncLifetime
     [Fact]
     public async Task ToolFailures_AreMarkedAsMcpErrors()
     {
-        var missingLookup = await _client.CallToolAsync("artifact_get");
+        var missingLookup = await _client.CallToolAsync("artifacts", new Dictionary<string, object?> { ["action"] = "get" });
         Assert.True(missingLookup.IsError is true, TextOf(missingLookup));
         Assert.Contains("Missing parameters", TextOf(missingLookup));
 
@@ -1007,25 +1038,105 @@ public sealed class McpSubscriptionTests : IAsyncLifetime
     // carries whichever peer a previously-run test left behind, and a claim by a stale peer id is a
     // legitimate NotFound the harness would report as a JSON parse error four lines later.
     [Fact]
-    public async Task ClaimTools_GrantAPath_ThenListAndReleaseIt()
+    public async Task ClaimsTool_GrantsAPath_ThenListsAndReleasesIt()
     {
         await RegisterAsync();
         var path = "src/Peers.Mcp/Tools/ClaimTools.cs";
-        var claimArgs = new Dictionary<string, object?> { ["paths"] = new[] { path } };
+        var claimArgs = new Dictionary<string, object?> { ["action"] = "claim", ["paths"] = new[] { path } };
 
-        var granted = await CallOkAsync("claim", claimArgs);
+        var granted = await CallOkAsync("claims", claimArgs);
         Assert.Empty(granted["conflicts"]!.AsArray());
         Assert.Equal(path, Str(granted["granted"]![0]!["path"]));
 
-        var listed = await CallOkAsync("claims");
+        var listed = await CallOkAsync("claims", new() { ["action"] = "list" });
         Assert.Contains(listed["claims"]!.AsArray(), claim => Str(claim!["path"]) == path);
 
         // Re-claiming my own path renews rather than conflicting, and release empties the map.
-        Assert.Empty((await CallOkAsync("claim", claimArgs))["conflicts"]!.AsArray());
+        Assert.Empty((await CallOkAsync("claims", claimArgs))["conflicts"]!.AsArray());
 
-        var released = await CallOkAsync("release");
+        var released = await CallOkAsync("claims", new() { ["action"] = "release" });
         Assert.Equal(1, released["released"]!.GetValue<int>());
-        Assert.Empty((await CallOkAsync("claims"))["claims"]!.AsArray());
+        Assert.Empty((await CallOkAsync("claims", new() { ["action"] = "list" }))["claims"]!.AsArray());
+
+        // Release by path drops only that path.
+        await CallOkAsync("claims", new() { ["action"] = "claim", ["paths"] = new[] { path, "README.md" }, ["ttl_seconds"] = 60 });
+        Assert.Equal(1, (await CallOkAsync("claims", new() { ["action"] = "release", ["paths"] = new[] { path } }))["released"]!.GetValue<int>());
+        Assert.Equal("README.md", Str(Assert.Single((await CallOkAsync("claims", new() { ["action"] = "list" }))["claims"]!.AsArray())!["path"]));
+    }
+
+    [Fact]
+    public async Task ChannelsTool_CreatesAChannel_ThenListsIt()
+    {
+        await RegisterAsync();
+        _state.RepoRoot = "/repo";
+        var name = $"listed-{Guid.NewGuid():N}";
+        var created = await CallOkAsync("channels", new() { ["action"] = "create", ["name"] = name });
+        Assert.Equal("/repo", Str(created["repo_root"]));
+
+        var listed = await CallOkAsync("channels", new() { ["action"] = "list" });
+        var channel = Assert.Single(listed["channels"]!.AsArray(), c => Str(c!["name"]) == name)!;
+        Assert.Equal(Str(created["channel_id"]), Str(channel["channel_id"]));
+        Assert.Equal("/repo", Str(channel["repo_root"]));
+    }
+
+    [Fact]
+    public async Task ArtifactsTool_PublishesGetsAndListsAnArtifact()
+    {
+        await RegisterAsync();
+        var ns = $"ns-{Guid.NewGuid():N}";
+        var published = await CallOkAsync("artifacts", new()
+        {
+            ["action"] = "publish", ["namespace"] = ns, ["name"] = "contract", ["type"] = "schema",
+            ["content"] = "0123456789", ["tags"] = new[] { "smoke" },
+        });
+        Assert.Equal(1, published["version"]!.GetValue<int>());
+        var id = Str(published["artifact_id"])!;
+
+        var byId = await CallOkAsync("artifacts", new() { ["action"] = "get", ["artifact_id"] = id });
+        Assert.Equal("0123456789", Str(byId["content"]));
+        var byName = await CallOkAsync("artifacts", new() { ["action"] = "get", ["namespace"] = ns, ["name"] = "contract" });
+        Assert.Equal(id, Str(byName["artifact_id"]));
+        var page = await CallOkAsync("artifacts", new() { ["action"] = "get", ["artifact_id"] = id, ["offset"] = 2, ["max_chars"] = 3 });
+        Assert.Equal("234", Str(page["content"]));
+        Assert.Equal(5, page["next_offset"]!.GetValue<int>());
+        Assert.Contains("Call artifacts action get again with offset=5", Str(page["message"]));
+
+        var listed = await CallOkAsync("artifacts", new() { ["action"] = "list", ["namespace"] = ns });
+        Assert.Equal(id, Str(Assert.Single(listed.AsArray())!["artifact_id"]));
+        Assert.Empty((await CallOkAsync("artifacts", new() { ["action"] = "list", ["namespace"] = ns, ["offset"] = 1 })).AsArray());
+    }
+
+    // An action tool's error names what to change: the allowed actions, or the field the action needs.
+    // A required argument that is absent used to fail binding inside the SDK as "An error occurred invoking".
+    [Theory]
+    [InlineData("channels", null, "action is missing; allowed values: list, create.")]
+    [InlineData("channels", "delete", "action is \"delete\"; allowed values: list, create.")]
+    [InlineData("channels", "create", "name is missing; action \"create\" requires it.")]
+    [InlineData("claims", null, "action is missing; allowed values: claim, list, release.")]
+    [InlineData("claims", "Claim", "action is \"Claim\"; allowed values: claim, list, release.")]
+    [InlineData("claims", "claim", "paths is missing; action \"claim\" requires it.")]
+    [InlineData("artifacts", null, "action is missing; allowed values: publish, get, list.")]
+    [InlineData("artifacts", "fetch", "action is \"fetch\"; allowed values: publish, get, list.")]
+    [InlineData("artifacts", "publish", "namespace is missing; action \"publish\" requires it.")]
+    [InlineData("review_packet", null, "action is missing; allowed values: publish, fetch, reply.")]
+    public async Task ActionTools_NameTheAllowedActions_AndTheMissingField(string tool, string? action, string expected)
+    {
+        await RegisterAsync();
+        var args = new Dictionary<string, object?> { ["channel_id"] = "unused" };
+        if (action is not null) args["action"] = action;
+        var result = await _client.CallToolAsync(tool, args);
+        Assert.True(result.IsError is true, TextOf(result));
+        Assert.EndsWith(": " + expected, TextOf(result));
+    }
+
+    [Fact]
+    public async Task ArtifactsPublish_NamesEachMissingField()
+    {
+        var args = new Dictionary<string, object?> { ["action"] = "publish", ["namespace"] = "ns", ["name"] = "n", ["type"] = "diff" };
+        Assert.EndsWith(": content is missing; action \"publish\" requires it.", TextOf(await _client.CallToolAsync("artifacts", args)));
+        args.Remove("type");
+        Assert.EndsWith(": type is missing; action \"publish\" requires it.", TextOf(await _client.CallToolAsync("artifacts", args)));
+        Assert.EndsWith(": content is missing; send requires it.", TextOf(await _client.CallToolAsync("send", new Dictionary<string, object?> { ["channel"] = "x" })));
     }
 
     // The retry contract on the wire: same key, same message, and the second call says so.
@@ -1034,7 +1145,7 @@ public sealed class McpSubscriptionTests : IAsyncLifetime
     {
         await RegisterAsync();
         var channel = $"idem-{Guid.NewGuid():N}";
-        await CallOkAsync("channel_create", new Dictionary<string, object?> { ["name"] = channel });
+        await CallOkAsync("channels", new Dictionary<string, object?> { ["action"] = "create", ["name"] = channel });
 
         var args = new Dictionary<string, object?>
         {
@@ -1104,7 +1215,7 @@ public sealed class McpSubscriptionTests : IAsyncLifetime
         var global = await _broker.CreateChannelAsync(new CreateChannelRequest
             { Name = name, CreatedByPeerId = _peerId! });
         await AppendAsync(global.ChannelId, "global survives");
-        var channel = await CallOkAsync("channel_create", new() { ["name"] = name });
+        var channel = await CallOkAsync("channels", new() { ["action"] = "create", ["name"] = name });
         var id = Str(channel["channel_id"])!;
         var first = await CallOkAsync("send", new() { ["channel"] = name, ["content"] = "first" });
         var last = await CallOkAsync("send", new() { ["channel"] = name, ["content"] = "last" });
@@ -1171,7 +1282,7 @@ public sealed class McpSubscriptionTests : IAsyncLifetime
         Assert.Equal("reached", Str(Assert.Single(idAsName["messages"]!.AsArray())!["content"]));
 
         // Name lookup is unchanged: the same name now resolves to this repo's own channel.
-        var own = await CallOkAsync("channel_create", new() { ["name"] = name });
+        var own = await CallOkAsync("channels", new() { ["action"] = "create", ["name"] = name });
         var local = await CallOkAsync("send", new() { ["channel"] = name, ["content"] = "local" });
         Assert.Equal(Str(own["channel_id"]), Str(local["channel_id"]));
         Assert.Equal("local", Str(Assert.Single((await CallOkAsync("read", new() { ["channel"] = name }))["messages"]!.AsArray())!["content"]));
@@ -1200,15 +1311,15 @@ public sealed class McpSubscriptionTests : IAsyncLifetime
         await RegisterAsync();
         _state.RepoRoot = "/repo";
         var name = $"notices-{Guid.NewGuid():N}";
-        var created = await CallOkAsync("channel_create", new() { ["name"] = name, ["global"] = true });
+        var created = await CallOkAsync("channels", new() { ["action"] = "create", ["name"] = name, ["global"] = true });
         Assert.Null(created["repo_root"]);
 
         _state.RepoRoot = "/another-repo";
         var sent = await CallOkAsync("send", new() { ["channel"] = name, ["content"] = "notice" });
         Assert.Equal(Str(created["channel_id"]), Str(sent["channel_id"]));
 
-        var both = await _client.CallToolAsync("channel_create", new Dictionary<string, object?>
-            { ["name"] = $"{name}-x", ["global"] = true, ["repo_root"] = "/repo" });
+        var both = await _client.CallToolAsync("channels", new Dictionary<string, object?>
+            { ["action"] = "create", ["name"] = $"{name}-x", ["global"] = true, ["repo_root"] = "/repo" });
         Assert.True(both.IsError is true, TextOf(both));
     }
 

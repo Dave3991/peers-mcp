@@ -157,3 +157,15 @@ test('get application error never becomes verified save evidence', async () => {
   assert.equal((await promoteLesson(f.call, f.input)).status, 'unknown');
   assert.equal(f.saves, 1);
 });
+
+test('a missing review_lesson device names PEERS_MCP_TOOL_PROFILE=all and makes no memory calls', async () => {
+  const omp = { text: 'No such tool: xd://mcp__peers_review_lesson. Mounted devices: mcp__peers_peers', details: {}, hasError: true };
+  const mcp = new Error("Request failed (remote): Unknown tool: 'review_lesson'");
+  for (const missing of [async () => omp, async () => { throw mcp; }]) {
+    const f = fixture();
+    const call = (path, args) => path.endsWith('peers_review_lesson') ? missing() : f.call(path, args);
+    await assert.rejects(promoteLesson(call, f.input), /PEERS_MCP_TOOL_PROFILE=all/);
+    assert.equal(f.searches, 0);
+    assert.equal(f.saves, 0);
+  }
+});

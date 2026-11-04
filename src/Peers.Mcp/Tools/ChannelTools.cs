@@ -1,5 +1,6 @@
 using System.Collections.Generic;
 using System.ComponentModel;
+using System.ComponentModel.DataAnnotations;
 using System.Text.Json;
 using Microsoft.Extensions.Logging;
 using ModelContextProtocol;
@@ -28,8 +29,7 @@ public sealed class ChannelTools
     private static McpException BrokerError(BrokerApiException ex) => new(ex.Message, ex);
 
     [McpServerTool(Name = "peers"), Description(
-        "Live roster of peer sessions known to the local broker — who is working where, on what branch, doing what.\n" +
-        "Returns: array of peers with peer_id, tool, repo_root, branch, role, summary, and progress_current/progress_total/progress_updated_at for peers reporting long-running work.")]
+        "Live roster of peer sessions: peer_id, tool, repo_root, branch, role, summary, and progress.")]
     public static async Task<string> Peers(
         BrokerClient client,
         SessionState state,
@@ -47,19 +47,17 @@ public sealed class ChannelTools
     }
 
     [McpServerTool(Name = "presence"), Description(
-        "Update how this session appears to other peers: role (implementing/reviewing/debugging/spec), summary of current work, capability tags, focus paths.\n" +
-        "Identity (tool, repo, branch) is derived automatically; presence is for the human-meaningful fields. Renewed automatically by heartbeat.\n" +
-        "Long-running work: call again with progress_current (and progress_total when you know it) as you go. Last value wins, one task at a time, and `summary` says what is being counted. Other peers see it in the roster, on peers://peers, and on their wait keepalives.")]
+        "Set how this session appears to peers: role, summary, capabilities, focus paths, and progress.")]
     public static async Task<string> Presence(
         BrokerClient client,
         SessionState state,
         McpServer server,
         ILoggerFactory loggerFactory,
-        [Description("Role: implementing, reviewing, debugging, spec")] string? role = null,
-        [Description("Brief summary of current work")] string? summary = null,
+        [Description("Role: implementing, reviewing, debugging, or spec. Identity (tool, repo, branch) is derived automatically: presence sets only the human-meaningful fields, and the heartbeat renews them")] string? role = null,
+        [Description("Brief summary of current work. During a long-running task, it says what progress_current counts")] string? summary = null,
         [Description("File paths this session focuses on")] string[]? focus_paths = null,
         [Description("Capability tags this session advertises, e.g. [\"build\",\"test\",\"review\"]")] string[]? capabilities = null,
-        [Description("Units of the current long-running task done so far, e.g. 7 of 12 files")] int? progress_current = null,
+        [Description("Units of the current long-running task done so far, e.g. 7 of 12 files. Call presence again as you go: the last value wins, one task at a time. Other peers see it in the roster, on peers://peers, and on their wait keepalives")] int? progress_current = null,
         [Description("Total units in the current task; omit for an open-ended count. Requires progress_current")] int? progress_total = null,
         CancellationToken cancellationToken = default)
     {
@@ -80,70 +78,63 @@ public sealed class ChannelTools
         catch (BrokerApiException ex) { throw BrokerError(ex); }
     }
 
+    private static readonly string[] ChannelsActions = ["list", "create"];
+
     [McpServerTool(Name = "channels"), Description(
-        "List channels — named message boards, optionally scoped to a repository. A channel name belongs to agents; the repo metadata says whose code it is about.\n" +
-        "Returns: array of { channel_id, name, repo_root, message_count, created_at }.")]
+        "List channels or create one. A channel is a named message board for one repo or for all repos.")]
     public static async Task<string> Channels(
         BrokerClient client,
         SessionState state,
         McpServer server,
         ILoggerFactory loggerFactory,
+        [Description(
+            "list: every channel. A channel name belongs to agents; repo_root says whose code it is about. " +
+            "Returns { channels:[{channel_id, name, repo_root, created_by_peer_id, created_at, message_count}] }.\n" +
+            "create (needs name): create a channel scoped to this session's repo, to repo_root, or to every repo with global. " +
+            "Names are unique per scope: an existing (repo, name) pair returns an error that names the existing channel. Returns { channel_id, name, repo_root }.\n" +
+            "Exact, lowercase."),
+         AllowedValues("list", "create")] string action,
+        [Description("create (required): channel name, e.g. 'deploy' or 'mafia-review'")] string? name = null,
+        [Description("create only: repository root this channel belongs to (defaults to this session's repo). Omit it with global")] string? repo_root = null,
+        [Description(
+            "create only: true creates a global channel that sessions in every repo reach by name; use it for notices to sessions in several repos. " +
+            "A name otherwise reaches only channels in the caller's repo and the global scope; sessions in other repos address a repo channel by its channel_id")] bool global = false,
         CancellationToken cancellationToken = default)
     {
-        await SessionRegistration.EnsureRegisteredAsync(client, state, server, loggerFactory, cancellationToken);
-        try
+        action = ToolArgs.RequireAction(action, ChannelsActions);
+        if (action == "create")
         {
-            var resp = await client.ListChannelsAsync();
-            return JsonSerializer.Serialize(resp, JsonOpts);
+            ToolArgs.RequirePayload(action, "name", name is not null, required: true);
+            if (global && repo_root is not null)
+                throw new McpException($"repo_root is '{repo_root}' and global is true; a channel has one scope. Omit repo_root for a global channel, or global for a repo channel.");
         }
-        catch (BrokerApiException ex) { throw BrokerError(ex); }
-    }
-
-    [McpServerTool(Name = "channel_create"), Description(
-        "Create a channel. Name is yours to choose. It is scoped to this session's repo, to `repo_root` when given, or to every repo with `global: true`.\n" +
-        "A name reaches only channels in the caller's repo and the global scope; sessions in other repos address a repo-scoped channel by its channel_id. Use global for notices meant for sessions in several repos.\n" +
-        "Names are unique per scope — creating an existing (repo, name) pair returns an error naming the existing channel.")]
-    public static async Task<string> ChannelCreate(
-        BrokerClient client,
-        SessionState state,
-        McpServer server,
-        ILoggerFactory loggerFactory,
-        [Description("Channel name, e.g. 'deploy' or 'mafia-review'")] string name,
-        [Description("Repository root this channel belongs to (defaults to this session's repo). Omit it with global")] string? repo_root = null,
-        [Description("true creates a global channel, reachable by name from every repo")] bool global = false,
-        CancellationToken cancellationToken = default)
-    {
-        if (global && repo_root is not null)
-            throw new McpException($"repo_root is '{repo_root}' and global is true; a channel has one scope. Omit repo_root for a global channel, or global for a repo channel.");
         await SessionRegistration.EnsureRegisteredAsync(client, state, server, loggerFactory, cancellationToken);
         try
         {
-            var resp = await client.CreateChannelAsync(new CreateChannelRequest
-            {
-                Name = name,
-                RepoRoot = global ? null : repo_root ?? state.RepoRoot,
-                CreatedByPeerId = state.PeerId!,
-            });
-            return JsonSerializer.Serialize(resp, JsonOpts);
+            return action == "list"
+                ? JsonSerializer.Serialize(await client.ListChannelsAsync(), JsonOpts)
+                : JsonSerializer.Serialize(await client.CreateChannelAsync(new CreateChannelRequest
+                {
+                    Name = name!,
+                    RepoRoot = global ? null : repo_root ?? state.RepoRoot,
+                    CreatedByPeerId = state.PeerId!,
+                }), JsonOpts);
         }
         catch (BrokerApiException ex) { throw BrokerError(ex); }
     }
 
     [McpServerTool(Name = "send"), Description(
-        "Post one message to a channel, addressed by `channel` (name) or `channel_id` — exactly one. A name resolves in this session's repo, then the global scope; `channel_id` reaches a channel scoped to any repo. Mentions go in `to` as peer IDs or prefixes.\n" +
-        "Loud (default): visible to everyone reading the channel; subscribers get a push hint.\n" +
-        "quiet=true: a whisper — delivered to the mentioned peers only; nobody else ever sees it in reads or notifications. Quiet requires at least one mention.\n" +
-        "Returns: { message_id, seq, mentions, delivery:{online,offline,unresolved} } — delivery tells you whether each mention reached a live session.")]
+        "Post a message to a channel. Mention peers with `to`; quiet=true whispers to the mentions only.")]
     public static async Task<string> Send(
         BrokerClient client,
         SessionState state,
         McpServer server,
         ILoggerFactory loggerFactory,
-        [Description("Markdown content to post")] string content,
+        [Description("Markdown content to post. Returns { message_id, seq, mentions, delivery:{online,offline,unresolved} }: delivery tells you whether each mention reached a live session")] string content,
         [Description(ChannelNameDescription)] string? channel = null,
         [Description(ChannelIdDescription)] string? channel_id = null,
         [Description("Peer IDs (or ID prefixes) to mention")] string[]? to = null,
-        [Description("Deliver only to mentions; hide from all other readers")] bool quiet = false,
+        [Description("false (default): loud, visible to everyone reading the channel; subscribers get a push hint. true: a whisper, delivered to the mentioned peers only; nobody else ever sees it in reads or notifications. Quiet requires at least one mention")] bool quiet = false,
         [Description("Retry-safe key: a second send with this key in this channel returns the first message instead of posting twice")] string? idempotency_key = null,
         CancellationToken cancellationToken = default)
     {
@@ -165,8 +156,7 @@ public sealed class ChannelTools
     }
 
     [McpServerTool(Name = "read"), Description(
-        "Read a channel's messages, oldest first, addressed by `channel` (name) or `channel_id` — exactly one. Whispers addressed to others are filtered out of your view automatically; you see your own quiet messages and those mentioning you.\n" +
-        "since_seq pages forward from a previous read's last seq; truncated=true means call again with since_seq set.")]
+        "Read a channel's messages, oldest first. You see a whisper only if you wrote it or it mentions you.")]
     public static async Task<string> Read(
         BrokerClient client,
         SessionState state,
@@ -174,7 +164,7 @@ public sealed class ChannelTools
         ILoggerFactory loggerFactory,
         [Description(ChannelNameDescription)] string? channel = null,
         [Description(ChannelIdDescription)] string? channel_id = null,
-        [Description("Only messages after this seq (from a previous read)")] long? since_seq = null,
+        [Description("Only messages after this seq (from a previous read). truncated=true in a result means: call again with since_seq set to its last seq")] long? since_seq = null,
         [Description("Max messages per call (default 200)")] int? limit = null,
         CancellationToken cancellationToken = default)
     {
@@ -189,8 +179,7 @@ public sealed class ChannelTools
     }
 
     [McpServerTool(Name = "channel_clear"), Description(
-        "Permanently clear a channel's messages for every session, including pending inbox deliveries. Address it by `channel` (name) or `channel_id` — exactly one. " + DeleteScopeRule + " " + ConfirmRule + "\n" +
-        "The channel remains usable and sequence numbers are not reset. Returns: { channel_id, name, repo_root, deleted_messages }.")]
+        "DESTRUCTIVE: permanently delete every message in a channel, for all sessions. The channel stays.")]
     public static async Task<string> ChannelClear(
         BrokerClient client,
         SessionState state,
@@ -198,7 +187,7 @@ public sealed class ChannelTools
         ILoggerFactory loggerFactory,
         [Description(DeletableChannelNameDescription)] string? channel = null,
         [Description(ChannelIdDescription)] string? channel_id = null,
-        [Description(ConfirmChannelDescription)] string? confirm_channel = null,
+        [Description(ConfirmChannelDescription + DeletionResultDescription)] string? confirm_channel = null,
         CancellationToken cancellationToken = default)
     {
         await SessionRegistration.EnsureRegisteredAsync(client, state, server, loggerFactory, cancellationToken);
@@ -212,18 +201,16 @@ public sealed class ChannelTools
     }
 
     [McpServerTool(Name = "messages_remove"), Description(
-        "Permanently remove selected messages from a channel for every session, including pending inbox deliveries. Address it by `channel` (name) or `channel_id` — exactly one. " + DeleteScopeRule + " " + ConfirmRule + "\n" +
-        "Provide 1..200 message IDs from read/send. Missing IDs are ignored; sequence numbers are not reset.\n" +
-        "Returns: { channel_id, name, repo_root, deleted_messages } — repeated removal returns zero.")]
+        "DESTRUCTIVE: permanently delete selected messages from a channel, for all sessions.")]
     public static async Task<string> MessagesRemove(
         BrokerClient client,
         SessionState state,
         McpServer server,
         ILoggerFactory loggerFactory,
-        [Description("Message IDs to remove (1..200)")] string[] message_ids,
+        [Description("Message IDs to remove (1..200), from read or send. Missing IDs are ignored, so removing them again returns zero")] string[] message_ids,
         [Description(DeletableChannelNameDescription)] string? channel = null,
         [Description(ChannelIdDescription)] string? channel_id = null,
-        [Description(ConfirmChannelDescription)] string? confirm_channel = null,
+        [Description(ConfirmChannelDescription + DeletionResultDescription)] string? confirm_channel = null,
         CancellationToken cancellationToken = default)
     {
         await SessionRegistration.EnsureRegisteredAsync(client, state, server, loggerFactory, cancellationToken);
@@ -238,16 +225,16 @@ public sealed class ChannelTools
     }
 
     [McpServerTool(Name = "wait"), Description(
-        "Long-poll: block up to timeout_seconds (default 120, max 120) until a directed message arrives — mentions, replies, review requests. Returns as soon as something lands; timed_out:true at the deadline.\n" +
-        "Call it without timeout_seconds: the default returns the moment a message lands, so a shorter window only adds empty polls. The client's MCP request timeout must exceed the window (omp: timeout 130000 on the peers entry); a client limited to less passes a smaller timeout_seconds.\n" +
-        "At-least-once by receipt: pass inbox_id values from your PREVIOUS result as ack_inbox_ids; ids you never echo are redelivered, never lost.")]
+        "Wait for a directed message (mention, reply, review request); returns as soon as one lands.")]
     public static Task<string> Wait(
         BrokerClient client,
         SessionState state,
         McpServer server,
         ILoggerFactory loggerFactory,
-        [Description("Max seconds to block waiting for directed events (default 120, max 120). Omit it unless your client's MCP request timeout is under 130s")] int? timeout_seconds = null,
-        [Description("inbox_id strings from a PREVIOUS wait result, to acknowledge them")] string[]? ack_inbox_ids = null,
+        [Description(
+            "Max seconds to block (default 120, max 120); the result has timed_out:true at the deadline. Omit it: the default returns the moment a message lands, so a shorter window only adds empty polls. " +
+            "The client's MCP request timeout must exceed the window (omp: timeout 130000 on the peers entry); a client limited to less passes a smaller timeout_seconds")] int? timeout_seconds = null,
+        [Description("inbox_id strings from your PREVIOUS wait result, to acknowledge them. Delivery is at-least-once by receipt: ids you never echo are redelivered, never lost")] string[]? ack_inbox_ids = null,
         // SDK-bound (progress token / request cancellation), excluded from the tool schema; see WaitCore.
         IProgress<ProgressNotificationValue>? progress = null,
         CancellationToken cancellationToken = default) =>
@@ -383,15 +370,14 @@ public sealed class ChannelTools
     private const string ChannelNameDescription =
         "Channel name, resolved in this session's repo, then the global scope. Pass this or channel_id, not both";
     private const string DeletableChannelNameDescription =
-        "Channel name, resolved in this session's repo only, never the global scope; delete a global channel by channel_id. Pass this or channel_id, not both";
-    private const string DeleteScopeRule =
-        "A name resolves only in this session's repo and never falls back to a global channel of the same name; delete a global channel by `channel_id` with `confirm_channel`.";
+        "Channel name, resolved in this session's repo only: it never falls back to a global channel of the same name. Delete a global channel by channel_id with confirm_channel. Pass this or channel_id, not both";
     private const string ChannelIdDescription =
-        "Channel ID (from channels, channel_create, a message, or an inbox item); reaches a channel scoped to any repo. Pass this or channel, not both";
-    private const string ConfirmRule =
-        "`confirm_channel` is the channel's exact, case-sensitive name; a blank one counts as absent. With `channel_id` it is required and compared with the name the broker stores for that id — the name only, not the repo: names are unique per repo, so check repo_root in the result. With `channel` it is optional, but if given it must equal `channel`. A missing (by id) or mismatched confirmation deletes nothing.";
+        "Channel ID (from channels, a message, or an inbox item); reaches a channel scoped to any repo. Pass this or channel, not both";
     private const string ConfirmChannelDescription =
-        "The channel's exact, case-sensitive name; blank counts as absent. Required with channel_id: compared with the name stored for that id (the name only, not the repo). Optional with channel: if given, it must equal channel. A mismatch deletes nothing";
+        "The channel's exact, case-sensitive name; blank counts as absent. Required with channel_id: compared with the name the broker stores for that id, the name only, not the repo (names are unique per repo, so check repo_root in the result). " +
+        "Optional with channel: if given, it must equal channel. A missing (by id) or mismatched confirmation deletes nothing";
+    private const string DeletionResultDescription =
+        ". The deletion applies to every session and includes the pending inbox deliveries of the deleted messages; sequence numbers are not reset. Returns { channel_id, name, repo_root, deleted_messages }";
 
     /// <summary>
     /// The broker routes are keyed by id, so an id goes straight through — an unknown one is the
@@ -419,10 +405,10 @@ public sealed class ChannelTools
             ? "the global scope (this session has no repo_root)"
             : $"this session's repo_root '{state.RepoRoot}' or the global scope";
         throw new McpException(named.Count == 0
-            ? $"No channel named or with channel_id '{channel}' exists in {scope} or any other repo. List channels with `channels`, or create one with `channel_create`."
+            ? $"No channel named or with channel_id '{channel}' exists in {scope} or any other repo. List channels with `channels` action list, or create one with action create."
             : $"Channel '{channel}' is not in {scope}; a name reaches only those. It exists in another repo: " +
               string.Join("; ", named.Select(c => $"channel_id '{c.ChannelId}' (repo_root '{c.RepoRoot}')")) +
-              ". Pass channel_id instead of channel. For notices to sessions in every repo, create the channel with channel_create global: true.");
+              ". Pass channel_id instead of channel. For notices to sessions in every repo, create the channel with `channels` action create, global: true.");
     }
 
     /// <summary>True for a name, false for an id; anything but exactly one of them is an error.</summary>
