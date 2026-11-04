@@ -635,22 +635,8 @@ public class PeerWaitTests
         ProductionTool(toolName).ProtocolTool.InputSchema.GetProperty("properties")
             .EnumerateObject().Select(p => p.Name).ToArray();
 
-    /// <summary>The tool exactly as production registers it — descriptions included, so a test can hold
-    /// the advertised contract against the behaviour.</summary>
-    private static McpServerTool ProductionTool(string toolName)
-    {
-        var collection = new ServiceCollection();
-        // Production registers logging (Program.cs); without it the SDK treats loggerFactory as a
-        // declared parameter and leaks it into the schema this test pins.
-        collection.AddLogging();
-        collection.AddSingleton(new BrokerClient(new HttpClient { BaseAddress = new Uri("http://localhost") }));
-        collection.AddSingleton(new SessionState());
-        collection.AddSingleton(new Peers.Mcp.Reviews.ReviewStorageOptions(Path.Combine(Path.GetTempPath(), "peers-review-wait-" + Guid.NewGuid().ToString("N"))));
-        var services = collection.BuildServiceProvider();
-
-        var options = ServerOptionsFactory.Create(services, allTools: false);
-        return Assert.Single(options.ToolCollection!, t => t.ProtocolTool.Name == toolName);
-    }
+    private static McpServerTool ProductionTool(string toolName) =>
+        Assert.Single(ProductionServer.Tools(allTools: false), t => t.ProtocolTool.Name == toolName);
 
     // ---- receipt acknowledgement (the ids the caller echoes back, and nothing else) ----
 

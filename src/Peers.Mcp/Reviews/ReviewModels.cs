@@ -64,7 +64,8 @@ internal sealed class ReviewRequest
     public string Phase { get; set; } = "";
     [JsonPropertyName("round"), Required, Description("Positive round number, counted per phase: the next PLAN or CODE round.")]
     public int Round { get; set; }
-    [JsonPropertyName("task"), Required] public string Task { get; set; } = "";
+    [JsonPropertyName("task"), Description("Full task text; PLAN/1 pins it for the channel. Later rounds may omit it to reuse the pinned text; a given task must match it byte-for-byte.")]
+    public string Task { get; set; } = "";
     [JsonPropertyName("base_sha"), Required] public string BaseSha { get; set; } = "";
     [JsonPropertyName("reviewer_peer_id"), Required, Description("Exact peer_id of a different live peer (see `peers`).")]
     public string ReviewerPeerId { get; set; } = "";

@@ -137,4 +137,12 @@ internal sealed class ReviewArtifacts(BrokerClient client, string channelId, str
         var map = await store.PutBlobAsync(ReviewJson.Bytes(new { manifest_path = manifestPath, files }), ct);
         return new(manifest, index, digest, manifestPath, map, files.ToArray());
     }
+    /// <summary>The task text a packet pins, checked against the manifest's task digest.</summary>
+    internal async Task<string> ReadTaskAsync(ReviewManifest manifest, CancellationToken ct = default)
+    {
+        var index = ReviewJson.Parse<ReviewPayloadIndex>(await ReadBlobAsync(manifest.PayloadIndex, ct));
+        var task = index.Files?.SingleOrDefault(f => f.Path == "task.txt");
+        ReviewJson.Require(task is not null && task.Blob.Sha256 == manifest.TaskSha256, "Review task digest mismatch.");
+        return Encoding.UTF8.GetString(await ReadBlobAsync(task.Blob, ct));
+    }
 }

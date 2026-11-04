@@ -1,5 +1,7 @@
 using System.Reflection;
 using System.Text.Json;
+using System.Text.Json.Nodes;
+using Microsoft.Extensions.AI;
 using Microsoft.Extensions.DependencyInjection;
 using ModelContextProtocol;
 using ModelContextProtocol.Protocol;
@@ -167,11 +169,35 @@ internal static class ServerOptionsFactory
 
             var tool = McpServerTool.Create(method, target: null, new()
             {
-                Services = services
+                Services = services,
+                SchemaCreateOptions = SchemaOptions,
             });
             toolCollection.Add(new ArgumentErrorNamingTool(tool, method));
         }
     }
+
+    /// <summary>
+    /// The SDK publishes every reference-typed and nullable DTO property as <c>"type": [T, "null"]</c>, also
+    /// when the schema lists it as required ([Required], or a record constructor parameter). Agents read
+    /// that as "required, but null is fine" and sent <c>exit_code: null</c> for an unknown status. The tools
+    /// reject null for every required field, so its published type drops the "null" alternative. Binding
+    /// is unchanged: exit_code stays int? so a missing value is still reported, never recorded as a success.
+    /// </summary>
+    private static readonly AIJsonSchemaCreateOptions SchemaOptions = AIJsonSchemaCreateOptions.Default with
+    {
+        TransformSchemaNode = (_, schema) =>
+        {
+            if (schema is not JsonObject node || node["properties"] is not JsonObject properties ||
+                node["required"] is not JsonArray required) return schema;
+            foreach (var name in required.Select(name => name!.GetValue<string>()))
+            {
+                if (properties[name] is not JsonObject property || property["type"] is not JsonArray types) continue;
+                var nonNull = types.Select(type => type!.GetValue<string>()).Where(type => type != "null").ToArray();
+                property["type"] = nonNull.Length == 1 ? nonNull[0] : new JsonArray([.. nonNull.Select(type => (JsonNode)type)]);
+            }
+            return schema;
+        },
+    };
 
     /// <summary>
     /// Argument binding fails inside the SDK before the tool runs, and the SDK answers any non-McpException

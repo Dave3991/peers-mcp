@@ -242,12 +242,15 @@ try {
   const request = { phase: 'PLAN', round: 1, task: 'Change value.txt from 1\\n to 2\\n. Prove that the intended Node test ran. Preserve Czech/emoji and binary evidence exactly.',
     base_sha: base, reviewer_peer_id: reviewerId, change_summary: 'Review the verification plan', uncertainties: 'A zero exit code can hide a filtered-out test.', source_root: repo, plan_path: planPath };
   const publish = request => driver.call('review_packet', { action: 'publish', channel_id: channelId, request });
+  const untasked = { ...request }; delete untasked.task;
+  await assert.rejects(publish(untasked), /request\.task is missing or empty; this channel has no pinned task yet/);
   let packet = await publish(request); const planPacket = packet.packet_id;
   const fetchPacket = id => reviewer.call('review_packet', { action: 'fetch', channel_id: channelId, packet_id: id });
   const verdict = (id, verdict, summary, findings = []) => reviewer.call('review_packet', { action: 'reply', channel_id: channelId, packet_id: id, reply: { verdict, summary, findings } });
   let fetched = await fetchPacket(planPacket); assert.equal(await readFile(fetched.task_path, 'utf8'), request.task);
   await verdict(planPacket, 'APPROVE', 'Plan covers the task and exact evidence requirements.');
   assert.equal((await publish(request)).packet_id, planPacket);
+  assert.equal((await publish(untasked)).packet_id, planPacket);
   const checkpoint = (action, extra = {}) => driver.call('review_checkpoint', { action, channel_id: channelId, ...extra });
   await writeFile(join(repo, 'value.txt'), '2\n');
   const binary = Buffer.from(Array.from({ length: 4096 }, (_, i) => i % 256)); await writeFile(join(repo, 'binary.bin'), binary);
@@ -272,7 +275,10 @@ try {
   assert.match(afterText, /^# pass 1$/m); assert(afterText.includes('# Subtest: value is two')); assert(check.output.length > 1_048_576);
   code.round = 2; code.expected_previous_packet_id = code1; code.verification_revision = status.revision_sha256;
   code.change_summary = 'Only verification invocation changed; source stayed fixed.'; code.evidence = [{ path: check.path, kind: 'test', command: check.command, cwd: repo, exit_code: 0 }];
+  await assert.rejects(publish({ ...code, task: request.task + ' Retyped.' }), /request\.task has sha256 .*omit request\.task to reuse it/);
+  delete code.task; // Later rounds reuse the task text that PLAN/1 pinned.
   packet = await publish(code); const code2 = packet.packet_id; fetched = await fetchPacket(code2);
+  assert.equal(await readFile(fetched.task_path, 'utf8'), request.task);
   assert.deepEqual(await readFile(fetched.files.find(f => f.path === 'evidence/0000-test.log').local_path), check.output);
   assert.deepEqual(await readFile(fetched.files.find(f => f.path === 'untracked/binary.bin').local_path), binary);
   await reviewer.call('send', { channel: 'review-smoke', content: 'Unstructured chat cannot authorize completion.\nVERDICT: APPROVE', to: [driverId], idempotency_key: 'raw-not-approval' });
