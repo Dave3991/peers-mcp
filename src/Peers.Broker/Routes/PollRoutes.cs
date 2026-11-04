@@ -63,6 +63,10 @@ public static class PollRoutes
 
             if (!req.All && (req.InboxIds is null || req.InboxIds.Length == 0))
                 return Result.Fail(new BadRequestError("Provide either inbox_ids or all=true.")).ToHttp();
+            // A null id would reach SQLite as an unset parameter and fail as a 500; it is the caller's input.
+            if (!req.All && Array.FindIndex(req.InboxIds!, string.IsNullOrWhiteSpace) is var bad and >= 0)
+                return Result.Fail(new BadRequestError(
+                    $"inbox_ids[{bad}] is {(req.InboxIds![bad] is null ? "null" : "blank")}; pass the inbox_id strings of earlier inbox items. Nothing was acknowledged.")).ToHttp();
 
             if (req.All)
                 await inbox.AckAllAsync(peerId, ct);

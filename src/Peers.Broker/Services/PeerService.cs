@@ -123,34 +123,20 @@ public sealed class PeerService(PeerRepository peers, EventService eventService,
         if (rows == 0)
             return Result.Fail(new NotFoundError($"Peer '{peerId}' not found. Re-register before sending heartbeats."));
 
-        // Only a heartbeat that actually carries a status field changes what peers://peers shows, and only
-        // that one may emit. The 30s background heartbeat sends an all-null request purely to renew the
-        // lease, so an idle peer stays at 0 events/min — a per-peer 2/min event floor would be a bigger
-        // regression than the stale-resource bug this fixes.
+        // Only a heartbeat that actually carries a status or progress field changes what peers://peers
+        // shows, and only that one emits peer.updated. The 30s background heartbeat sends an all-null
+        // request purely to renew the lease, so an idle peer stays at 0 events/min.
         //
-        // No recipients: this is a resource-change signal, not a directed message. Recipients would put a
-        // row in every peer's durable inbox and surface as unread traffic in peer_inbox.
+        // No recipients and no push audience: peer.updated feeds the MCP servers' cached roster (wait
+        // keepalives) and the CLI's event stream. It wakes nobody — roster churn is not a message.
         //
-        // ponytail: no rate gate on progress. The PUSH side is already coalesced — ChannelNotifier polls
-        // at 5s and SubscriptionRegistry unions a batch into one hint per URI — so a gate here would be a
-        // second copy of that in the wrong process, and PeerService is scoped so it would need static
-        // state. What stays uncapped is one small events row per progress call, and note these are NOT
-        // "pruned within seconds": PruneAsync prunes below the MINIMUM active cursor, so one live peer
-        // whose cursor never advances pins the table until the 72h TTL. The real rate ceiling is LLM
-        // tool-call latency. Revisit only if /status events_last_5min says otherwise.
+        // ponytail: no rate gate on progress. What stays uncapped is one small events row per progress
+        // call, and note these are NOT "pruned within seconds": PruneAsync prunes below the MINIMUM
+        // active cursor, so one live peer whose cursor never advances pins the table until the 72h TTL.
+        // The real rate ceiling is LLM tool-call latency. Revisit only if /status events_last_5min says otherwise.
         if (Changes(req))
-        {
-            // channel_peer_ids is the push AUDIENCE: peers this one has actually corresponded with.
-            // Absent (a progress-only update) means nobody is notified — the event still exists for the
-            // notifier's roster cache and the CLI, it just is not a wake-up. Without this every
-            // presence call on the machine woke every subscribed session, including unrelated pairs.
-            var audience = ChangesStatus(req)
-                ? await channelService.CorrespondentPeerIdsAsync(peerId, ct)
-                : null;
-
             await eventService.EmitAsync(EventTypes.PeerUpdated,
-                JsonSerializer.Serialize(new { peer_id = peerId, progress = ProgressText(req), channel_peer_ids = audience }), ct);
-        }
+                JsonSerializer.Serialize(new { peer_id = peerId, progress = ProgressText(req) }), ct);
 
         return Result.Ok();
     }
@@ -158,21 +144,15 @@ public sealed class PeerService(PeerRepository peers, EventService eventService,
     /// <summary>True when the heartbeat supplied at least one status field. RenewLeaseAsync COALESCEs nulls,
     /// so an all-null request provably cannot change a single column other than the lease.</summary>
     private static bool Changes(HeartbeatRequest req) =>
-        ChangesStatus(req) || req.ProgressCurrent is not null;
-
-    /// <summary>True when a heartbeat changed something a peer would want PUSHED. Progress is
-    /// excluded on purpose: it is pull-only, read from the roster or off a wait keepalive.</summary>
-    private static bool ChangesStatus(HeartbeatRequest req) =>
-        req.Summary is not null || req.Role is not null || req.Branch is not null ||
-        req.CommitSha is not null || req.FocusPaths is not null || req.Capabilities is not null;
+        req.Summary is not null || req.Role is not null || req.Branch is not null || req.CommitSha is not null ||
+        req.FocusPaths is not null || req.Capabilities is not null || req.ProgressCurrent is not null;
 
     /// <summary>
     /// Rendered counts for the event payload, or null when this heartbeat carried no progress.
     ///
     /// This exists for ONE consumer: the CLI's `events --follow`, whose SummarizePayload cherry-picks
     /// string keys and would otherwise print a bare peer_id for every progress tick. Nothing
-    /// reconstructs state from here — the resource hint still means "re-read peers://peers". A null
-    /// serialises as "progress": null, which that renderer skips.
+    /// reconstructs state from here. A null serialises as "progress": null, which that renderer skips.
     /// </summary>
     private static string? ProgressText(HeartbeatRequest req) =>
         req.ProgressCurrent is null ? null : ProgressFormat.Counts(req.ProgressCurrent, req.ProgressTotal);

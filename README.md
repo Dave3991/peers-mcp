@@ -81,7 +81,13 @@ so `wait` returns as soon as it arrives.
 `channel_id`. For `send` and `read`, a name resolves in this session's repository first, then the
 global scope — never an unrelated repository. A `channel_id` (from `channels`, `channel_create`, a
 message, or an inbox item) reaches a channel scoped to any repository, e.g. a reviewer in one repo
-answering a driver's channel scoped to another worktree.
+answering a driver's channel scoped to another worktree. If `send` or `read` gets a channel ID in
+`channel`, it uses that channel. If the name exists only in another repository, the error gives the
+`channel_id` and `repo_root` of each match.
+
+`channel_create` scopes a channel to this session's repository by default, or to `repo_root`.
+Pass `global: true` for a channel that sessions in every repository can reach by name, for example
+a notice channel for several repositories.
 
 ### Clear history or remove selected messages
 
@@ -140,7 +146,15 @@ A claim informs; it never blocks a write. A conflict names the holder (peer id, 
 two sessions can split the work — that is the whole mechanism. Claims lapse with their TTL (default 30
 minutes, max 4 hours) or with the holder's 2-minute lease, so a crashed session never holds a path
 hostage and `release` is a courtesy rather than a requirement. Scope is server-derived: a session
-claims inside the repository it registered from, under its own peer id.
+claims under its own peer id. A relative path is claimed in the session's repository. An absolute
+path is claimed in the nearest git working tree that holds it, where the sessions of that tree see it.
+A worktree nested inside a repository (for example `fe/.claude/worktrees/<name>`) is its own tree.
+The broker finds the tree from the nearest parent directory with a `.git` entry. It keys the claim by
+the root that `git rev-parse --show-toplevel` reports, which is the root that sessions register.
+As a result, a path through a symlinked folder or in other case maps to the same claim.
+Each grant and conflict carries its `repo_root`. A path in no git working tree is rejected.
+`release` with an absolute path also matches the caller's own claim on that path after its worktree
+is removed.
 
 ### Retry a send without double-posting
 
@@ -169,7 +183,7 @@ top; the inbox is the guarantee.
 
 | Resource | Payload |
 |----------|---------|
-| `peers://peers` | Same as the `peers` tool. Updates notify only peers you correspond with (mentioned, or mentioned you); progress changes never notify |
+| `peers://peers` | Same as the `peers` tool. It never notifies: presence, progress, registration and expiry are roster changes, not messages |
 | `peers://inbox` | Your unacknowledged inbox — same payload as `wait` returns |
 | `peers://channel/{id}` | A channel's messages, with your own quiet-visibility applied |
 
@@ -188,13 +202,13 @@ by `wait` until you echo their ids back as `ack_inbox_ids`.
 | `peers` | Live roster of sessions: who is working where, on what, with which role |
 | `presence` | Update this session's role, summary, capabilities, focus paths, and progress on long-running work |
 | `channels` | List channels and their repo scope + message counts |
-| `channel_create` | Create a channel (`name`, optional `repo_root`; names unique per scope) |
+| `channel_create` | Create a channel (`name`, optional `repo_root` or `global: true`; names unique per scope) |
 | `channel_clear` | Permanently clear a channel's history and pending deliveries; keep the channel (`channel` in this session's repo only, or `channel_id` with `confirm_channel`) |
 | `messages_remove` | Permanently remove selected `message_ids` from a channel (1..200; `channel` in this session's repo only, or `channel_id` with `confirm_channel`) |
 | `send` | Post to a channel (`channel` name or `channel_id`): `content`, optional `to` mentions, optional `quiet` whisper |
 | `read` | Read a channel (`channel` name or `channel_id`) from `since_seq`; whispers addressed to others are filtered out |
-| `wait` | Long-poll for directed messages (default 25s, max 120s); echo `ack_inbox_ids` to acknowledge receipts |
-| `claim` | Announce the paths this session is editing; reports any live peer already holding them |
+| `wait` | Long-poll for directed messages (default and max 120s); echo `ack_inbox_ids` to acknowledge receipts |
+| `claim` | Announce the paths this session is editing (in this repository or another git working tree); reports any live peer already holding them |
 | `claims` | The whole claim map for this repository, with holders |
 | `release` | Give back claims (named paths, or all of them) |
 | `artifact_publish` | Publish a versioned, content-hashed artifact |
@@ -216,17 +230,23 @@ This result means that the review gate did not authorize completion. It does not
 loaded at launch for the whole client session, so the sha is how a session tells a fresh build from one
 still answering with pre-change tools.
 
-`wait` defaults to 25s because an MCP client's request timeout is one-shot: omp resolves it as
-`OMP_MCP_TIMEOUT_MS`, then the per-server `timeout`, then 30s, and it does not extend that deadline
-when the server reports progress — so the 5s keepalives this server sends cannot save a longer park.
-Ask for more than 25s only after raising the client budget past it (`OMP_MCP_TIMEOUT_MS=130000`, or
-`"timeout": 130000` on the peers entry). Without that, a longer wait dies as a client-side transport
-error that reads exactly like broker silence — and silence is never a verdict.
+`wait` defaults to its 120s maximum. It returns as soon as a directed message arrives, so a shorter
+window only adds empty polls. An MCP client's request timeout is one-shot: omp resolves it as
+`OMP_MCP_TIMEOUT_MS`, then the per-server `timeout`, then 30s. It does not extend that deadline when
+the server reports progress, so the 5s keepalives cannot save a longer park. The client budget must
+be more than the window: set `"timeout": 130000` on the peers entry (or `OMP_MCP_TIMEOUT_MS=130000`).
+Claude Code's default tool-call timeout is several minutes. Codex allows 60s unless
+`tool_timeout_sec = 130` is set on `[mcp_servers.peers]`. A client with a smaller budget must pass a
+smaller `timeout_seconds`. Otherwise the wait fails as a client-side transport error that looks
+exactly like broker silence, and silence is never a verdict.
 
 ## Managed independent review
 
 Use one channel for one task, base commit, source-worktree lineage, and driver.
 Publish PLAN/1 with the full task text and an explicit regular plan file.
+Plan and evidence paths must not pass through a symlink. The only exception is the macOS system links
+`/tmp`, `/var` and `/etc` to `/private`, so files from `mktemp` and `$TMPDIR` are accepted.
+A channel keeps the task text, base commit and source root of PLAN/1. If a later round changes one of them, the error names the changed value and the pinned value.
 After independent PLAN approval, obtain a revision from `review_checkpoint/status` before native verification.
 Publish CODE with that revision and ordered metadata for the exact raw build/test/smoke outputs.
 CODE requires test or smoke evidence. Peers records driver claims and never runs those commands.
@@ -261,6 +281,7 @@ Status reports `source_changed_since_completion` and evidence integrity without 
 
 Channel history authorizes decisions independently of inbox delivery or acknowledgement.
 `review_checkpoint/sync` returns durable `ready_to_ack` IDs and unrelated receipt IDs/types.
+Only `sync` takes `ack_inbox_ids`, and only IDs that an earlier `sync` of the same peer returned in `ready_to_ack`.
 `ready_to_ack` holds only the requests, verdicts, and controls that the review ledger accepted, plus review artifact and deletion notices.
 Every other message in the review channel is an unrelated receipt: a question from the reviewer or a person, and also a `PEERS_REVIEW_V1` record that the workflow rejected, such as a late verdict for an older round.
 Read an unrelated receipt with `read` or `wait` before you acknowledge it through `wait`.
@@ -293,6 +314,8 @@ dotnet build src/Peers.Broker/Peers.Broker.csproj -c Release
 dotnet build src/Peers.Mcp/Peers.Mcp.csproj -c Release
 ```
 
+Contract 8 records a claim on an absolute path in the nearest git working tree that holds it, and adds `repo_root` to each grant and conflict.
+The broker also stops computing a push audience for `peer.updated`, because the roster never notifies.
 Contract 7 adds `GET /channels/{id}`, which deletion by `channel_id` reads to confirm the channel name.
 Contract 6 adds `NotifyPeers=false` for internal review parts, indexes, roots, and checkpoints.
 Ordinary `artifact_publish` keeps its normal notifications. SQLite schema v6 does not change.
@@ -340,7 +363,7 @@ tests/
 ```
 
 **Broker** (`localhost:7856`) stores shared coordination facts and immutable evidence in SQLite at `~/.peers/peers.db` (schema v6).
-`/health` reports HTTP contract 7 independently of the schema version.
+`/health` reports HTTP contract 8 independently of the schema version.
 The broker manages leases, persistent inbox delivery, event fan-out, request limits, and cleanup.
 Internal review artifacts suppress notifications without changing storage or versioning.
 
@@ -376,7 +399,7 @@ Check its health:
 
 ```bash
 curl http://localhost:7856/health
-# {"status":"ok","version":6,"contract":7}
+# {"status":"ok","version":6,"contract":8}
 ```
 
 Or use the CLI:

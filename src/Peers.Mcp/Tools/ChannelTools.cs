@@ -100,7 +100,8 @@ public sealed class ChannelTools
     }
 
     [McpServerTool(Name = "channel_create"), Description(
-        "Create a channel. Name is yours to choose; repo_root tags which repository it belongs to (omit for a global channel).\n" +
+        "Create a channel. Name is yours to choose. It is scoped to this session's repo, to `repo_root` when given, or to every repo with `global: true`.\n" +
+        "A name reaches only channels in the caller's repo and the global scope; sessions in other repos address a repo-scoped channel by its channel_id. Use global for notices meant for sessions in several repos.\n" +
         "Names are unique per scope — creating an existing (repo, name) pair returns an error naming the existing channel.")]
     public static async Task<string> ChannelCreate(
         BrokerClient client,
@@ -108,16 +109,19 @@ public sealed class ChannelTools
         McpServer server,
         ILoggerFactory loggerFactory,
         [Description("Channel name, e.g. 'deploy' or 'mafia-review'")] string name,
-        [Description("Repository root this channel belongs to (defaults to this session's repo)")] string? repo_root = null,
+        [Description("Repository root this channel belongs to (defaults to this session's repo). Omit it with global")] string? repo_root = null,
+        [Description("true creates a global channel, reachable by name from every repo")] bool global = false,
         CancellationToken cancellationToken = default)
     {
+        if (global && repo_root is not null)
+            throw new McpException($"repo_root is '{repo_root}' and global is true; a channel has one scope. Omit repo_root for a global channel, or global for a repo channel.");
         await SessionRegistration.EnsureRegisteredAsync(client, state, server, loggerFactory, cancellationToken);
         try
         {
             var resp = await client.CreateChannelAsync(new CreateChannelRequest
             {
                 Name = name,
-                RepoRoot = repo_root ?? state.RepoRoot,
+                RepoRoot = global ? null : repo_root ?? state.RepoRoot,
                 CreatedByPeerId = state.PeerId!,
             });
             return JsonSerializer.Serialize(resp, JsonOpts);
@@ -234,16 +238,16 @@ public sealed class ChannelTools
     }
 
     [McpServerTool(Name = "wait"), Description(
-        "Long-poll: block up to timeout_seconds (default 25, max 120) until a directed message arrives — mentions, replies, review requests. Returns as soon as something lands; timed_out:true at the deadline.\n" +
-        "The default fits inside the 30s MCP request timeout most clients ship. Progress keepalives go out every 5s, but a client that does not reset its deadline on them aborts a longer wait as a transport error — indistinguishable from broker silence — so raise the client's per-server MCP timeout before passing more than 25.\n" +
+        "Long-poll: block up to timeout_seconds (default 120, max 120) until a directed message arrives — mentions, replies, review requests. Returns as soon as something lands; timed_out:true at the deadline.\n" +
+        "Call it without timeout_seconds: the default returns the moment a message lands, so a shorter window only adds empty polls. The client's MCP request timeout must exceed the window (omp: timeout 130000 on the peers entry); a client limited to less passes a smaller timeout_seconds.\n" +
         "At-least-once by receipt: pass inbox_id values from your PREVIOUS result as ack_inbox_ids; ids you never echo are redelivered, never lost.")]
     public static Task<string> Wait(
         BrokerClient client,
         SessionState state,
         McpServer server,
         ILoggerFactory loggerFactory,
-        [Description("Max seconds to block waiting for directed events (default 25, max 120; above 25 needs the client's MCP request timeout raised to match)")] int? timeout_seconds = null,
-        [Description("inbox_id values from a PREVIOUS wait result, to acknowledge them")] string[]? ack_inbox_ids = null,
+        [Description("Max seconds to block waiting for directed events (default 120, max 120). Omit it unless your client's MCP request timeout is under 130s")] int? timeout_seconds = null,
+        [Description("inbox_id strings from a PREVIOUS wait result, to acknowledge them")] string[]? ack_inbox_ids = null,
         // SDK-bound (progress token / request cancellation), excluded from the tool schema; see WaitCore.
         IProgress<ProgressNotificationValue>? progress = null,
         CancellationToken cancellationToken = default) =>
@@ -266,16 +270,23 @@ public sealed class ChannelTools
     {
         try
         {
+            if (ack_inbox_ids is not null)
+                for (var i = 0; i < ack_inbox_ids.Length; i++)
+                    if (string.IsNullOrWhiteSpace(ack_inbox_ids[i]))
+                        throw new McpException($"ack_inbox_ids[{i}] is {(ack_inbox_ids[i] is null ? "null" : "blank")}; " +
+                            "pass the inbox_id strings of a previous wait result, or omit ack_inbox_ids. Nothing was acknowledged.");
+
             await SessionRegistration.EnsureRegisteredAsync(client, state, server, loggerFactory, cancellationToken);
 
             // Before the long poll, so an id acknowledged now cannot come back in this same result.
             if (ack_inbox_ids is { Length: > 0 })
                 await client.AckInboxAsync(state.PeerId!, ack_inbox_ids, cancellationToken: cancellationToken);
 
-            // 25s, not the broker route's 60: an MCP client's request timeout is one-shot (omp: 30s
-            // default, no progress-based reset), so a longer default hands the caller a transport error
-            // instead of timed_out. Callers who raised their client budget can still ask for up to 120.
-            var t = Math.Clamp(timeout_seconds ?? 25, 1, 120);
+            // The broker's maximum. The poll returns the moment a directed message lands, so a long
+            // window costs nothing, while a short one only multiplies empty polls. An MCP client's
+            // request timeout is one-shot (omp does not reset it on progress), so the client budget
+            // must exceed this window: omp's peers entry sets 130000 ms.
+            var t = Math.Clamp(timeout_seconds ?? 120, 1, 120);
             var completed = false;
             // Linked, so a client cancellation stops the ticker as well as the broker call.
             using var cts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
@@ -385,16 +396,33 @@ public sealed class ChannelTools
     /// <summary>
     /// The broker routes are keyed by id, so an id goes straight through — an unknown one is the
     /// broker's NotFound. A name stays scoped: this session's repo first, then global, never an
-    /// unrelated repo; addressing another repo's channel takes its explicit id.
+    /// unrelated repo; addressing another repo's channel takes its explicit id. A name that misses both
+    /// is diagnosed rather than reported missing: a channel id passed as the name reaches that channel
+    /// (the id is unambiguous), and a same-named channel in another repo is reported with its id.
     /// </summary>
     private static async Task<string> ChannelIdAsync(
         BrokerClient client, SessionState state, string? channel, string? channelId, CancellationToken ct)
     {
         if (!ByName(channel, channelId)) return channelId!;
 
-        var ch = await ResolveChannelAsync(client, channel!, state.RepoRoot, ct)
-                 ?? await ResolveChannelAsync(client, channel!, null, ct);
-        return ch?.ChannelId ?? throw new McpException($"Channel '{channel}' not found.");
+        if (state.RepoRoot is not null && await ResolveChannelAsync(client, channel!, state.RepoRoot, ct) is { } own)
+            return own.ChannelId;
+        // ListAsync(null) returns every channel, so the global lookup and the diagnosis share one read.
+        var named = (await client.ListChannelsAsync(null, limit: 500)).Channels
+            .Where(c => string.Equals(c.Name, channel, StringComparison.Ordinal)).ToList();
+        if (named.FirstOrDefault(c => c.RepoRoot is null) is { } global)
+            return global.ChannelId;
+        try { return (await client.GetChannelAsync(channel!, ct)).ChannelId; }
+        catch (BrokerApiException ex) when (ex.StatusCode == System.Net.HttpStatusCode.NotFound) { }
+
+        var scope = state.RepoRoot is null
+            ? "the global scope (this session has no repo_root)"
+            : $"this session's repo_root '{state.RepoRoot}' or the global scope";
+        throw new McpException(named.Count == 0
+            ? $"No channel named or with channel_id '{channel}' exists in {scope} or any other repo. List channels with `channels`, or create one with `channel_create`."
+            : $"Channel '{channel}' is not in {scope}; a name reaches only those. It exists in another repo: " +
+              string.Join("; ", named.Select(c => $"channel_id '{c.ChannelId}' (repo_root '{c.RepoRoot}')")) +
+              ". Pass channel_id instead of channel. For notices to sessions in every repo, create the channel with channel_create global: true.");
     }
 
     /// <summary>True for a name, false for an id; anything but exactly one of them is an error.</summary>

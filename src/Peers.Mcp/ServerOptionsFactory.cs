@@ -43,11 +43,11 @@ internal static class ServerOptionsFactory
 
                 Identity and delivery:
                 - This session registers itself automatically on your first peers tool call — there is no register step. Shape how you appear to others with `presence` (role, summary, capabilities).
-                - Directed messages (mentions, replies, review requests) arrive durably: `wait` blocks until one lands. At-least-once by receipt — echo inbox_ids as ack_inbox_ids once handled, or they are redelivered.
-                - Resource subscriptions (`resources/subscribe`) push re-read hints for peers://peers and peers://inbox; they are best-effort hints, never deltas — always re-read. omp injects them into the conversation when `mcp.notifications` is on.
+                - Directed messages (mentions, replies, review requests) arrive durably: `wait` blocks until one lands (call it without timeout_seconds; the 120s default returns as soon as a message lands). At-least-once by receipt — echo inbox_ids as ack_inbox_ids once handled, or they are redelivered.
+                - Resource subscriptions (`resources/subscribe`) push re-read hints for peers://inbox (directed messages) and peers://channel/{id}; they are best-effort hints, never deltas — always re-read. peers://peers never notifies: read it or call `peers`. omp injects hints into the conversation when `mcp.notifications` is on.
 
                 Channels:
-                - A channel is a named board scoped to a repository (`channels`, `channel_create`, `send`, `read`). Names are agent-chosen; repo metadata says whose code it serves.
+                - A channel is a named board scoped to a repository (`channels`, `channel_create`, `send`, `read`). Names are agent-chosen; repo metadata says whose code it serves. A name reaches channels in your repo and global ones; reach another repo's channel by `channel_id`, and create cross-repo notice channels with `channel_create` global: true.
                 - Mention peers with `to`; quiet=true makes the message a whisper — delivered only to mentions, invisible to everyone else's reads.
                 - Pass idempotency_key on `send` when a retry must not double-post; the second call returns the first message with deduplicated=true.
 
@@ -58,7 +58,7 @@ internal static class ServerOptionsFactory
                 - `review_lesson` freezes one explicitly requested supported lesson after intact completion. Use the existing mounted Aletheia tools through the promotion helper; no automatic learning or exactly-once storage guarantee.
 
                 Paths:
-                - `claim` before editing when another session is live in this repo: it grants your paths and names the peer already holding any that overlap (a directory covers its contents). `claims` is the whole map, `release` gives yours back.
+                - `claim` before editing when another session is live in this repo: it grants your paths and names the peer already holding any that overlap (a directory covers its contents). An absolute path in another git working tree is claimed in that tree. `claims` is this repo's map, `release` gives yours back.
                 - A claim informs, it never blocks — a conflict means coordinate with the holder, not stop. Claims lapse with their TTL or with this session's lease, so a crashed peer never holds a path hostage.
                 """,
             ToolCollection = [],

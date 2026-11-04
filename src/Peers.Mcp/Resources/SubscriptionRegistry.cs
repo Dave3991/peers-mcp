@@ -148,33 +148,18 @@ public sealed class SubscriptionRegistry
         catch (Exception ex) when (ex is not OperationCanceledException) { /* one dead stream, not the batch */ }
     }
 
-    /// <summary>Every resource a broker event changed, or none when it changes none of them.</summary>
+    /// <summary>
+    /// Every resource a broker event changed that is worth a hint, or none. Only channel traffic and
+    /// directed inbox deliveries notify. Roster events (peer.updated for presence and progress,
+    /// peer.registered, peer.expired) never do: omp turns each hint into a user-role turn, and roster
+    /// churn was about a third of them. peers://peers stays readable; registration and expiry still
+    /// reach the inbox durably.
+    /// </summary>
     internal HashSet<string> ResourceUrisFor(PeerEvent evt)
     {
         var uris = new HashSet<string>(StringComparer.Ordinal);
         switch (evt.Type)
         {
-            // A roster change is only OUR business when it is somebody we work with. Unscoped, every
-            // presence call anywhere on the machine woke every subscribed session — and since progress
-            // reporting rides peer.updated, that turned into constant churn from unrelated pairs.
-            //
-            // peer.updated carries channel_peer_ids (peers sharing a channel with the subject);
-            // registered/expired already carry recipient_peer_ids, which the broker resolved the same
-            // way it resolves a mention. Either list absent means "no audience" — notify nobody.
-            case EventTypes.PeerUpdated:
-                if (PayloadNamesUs(evt.Payload, "channel_peer_ids"))
-                    uris.Add(PeerResources.PeersUri);
-                break;
-
-            // Registration and expiry push NOTHING here. Their recipient_peer_ids is the durable INBOX
-            // audience — every peer in the repo — so reusing it as a roster hint is repo scoping, and a
-            // stranger starting a session in your repo would keep waking you. Correspondence scoping
-            // cannot apply either: a peer that just registered has not corresponded with anyone yet.
-            // Nothing is lost — both events already deliver durably to that inbox, so `wait` returns
-            // them and the roster is one `peers` call away.
-            case EventTypes.PeerRegistered or EventTypes.PeerExpired:
-                break;
-
             case EventTypes.ChannelMessageAdded or EventTypes.ChannelMessageRemoved:
                 // Loud messages notify everyone watching the channel; quiet whispers only their own
                 // participants (which includes us when we authored them).

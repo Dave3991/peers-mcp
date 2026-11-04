@@ -49,21 +49,28 @@ internal sealed class ReviewTools
     private static void RequirePayload(string action, string field, bool present, bool required) =>
         ReviewJson.Require(present == required, required
             ? $"{field} is missing; action \"{action}\" requires it."
-            : $"{field} must be omitted for action \"{action}\".");
+            : $"{field} is set, but action \"{action}\" takes no {field}; omit it.");
 
     [McpServerTool(Name = "review_checkpoint"), Description(
         "Restore managed review state from authoritative channel history, inspect source revision, sync explicitly handled receipts, pause/resume (including explicit offline-driver adoption), or gate terminal CODE completion. A blocked gate returns completed:false; input/lock/broker faults are tool errors. Completion after CHANGES rounds adds a non-authoritative lesson_hint that saves nothing.")]
     public static async Task<string> Checkpoint(BrokerClient client, SessionState state, McpServer server,
-        ILoggerFactory loggerFactory, ReviewStorageOptions storage, string action, string channel_id,
-        string? source_root = null, string? expected_packet_id = null, string[]? ack_inbox_ids = null,
-        string? reason = null, CancellationToken cancellationToken = default)
+        ILoggerFactory loggerFactory, ReviewStorageOptions storage,
+        [Description("status, sync, complete, pause, or resume. Exact, lowercase."), AllowedValues("status", "sync", "complete", "pause", "resume")] string action,
+        [Description("The review channel's channel_id.")] string channel_id,
+        [Description("Optional Git working tree of the review (default: this session's repo).")] string? source_root = null,
+        [Description("complete only (required there): the approved CODE packet_id.")] string? expected_packet_id = null,
+        [Description("sync only: ready_to_ack IDs returned by a previous sync. Acknowledge other receipts with wait.")] string[]? ack_inbox_ids = null,
+        [Description("pause: required. resume: optional (give one to adopt an offline driver). Other actions: omit.")] string? reason = null,
+        CancellationToken cancellationToken = default)
     {
-        ReviewJson.Require(!string.IsNullOrWhiteSpace(channel_id) && action is "status" or "sync" or "complete" or "pause" or "resume",
-            "Invalid review_checkpoint action/channel_id.");
-        ReviewJson.Require((action == "complete" ? expected_packet_id is not null : expected_packet_id is null) &&
-            (action == "sync" || ack_inbox_ids is null) &&
-            (action is "pause" or "resume" || reason is null) &&
-            (action != "pause" || !string.IsNullOrWhiteSpace(reason)), "Irrelevant or missing review_checkpoint parameters.");
+        ReviewJson.RequireText("channel_id", channel_id);
+        ReviewJson.RequireOneOf("action", action, CheckpointActions);
+        RequirePayload(action, "expected_packet_id", expected_packet_id is not null, required: action == "complete");
+        ReviewJson.Require(ack_inbox_ids is null || action == "sync",
+            $"ack_inbox_ids lists {ack_inbox_ids?.Length} ID(s), but action \"{action}\" takes none; omit it. " +
+            "Acknowledge ready_to_ack IDs with a separate review_checkpoint action \"sync\" call, and other receipts with wait ack_inbox_ids.");
+        if (action == "pause") ReviewJson.RequireText("reason", reason);
+        else if (action != "resume") RequirePayload(action, "reason", reason is not null, required: false);
         await SessionRegistration.EnsureRegisteredAsync(client, state, server, loggerFactory, cancellationToken);
         try
         {
@@ -74,6 +81,8 @@ internal sealed class ReviewTools
         catch (JsonException ex) { throw new McpException("Invalid review checkpoint JSON.", ex); }
         catch (IOException ex) { throw new McpException("Review filesystem operation failed: " + ex.Message, ex); }
     }
+
+    private static readonly string[] CheckpointActions = ["status", "sync", "complete", "pause", "resume"];
 
     [McpServerTool(Name = "review_lesson"), Description(
         "Explicit optional promotion after intact terminal CODE review. prepare freezes one supported before/after lesson; begin_save grants one durable dispatch through existing Aletheia tools; record and reconcile handle ambiguity and visible duplicates. Never saves memory itself or promises exactly-once storage.")]

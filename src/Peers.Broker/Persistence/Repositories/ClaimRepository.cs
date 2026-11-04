@@ -69,22 +69,44 @@ public sealed class ClaimRepository(SqliteConnectionFactory db)
         }, ct);
     }
 
-    /// <summary>Releases the peer's claims: the named paths, or all of them when <paramref name="paths"/> is null.</summary>
-    public async Task<int> DeleteAsync(string peerId, IReadOnlyList<string>? paths, CancellationToken ct = default)
+    /// <summary>Every claim row <paramref name="peerId"/> holds, in any repo, expired or not: what a release can match.</summary>
+    public async Task<List<(string RepoRoot, string Path)>> ListForPeerAsync(string peerId, CancellationToken ct = default)
     {
+        return await db.ReadAsync(async conn =>
+        {
+            using var cmd = conn.CreateCommand();
+            cmd.CommandText = "SELECT repo_root, path FROM claims WHERE peer_id = @peer";
+            cmd.Parameters.AddWithValue("@peer", peerId);
+
+            var rows = new List<(string RepoRoot, string Path)>();
+            await using var reader = await cmd.ExecuteReaderAsync(ct);
+            while (await reader.ReadAsync(ct))
+                rows.Add((reader.GetString(0), reader.GetString(1)));
+            return rows;
+        }, ct);
+    }
+
+    /// <summary>Releases the peer's claims: the named (repo root, path) pairs, or all of them when <paramref name="targets"/> is null.</summary>
+    public async Task<int> DeleteAsync(string peerId, IReadOnlyList<(string RepoRoot, string Path)>? targets, CancellationToken ct = default)
+    {
+        if (targets is { Count: 0 })
+            return 0;
         return await db.WriteAsync(async conn =>
         {
             using var cmd = conn.CreateCommand();
-            if (paths is null)
+            if (targets is null)
             {
                 cmd.CommandText = "DELETE FROM claims WHERE peer_id = @peer";
             }
             else
             {
-                var names = paths.Select((_, index) => $"@p{index}").ToArray();
-                cmd.CommandText = $"DELETE FROM claims WHERE peer_id = @peer AND path IN ({string.Join(", ", names)})";
-                for (var index = 0; index < paths.Count; index++)
-                    cmd.Parameters.AddWithValue(names[index], paths[index]);
+                var pairs = targets.Select((_, index) => $"(repo_root = @r{index} AND path = @p{index})");
+                cmd.CommandText = $"DELETE FROM claims WHERE peer_id = @peer AND ({string.Join(" OR ", pairs)})";
+                for (var index = 0; index < targets.Count; index++)
+                {
+                    cmd.Parameters.AddWithValue($"@r{index}", targets[index].RepoRoot);
+                    cmd.Parameters.AddWithValue($"@p{index}", targets[index].Path);
+                }
             }
             cmd.Parameters.AddWithValue("@peer", peerId);
             return await cmd.ExecuteNonQueryAsync(ct);

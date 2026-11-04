@@ -5,14 +5,16 @@ namespace Peers.Shared.Contracts;
 /// advisory in the only sense that matters: the broker never blocks an edit, it reports who else is
 /// already on that path so the caller can coordinate instead of discovering the collision in a diff.
 ///
-/// Scope is server-derived — the claiming peer's own repo_root, never a value the caller supplies —
-/// so a session cannot claim paths in a repo it is not working in.
+/// Scope is server-derived, never a value the caller supplies: the claiming peer's own repo_root for a
+/// relative path, and for an absolute path the nearest git working tree that holds it, keyed by the
+/// root git reports — so a session working across sibling or nested worktrees claims each path where
+/// that tree's sessions look.
 /// </summary>
 public sealed class ClaimPathsRequest
 {
     public required string PeerId { get; init; }
 
-    /// <summary>Repo-relative or absolute paths inside the peer's repo. A directory covers everything under it.</summary>
+    /// <summary>Repo-relative paths in the peer's repo, or absolute paths in any git working tree. A directory covers everything under it.</summary>
     public required string[] Paths { get; init; }
 
     /// <summary>Seconds the claim holds; clamped to [60, 14400], default 1800.</summary>
@@ -21,6 +23,7 @@ public sealed class ClaimPathsRequest
 
 public sealed class ClaimPathsResponse
 {
+    /// <summary>The claiming peer's own repo root.</summary>
     public required string RepoRoot { get; init; }
 
     /// <summary>Paths now held by the caller. Re-claiming a path it already holds extends the TTL.</summary>
@@ -33,6 +36,8 @@ public sealed class ClaimPathsResponse
 public sealed class ClaimGrant
 {
     public required string Path { get; init; }
+    /// <summary>The working tree this grant is recorded in; differs from the response's RepoRoot for a path in another tree.</summary>
+    public required string RepoRoot { get; init; }
     public required string ExpiresAt { get; init; }
 }
 
@@ -43,6 +48,7 @@ public sealed class ClaimGrant
 public sealed class ClaimConflict
 {
     public required string Path { get; init; }
+    public required string RepoRoot { get; init; }
     public required string HeldPath { get; init; }
     public required string HolderPeerId { get; init; }
     public string? HolderRole { get; init; }
