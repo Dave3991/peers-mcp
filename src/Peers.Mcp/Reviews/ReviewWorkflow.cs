@@ -304,7 +304,7 @@ internal sealed partial class ReviewWorkflow(BrokerClient client, SessionState s
     {
         var changes = new List<string>();
         if (taskSha256 is not null && taskSha256 != ledger.TaskSha256)
-            changes.Add($"request.task has sha256 {taskSha256[..12]}…, the channel's task has {ledger.TaskSha256[..12]}… (the task text must be byte-identical in every round)");
+            changes.Add($"request.task has sha256 {taskSha256[..12]}…, the channel's task has {ledger.TaskSha256[..12]}… (a given task must match it byte-for-byte; omit request.task to reuse it)");
         if (source.BaseSha != ledger.BaseSha)
             changes.Add($"base_sha resolves to {source.BaseSha}, the channel's base is {ledger.BaseSha}");
         if (source.SourceRoot != ledger.SourceRoot)
@@ -313,13 +313,30 @@ internal sealed partial class ReviewWorkflow(BrokerClient client, SessionState s
             changes.Add($"git dir is {ReviewJson.Show(source.GitDir, path: true)}, the channel's is {ReviewJson.Show(ledger.GitDir, path: true)}");
         return changes.Count == 0 ? null :
             $"Review lineage changed: {string.Join("; ", changes)}. A review channel pins one task, base commit and source tree. " +
-            $"Reuse the channel's values (the original task text, base_sha {ledger.BaseSha}, source_root {ReviewJson.Show(ledger.SourceRoot, path: true)}), or create a new channel for different work.";
+            $"Reuse the channel's values (omit request.task for the pinned text, base_sha {ledger.BaseSha}, source_root {ReviewJson.Show(ledger.SourceRoot, path: true)}), or create a new channel for different work.";
+    }
+    /// <summary>The request's task text. An omitted (null or empty) task is the text this channel pinned with
+    /// its first packet: agents that retyped or summarized it for a later round hit the lineage error.</summary>
+    private async Task<string> RequestTaskAsync(string? task, CancellationToken ct)
+    {
+        if (!string.IsNullOrEmpty(task))
+        {
+            ReviewJson.RequireText("request.task", task);
+            return task;
+        }
+        var store = DriverStore;
+        ReviewLedger? ledger;
+        using (store.Acquire()) ledger = await LoadAsync(store);
+        var pinned = ledger is null ? null : Latest(ledger);
+        ReviewJson.Require(pinned is not null,
+            "request.task is missing or empty; this channel has no pinned task yet, so its first request (PLAN/1) must give the full task text.");
+        return await Artifacts.ReadTaskAsync(pinned.Manifest, ct);
     }
     internal async Task<object> PublishAsync(ReviewRequest request, CancellationToken ct)
     {
         ReviewJson.RequireOneOf("request.phase", request.Phase, ReviewJson.Phases);
         ReviewJson.Require(request.Round > 0, $"request.round is {request.Round}; it must be a positive integer (1 for the first round of each phase).");
-        ReviewJson.RequireText("request.task", request.Task);
+        request.Task = await RequestTaskAsync(request.Task, ct);
         ReviewJson.RequireText("request.base_sha", request.BaseSha);
         ReviewJson.RequireText("request.reviewer_peer_id", request.ReviewerPeerId);
         ReviewJson.Require(request.ChangeSummary is not null, "request.change_summary is null; it must be text.");

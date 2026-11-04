@@ -275,15 +275,16 @@ Publish PLAN/1 with the full task text and an explicit regular plan file.
 Plan and evidence paths must not pass through a symlink. The only exception is the macOS system links
 `/tmp`, `/var` and `/etc` to `/private`, so files from `mktemp` and `$TMPDIR` are accepted.
 A channel keeps the task text, base commit and source root of PLAN/1. If a later round changes one of them, the error names the changed value and the pinned value.
+A later round may omit `task`: the server then reuses the pinned text. A task that is given must match it byte-for-byte.
 After independent PLAN approval, obtain a revision from `review_checkpoint/status` before native verification.
 Publish CODE with that revision and ordered metadata for the exact raw build/test/smoke outputs.
 CODE requires test or smoke evidence. Peers records driver claims and never runs those commands.
-Evidence `kind` is `build`, `test`, `smoke`, or `other` (exact, lowercase).
+Evidence `kind` is `build`, `test`, `smoke`, or `other` (exact, lowercase). Each entry needs the command's integer `exit_code`.
 
 The reviewer replies with verdict `APPROVE` or `CHANGES` and findings whose severity is `HIGH`, `MED`, or `LOW`.
 Verdict and severity match case-insensitively and are stored in that canonical spelling; there are no synonyms such as `REQUEST_CHANGES`.
 `APPROVE` allows only optional findings; `CHANGES` needs at least one blocking finding (`optional: false`).
-The `review_packet` schema lists these allowed values as enums.
+The `review_packet` schema lists these allowed values as enums. It never advertises `null` for a required field; the tool rejects it.
 A rejected call names the field (for example `reply.findings[0].severity`), the value it got, and the allowed values.
 
 The reviewer fetches the exact immutable packet ID and reads the complete materialized payloads.
