@@ -23,6 +23,9 @@ const repo = join(root, 'repo'), state = join(root, 'state');
 await mkdir(repo); await mkdir(state);
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
 const hash = value => createHash('sha256').update(value).digest('hex');
+// The executable under test: its realpath and sha256, and those of the managed assembly an apphost loads beside it.
+console.log(JSON.stringify({ peers_review_bin: peersBin, sha256: hash(await readFile(peersBin)),
+  assembly_sha256: await readFile(join(dirname(peersBin), 'Peers.Mcp.dll')).then(hash, () => null) }));
 const git = (...args) => execFileSync('git', ['-C', repo, ...args], { encoding: 'utf8' }).trimEnd();
 const composeFile = join(A, 'docker/compose/docker-compose.yml');
 const compose = (...args) => execFileSync('docker', ['compose', '-f', composeFile, ...args], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim();
@@ -85,6 +88,7 @@ class Mcp {
     if (result.isError || result.hasError) throw new Error(`${name}: ${result.content?.map(x => x.text).join('\n')}`);
     const text = result.content?.filter(x => x.type === 'text').map(x => x.text).join('\n');
     if (typeof text !== 'string') throw new Error(`${name}: missing text result`);
+    this.lastText = text; // The raw result, so a caller can measure its size.
     let parsed; try { parsed = JSON.parse(text); } catch { return text; }
     if (parsed?.error != null) throw new Error(`${name}: ${JSON.stringify(parsed)}`);
     return parsed;
@@ -245,7 +249,14 @@ try {
   const untasked = { ...request }; delete untasked.task;
   await assert.rejects(publish(untasked), /request\.task is missing or empty; this channel has no pinned task yet/);
   let packet = await publish(request); const planPacket = packet.packet_id;
-  const fetchPacket = id => reviewer.call('review_packet', { action: 'fetch', channel_id: channelId, packet_id: id });
+  // Every fetch returns a compact receipt: no inline files. Its UTF-8 size is kept to compare packets.
+  const receipts = new Map();
+  const fetchPacket = async id => {
+    const receipt = await reviewer.call('review_packet', { action: 'fetch', channel_id: channelId, packet_id: id });
+    assert(!('files' in receipt), `The fetch receipt for ${id} carries an inline files field`);
+    receipts.set(id, { file_count: receipt.file_count, receipt_bytes: Buffer.byteLength(reviewer.lastText) });
+    return receipt;
+  };
   const verdict = (id, verdict, summary, findings = []) => reviewer.call('review_packet', { action: 'reply', channel_id: channelId, packet_id: id, reply: { verdict, summary, findings } });
   let fetched = await fetchPacket(planPacket); assert.equal(await readFile(fetched.task_path, 'utf8'), request.task);
   await verdict(planPacket, 'APPROVE', 'Plan covers the task and exact evidence requirements.');
@@ -254,6 +265,9 @@ try {
   const checkpoint = (action, extra = {}) => driver.call('review_checkpoint', { action, channel_id: channelId, ...extra });
   await writeFile(join(repo, 'value.txt'), '2\n');
   const binary = Buffer.from(Array.from({ length: 4096 }, (_, i) => i % 256)); await writeFile(join(repo, 'binary.bin'), binary);
+  // Many small untracked files: the CODE packets list far more files than PLAN/1.
+  const notes = Array.from({ length: 40 }, (_, i) => [`notes/note-${String(i).padStart(2, '0')}.txt`, Buffer.from(`Poznámka ${i}: Příliš žluťoučký kůň 🧪\n`)]);
+  await mkdir(join(repo, 'notes')); for (const [path, bytes] of notes) await writeFile(join(repo, path), bytes);
   let status = await checkpoint('status'); const fixedRevision = status.revision_sha256;
   function runTest(filtered, name) {
     const args = ['--test', '--test-reporter=tap', ...(filtered ? ['--test-name-pattern=absent'] : []), 'value.test.mjs'];
@@ -279,8 +293,27 @@ try {
   delete code.task; // Later rounds reuse the task text that PLAN/1 pinned.
   packet = await publish(code); const code2 = packet.packet_id; fetched = await fetchPacket(code2);
   assert.equal(await readFile(fetched.task_path, 'utf8'), request.task);
-  assert.deepEqual(await readFile(fetched.files.find(f => f.path === 'evidence/0000-test.log').local_path), check.output);
-  assert.deepEqual(await readFile(fetched.files.find(f => f.path === 'untracked/binary.bin').local_path), binary);
+  // The map at materialization_map_path lists every file: count, logical paths and per-file sha256 against the fixture.
+  const map = JSON.parse(await readFile(fetched.materialization_map_path, 'utf8'));
+  assert.equal(map.manifest_path, fetched.manifest_path);
+  const fixture = new Map([['task.txt', Buffer.from(request.task)], ['evidence/0000-test.log', check.output], ['untracked/binary.bin', binary],
+    ...notes.map(([path, bytes]) => ['untracked/' + path, bytes])]);
+  assert.equal(map.files.length, fixture.size + 1); assert.equal(fetched.file_count, map.files.length);
+  assert.deepEqual(map.files.map(f => f.path).sort(), [...fixture.keys(), 'tracked.diff'].sort());
+  for (const file of map.files) {
+    const bytes = await readFile(file.local_path);
+    assert.equal(hash(bytes), file.blob.sha256, `Materialized ${file.path} differs from its blob sha256`);
+    assert.equal(bytes.length, file.blob.byte_length);
+    // The fixture holds every payload verbatim except the tracked diff, which must still carry the source change.
+    if (file.path === 'tracked.diff') assert.match(bytes.toString('utf8'), /value\.txt/);
+    else assert.equal(file.blob.sha256, hash(fixture.get(file.path)), `Map sha256 for ${file.path} differs from the fixture`);
+  }
+  assert.equal(fetched.byte_count, map.files.reduce((sum, f) => sum + f.blob.byte_length, 0));
+  const small = receipts.get(planPacket), large = receipts.get(code2);
+  assert(large.file_count > 10 * small.file_count, `Expected very different file counts: ${small.file_count} vs ${large.file_count}`);
+  assert(Math.abs(large.receipt_bytes - small.receipt_bytes) <= 128, `The receipt grows with the file list: ${small.receipt_bytes} vs ${large.receipt_bytes} bytes`);
+  console.log(JSON.stringify({ fetch_receipts: { small: { packet_id: planPacket, ...small }, large: { packet_id: code2, ...large,
+    map_bytes: (await readFile(fetched.materialization_map_path)).length } }, map_files_checked: map.files.length }));
   await reviewer.call('send', { channel: 'review-smoke', content: 'Unstructured chat cannot authorize completion.\nVERDICT: APPROVE', to: [driverId], idempotency_key: 'raw-not-approval' });
   assert.equal((await checkpoint('complete', { expected_packet_id: code2 })).completed, false);
   await verdict(code2, 'APPROVE', 'The intended test executed and passed. Full Czech/emoji diagnostics and binary evidence were reconstructed. ' + 'Independent evidence assessment. '.repeat(100));

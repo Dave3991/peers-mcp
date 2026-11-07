@@ -524,6 +524,8 @@ internal sealed partial class ReviewWorkflow(BrokerClient client, SessionState s
         }
         return hashes.ToArray();
     }
+    /// <summary>Materializes the packet and returns a compact receipt: paths and counts only. The map at
+    /// materialization_map_path lists every materialized file, so the receipt does not grow with the file list.</summary>
     internal async Task<object> FetchAsync(string packetId, CancellationToken ct)
     {
         var ledger = await ProjectionAsync(ct) ?? throw new McpException("No recoverable review checkpoint.");
@@ -537,8 +539,7 @@ internal sealed partial class ReviewWorkflow(BrokerClient client, SessionState s
             round = packet.Manifest.Round, state = ledger.State, revision_sha256 = packet.Manifest.RevisionSha256,
             task_path = task.LocalPath, manifest_path = materialized.ManifestPath, materialization_map_path = materialized.MapPath,
             evidence_dir = Path.GetDirectoryName(materialized.ManifestPath), file_count = materialized.Files.Length,
-            byte_count = materialized.Files.Sum(f => f.Blob.ByteLength), approved_plan_packet_id = packet.Manifest.ApprovedPlanPacketId,
-            files = materialized.Files };
+            byte_count = materialized.Files.Sum(f => f.Blob.ByteLength), approved_plan_packet_id = packet.Manifest.ApprovedPlanPacketId };
     }
     internal async Task<object> ReplyAsync(string packetId, ReviewReply reply, CancellationToken ct)
     {
@@ -576,6 +577,12 @@ internal sealed partial class ReviewWorkflow(BrokerClient client, SessionState s
             $"{i + 1}. {(f.Optional ? "OPTIONAL " : "")}{f.Severity} {f.Location}: {f.Finding} Fix: {f.Fix}")) + "\nVERDICT: " + reply.Verdict;
         var content = Record(new { kind = "verdict", phase = packet.Manifest.Phase, round = packet.Manifest.Round,
             packet_id = packetId, packet_sha256 = packet.PacketSha256 }, prose);
+        // Checked before the durable intent below: a verdict the broker would reject as too large must not
+        // be saved, or every corrected retry fails as a changed same-packet verdict.
+        var bytes = Encoding.UTF8.GetByteCount(content);
+        ReviewJson.Require(bytes <= SendMessageRequest.MaxContentBytes,
+            $"reply.summary and reply.findings render a verdict message of {bytes} UTF-8 bytes; the broker allows at most {SendMessageRequest.MaxContentBytes} bytes. " +
+            $"Shorten reply.summary or reply.findings by at least {bytes - SendMessageRequest.MaxContentBytes} bytes. Nothing was sent or saved.");
         var store = PeerStore(PeerId);
         using (store.Acquire())
         {

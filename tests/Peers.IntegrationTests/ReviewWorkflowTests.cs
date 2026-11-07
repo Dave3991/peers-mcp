@@ -3,6 +3,7 @@ using System.Net.Http.Json;
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Nodes;
+using System.Text.RegularExpressions;
 using Microsoft.AspNetCore.Builder;
 using Microsoft.AspNetCore.Hosting;
 using Microsoft.AspNetCore.TestHost;
@@ -11,6 +12,7 @@ using ModelContextProtocol.Client;
 using ModelContextProtocol.Protocol;
 using ModelContextProtocol.Server;
 using Peers.Broker.Hosting;
+using Peers.Broker.Validation;
 using Peers.Mcp;
 using Peers.Mcp.Reviews;
 using Peers.Shared.Contracts;
@@ -28,6 +30,9 @@ public sealed class ReviewWorkflowTests
         var fetched = await f.Reviewer.Call("review_packet", new { action = "fetch", channel_id = f.ChannelId, packet_id = planId });
         Assert.Equal(plan["packet_sha256"]!.GetValue<string>(), ReviewJson.Hash(await File.ReadAllBytesAsync(fetched["manifest_path"]!.GetValue<string>())));
         Assert.Equal(f.TaskText, await File.ReadAllTextAsync(fetched["task_path"]!.GetValue<string>()));
+        var planMap = await ReviewFixture.MapOf(fetched);
+        Assert.Equal(["plan.md", "task.txt", "tracked.diff"], planMap.Keys.Order(StringComparer.Ordinal).ToArray());
+        Assert.Equal(await File.ReadAllBytesAsync(f.PlanPath), await File.ReadAllBytesAsync(planMap["plan.md"]));
         await f.Reply(planId, "APPROVE");
         await File.WriteAllTextAsync(Path.Combine(f.Root, "value.txt"), "2\n");
         var binary = new byte[] { 0, 255, 128, 42 };
@@ -35,9 +40,12 @@ public sealed class ReviewWorkflowTests
         await File.WriteAllTextAsync(f.LogPath, string.Concat(Enumerable.Repeat("Čeština 🧪\n", 100000)) + "# pass 1\n");
         var code1 = await f.PublishCode(1, planId); var id1 = code1["packet_id"]!.GetValue<string>();
         fetched = await f.Reviewer.Call("review_packet", new { action = "fetch", channel_id = f.ChannelId, packet_id = id1 });
-        var files = fetched["files"]!.AsArray();
-        Assert.Equal(await File.ReadAllBytesAsync(f.LogPath), await File.ReadAllBytesAsync(files.Single(x => x!["path"]!.GetValue<string>() == "evidence/0000-test.log")!["local_path"]!.GetValue<string>()));
-        Assert.Equal(binary, await File.ReadAllBytesAsync(files.Single(x => x!["path"]!.GetValue<string>() == "untracked/new.bin")!["local_path"]!.GetValue<string>()));
+        // The receipt is compact; the map at materialization_map_path lists exactly the packet's files.
+        var map = await ReviewFixture.MapOf(fetched);
+        Assert.Equal(["evidence/0000-test.log", "task.txt", "tracked.diff", "untracked/new.bin"], map.Keys.Order(StringComparer.Ordinal).ToArray());
+        Assert.Equal(f.TaskText, await File.ReadAllTextAsync(map["task.txt"]));
+        Assert.Equal(await File.ReadAllBytesAsync(f.LogPath), await File.ReadAllBytesAsync(map["evidence/0000-test.log"]));
+        Assert.Equal(binary, await File.ReadAllBytesAsync(map["untracked/new.bin"]));
         var rawChat = await f.Broker.SendMessageAsync(f.ChannelId, new SendMessageRequest { AuthorPeerId = f.Reviewer.Id, To = [f.Driver.Id], Content = "Raw chat\nVERDICT: APPROVE" });
         Assert.False((await f.Complete(id1))["completed"]!.GetValue<bool>());
         await f.Reviewer.Error("review_packet", new { action = "reply", channel_id = f.ChannelId, packet_id = id1,
@@ -251,13 +259,16 @@ public sealed class ReviewWorkflowTests
     {
         await using var f = await ReviewFixture.CreateAsync();
         var p = (await f.PublishPlan())["packet_id"]!.GetValue<string>();
+        var before = await f.Dispatched();
         var finding = new { severity = "HIGH", location = "plan.md", finding = "No test named", fix = "Name the test", optional = false };
         var verdict = await f.Reviewer.Error("review_packet", new { action = "reply", channel_id = f.ChannelId, packet_id = p,
             reply = new { verdict = "REQUEST_CHANGES", summary = "The plan names no test", findings = new[] { finding } } });
         Assert.Contains("reply.verdict is \"REQUEST_CHANGES\"; allowed values: APPROVE, CHANGES (case-insensitive).", verdict);
+        Assert.Equal(before, await f.Dispatched());
         var severity = await f.Reviewer.Error("review_packet", new { action = "reply", channel_id = f.ChannelId, packet_id = p,
             reply = new { verdict = "CHANGES", summary = "The plan names no test", findings = new[] { finding with { severity = "CRITICAL" } } } });
         Assert.Contains("reply.findings[0].severity is \"CRITICAL\"; allowed values: HIGH, MED, LOW (case-insensitive).", severity);
+        Assert.Equal(before, await f.Dispatched());
         Assert.Single((await f.Broker.ReadChannelMessagesAsync(f.ChannelId, f.Driver.Id))!.Messages); // Only the PLAN request.
     }
 
@@ -265,6 +276,7 @@ public sealed class ReviewWorkflowTests
     public async Task Publish_error_for_a_wrong_evidence_kind_names_kind_and_its_allowed_values()
     {
         await using var f = await ReviewFixture.CreateAsync();
+        var before = await f.Dispatched();
         var error = await f.Driver.Error("review_packet", new { action = "publish", channel_id = f.ChannelId, request = new
         {
             phase = "CODE", round = 1, task = f.TaskText, base_sha = f.Base, reviewer_peer_id = f.Reviewer.Id, change_summary = "code",
@@ -272,6 +284,7 @@ public sealed class ReviewWorkflowTests
             evidence = new[] { new { path = f.LogPath, kind = "unit", command = "dotnet test", cwd = f.Root, exit_code = 0 } },
         } });
         Assert.Contains("request.evidence[0].kind is \"unit\"; allowed values: build, test, smoke, other.", error);
+        Assert.Equal(before, await f.Dispatched());
     }
 
     // A missing field or a JSON value of the wrong type used to fail argument binding inside the SDK,
@@ -281,6 +294,7 @@ public sealed class ReviewWorkflowTests
     {
         await using var f = await ReviewFixture.CreateAsync();
         var p = (await f.PublishPlan())["packet_id"]!.GetValue<string>();
+        var before = await f.Dispatched();
         var missing = await f.Reviewer.Error("review_packet", new { action = "reply", channel_id = f.ChannelId, packet_id = p,
             reply = new { verdict = "CHANGES", summary = "s", findings = new[] { new { severity = "HIGH", location = "x", finding = "y" } } } });
         Assert.Contains("reply.findings[0].fix is missing or empty; it must be non-blank text.", missing);
@@ -291,6 +305,86 @@ public sealed class ReviewWorkflowTests
         var topLevel = await f.Reviewer.Error("review_packet", new { action = "fetch", channel_id = f.ChannelId, packet_id = 5 });
         Assert.Contains("packet_id has the wrong JSON type: ", topLevel);
         Assert.Contains("System.String", topLevel);
+        Assert.Equal(before, await f.Dispatched());
+    }
+
+    // Observed 2026-11-07: an oversized verdict was saved as the durable reply intent before the broker
+    // refused it with 413, so a shorter retry failed as a changed same-packet verdict and the reviewer
+    // was locked out of the round. The size of the final rendered message is checked first, in UTF-8 bytes.
+    [Fact]
+    public async Task Oversized_multibyte_reply_is_rejected_before_its_intent_and_a_smaller_reply_succeeds()
+    {
+        await using var f = await ReviewFixture.CreateAsync();
+        var p = (await f.PublishPlan())["packet_id"]!.GetValue<string>();
+        var before = await f.Dispatched();
+        // 11 UTF-16 chars but 15 UTF-8 bytes per repeat: under the limit in chars, over it in bytes.
+        var summary = string.Concat(Enumerable.Repeat("Čeština 🧪 ", 8000));
+        Assert.True(summary.Length < SendMessageRequest.MaxContentBytes);
+        Assert.True(Encoding.UTF8.GetByteCount(summary) > SendMessageRequest.MaxContentBytes);
+        var error = await f.Reviewer.Error("review_packet", new { action = "reply", channel_id = f.ChannelId, packet_id = p,
+            reply = new { verdict = "APPROVE", summary, findings = Array.Empty<object>() } });
+        Assert.Equal(before, await f.Dispatched());
+        Assert.DoesNotContain(f.ReviewerState()?.Replies ?? [], intent => intent.PacketId == p);
+        var size = Regex.Match(error, @"reply\.summary and reply\.findings render a verdict message of (\d+) UTF-8 bytes; the broker allows at most (\d+) bytes\.");
+        Assert.True(size.Success, error);
+        Assert.True(int.Parse(size.Groups[1].Value) > Encoding.UTF8.GetByteCount(summary));
+        Assert.Equal(SendMessageRequest.MaxContentBytes, int.Parse(size.Groups[2].Value));
+
+        var corrected = await f.Reply(p, "APPROVE", string.Concat(Enumerable.Repeat("Čeština 🧪 ", 2000)));
+        Assert.False(corrected["deduplicated"]!.GetValue<bool>());
+        Assert.Equal("approved", (await f.Status())["state"]!.GetValue<string>());
+        Assert.Equal(before.Messages + 1, (await f.Dispatched()).Messages);
+        Assert.Equal(p, Assert.Single(f.ReviewerState()!.Replies).PacketId);
+    }
+
+    // RequestLimits.ValidateSendMessage refuses before the broker writes: no message, event or inbox entry.
+    [Fact]
+    public async Task Send_limit_errors_name_the_limit_and_dispatch_nothing()
+    {
+        await using var f = await ReviewFixture.CreateAsync();
+        var before = await f.Dispatched();
+        // 2 UTF-8 bytes per char: the broker counts bytes, not chars.
+        var content = await f.Reviewer.Error("send", new { channel_id = f.ChannelId, to = new[] { f.Driver.Id },
+            content = new string('é', SendMessageRequest.MaxContentBytes / 2 + 1) });
+        Assert.Contains("Message content exceeds 100 KB.", content);
+        Assert.Equal(before, await f.Dispatched());
+        var mentions = await f.Reviewer.Error("send", new { channel_id = f.ChannelId,
+            to = Enumerable.Repeat(f.Driver.Id, RequestLimits.MaxMentionCount + 1).ToArray(), content = "Too many mentions" });
+        Assert.Contains($"A message can mention at most {RequestLimits.MaxMentionCount} peers.", mentions);
+        Assert.Equal(before, await f.Dispatched());
+        var key = await f.Reviewer.Error("send", new { channel_id = f.ChannelId, to = new[] { f.Driver.Id }, content = "Long key",
+            idempotency_key = new string('k', RequestLimits.MaxIdempotencyKeyLength + 1) });
+        Assert.Contains($"Idempotency key exceeds {RequestLimits.MaxIdempotencyKeyLength} characters.", key);
+        Assert.Equal(before, await f.Dispatched());
+    }
+
+    // A plain send whose HTTP response is lost after the broker committed it: the retry with the same key
+    // returns that message instead of posting a second one.
+    [Fact]
+    public async Task Lost_plain_send_response_recovers_by_key_as_one_message_event_and_inbox_entry()
+    {
+        await using var f = await ReviewFixture.CreateAsync();
+        var send = new { channel_id = f.ChannelId, to = new[] { f.Driver.Id }, content = "Question: keep the trailing newline?", idempotency_key = "plain-question-1" };
+        f.Handler.LoseNextSendKind = "plain";
+        await f.Reviewer.Error("send", send);
+        Assert.Null(f.Handler.LoseNextSendKind); // The fault fired after the broker committed the send.
+        var stored = Assert.Single((await f.Broker.ReadChannelMessagesAsync(f.ChannelId, f.Driver.Id))!.Messages);
+
+        var retry = await f.Reviewer.Call("send", send);
+        Assert.True(retry["deduplicated"]!.GetValue<bool>());
+        Assert.Equal(stored.MessageId, retry["message_id"]!.GetValue<string>());
+        Assert.Equal(stored.Seq, retry["seq"]!.GetValue<long>());
+        // Unchanged broker behaviour: the same key with different content still returns the first message.
+        var changed = await f.Reviewer.Call("send", send with { content = "A different question" });
+        Assert.True(changed["deduplicated"]!.GetValue<bool>());
+        Assert.Equal(stored.MessageId, changed["message_id"]!.GetValue<string>());
+
+        Assert.Equal(stored.Content, Assert.Single((await f.Broker.ReadChannelMessagesAsync(f.ChannelId, f.Driver.Id))!.Messages).Content);
+        Assert.Single((await f.Events()).Events, e => e.Type == Peers.Shared.Models.EventTypes.ChannelMessageAdded && e.Payload.Contains(stored.MessageId, StringComparison.Ordinal));
+        Assert.Single((await f.Broker.GetInboxAsync(f.Driver.Id, limit: 500))!.Items,
+            i => i.Event.Type == Peers.Shared.Models.EventTypes.ChannelMessageAdded && i.Event.Payload.Contains(stored.MessageId, StringComparison.Ordinal));
+        Assert.DoesNotContain((await f.Broker.GetInboxAsync(f.Reviewer.Id, limit: 500))!.Items,
+            i => i.Event.Payload.Contains(stored.MessageId, StringComparison.Ordinal));
     }
 
     // The argument-type wrapper translates only binding failures. A tool's own McpException that wraps a
@@ -430,6 +524,7 @@ internal sealed class ReviewFixture : IAsyncDisposable
     internal ReviewTestPeer Driver { get; private set; } = null!;
     internal ReviewTestPeer Reviewer { get; private set; } = null!;
     private WebApplication _app = null!;
+    private HttpClient _raw = null!; // Bypasses the fault handler.
     private readonly List<ReviewTestPeer> _peers = [];
     internal static async Task<ReviewFixture> CreateAsync()
     {
@@ -443,6 +538,7 @@ internal sealed class ReviewFixture : IAsyncDisposable
         f._app = builder.Build(); BrokerHost.MapBrokerRoutes(f._app); await f._app.StartAsync();
         f.Handler = new ReviewFaultHandler(f._app.GetTestServer().CreateHandler());
         f.Broker = new BrokerClient(new HttpClient(f.Handler) { BaseAddress = new Uri("http://localhost") });
+        f._raw = new HttpClient(f._app.GetTestServer().CreateHandler()) { BaseAddress = new Uri("http://localhost") };
         f.Driver = await f.NewPeer("driver"); f.Reviewer = await f.NewPeer("reviewer");
         f.ChannelId = (await f.Broker.CreateChannelAsync(new CreateChannelRequest { Name = "review", RepoRoot = f.Root, CreatedByPeerId = f.Driver.Id })).ChannelId;
         return f;
@@ -472,14 +568,51 @@ internal sealed class ReviewFixture : IAsyncDisposable
     /// <summary>The driver's inbox receipt for one channel message.</summary>
     internal async Task<string> ReceiptOf(string messageId) => (await Broker.GetInboxAsync(Driver.Id, limit: 500))!.Items
         .Single(i => i.Event.Type == Peers.Shared.Models.EventTypes.ChannelMessageAdded && i.Event.Payload.Contains(messageId, StringComparison.Ordinal)).InboxId;
+    /// <summary>Every broker event, read with peek so no peer's poll cursor moves.</summary>
+    internal async Task<PollResponse> Events() =>
+        (await _raw.GetFromJsonAsync<PollResponse>($"/poll/{Driver.Id}?cursor=0&limit=100000&peek=true", new JsonSerializerOptions(JsonSerializerDefaults.Web)))!;
+    /// <summary>What a rejected call must leave unchanged: the channel's messages, the event cursor and both peers' inboxes.</summary>
+    internal async Task<DispatchState> Dispatched() => new(
+        (await Broker.ReadChannelMessagesAsync(ChannelId, Driver.Id))!.Messages.Length, (await Events()).Cursor,
+        (await Broker.GetInboxAsync(Driver.Id, limit: 500))!.Count, (await Broker.GetInboxAsync(Reviewer.Id, limit: 500))!.Count);
+    /// <summary>The reviewer's private review state, where a reply intent is saved before its send.</summary>
+    internal ReviewPeerState? ReviewerState()
+    {
+        var store = new ReviewStore(new ReviewStorageOptions(Storage), ChannelId, "reviewer-" + ReviewJson.Hash(Reviewer.Id));
+        using (store.Acquire()) return store.Load<ReviewPeerState>();
+    }
+    /// <summary>
+    /// The map a fetch receipt points to, as logical path to local path. Checks that the receipt has no inline
+    /// files, and that the map's count, total bytes and every file's sha256 and length match the receipt and the bytes on disk.
+    /// </summary>
+    internal static async Task<Dictionary<string, string>> MapOf(JsonNode receipt)
+    {
+        Assert.False(receipt.AsObject().ContainsKey("files"), "The fetch receipt still carries an inline files array.");
+        var map = JsonNode.Parse(await File.ReadAllTextAsync(receipt["materialization_map_path"]!.GetValue<string>()))!;
+        Assert.Equal(receipt["manifest_path"]!.GetValue<string>(), map["manifest_path"]!.GetValue<string>());
+        var files = map["files"]!.AsArray();
+        Assert.Equal(receipt["file_count"]!.GetValue<int>(), files.Count);
+        var paths = new Dictionary<string, string>(StringComparer.Ordinal);
+        long total = 0;
+        foreach (var file in files)
+        {
+            var local = file!["local_path"]!.GetValue<string>(); var bytes = await File.ReadAllBytesAsync(local);
+            Assert.Equal(file["blob"]!["sha256"]!.GetValue<string>(), ReviewJson.Hash(bytes));
+            Assert.Equal(file["blob"]!["byte_length"]!.GetValue<long>(), bytes.LongLength);
+            paths.Add(file["path"]!.GetValue<string>(), local); total += bytes.LongLength;
+        }
+        Assert.Equal(receipt["byte_count"]!.GetValue<long>(), total);
+        return paths;
+    }
     internal object Proposal(string before, string after, string cue = "When test counts matter") => new { cue, lesson = "Inspect counts", effect = "helped", confidence = "high", confidence_reason = "Fixture contrast",
         before = new[] { new { packet_id = before, path = "task.txt", quote = "Set value to two" } }, after = new[] { new { packet_id = after, path = "evidence/0000-test.log", quote = "# pass 1" } } };
     internal Task<byte[]> Git(params string[] args) => ReviewSnapshot.RunGitAsync(Root, args);
     public async ValueTask DisposeAsync()
     {
-        foreach (var peer in _peers) await peer.DisposeAsync(); Broker.Dispose(); await _app.DisposeAsync(); Directory.Delete(Temporary, true);
+        foreach (var peer in _peers) await peer.DisposeAsync(); Broker.Dispose(); _raw.Dispose(); await _app.DisposeAsync(); Directory.Delete(Temporary, true);
     }
 }
+internal sealed record DispatchState(int Messages, long EventCursor, int DriverInbox, int ReviewerInbox);
 internal sealed class ReviewTestPeer : IAsyncDisposable
 {
     internal string Id { get; private set; } = "";
@@ -519,6 +652,8 @@ internal sealed class ReviewFaultHandler(HttpMessageHandler inner) : DelegatingH
 {
     internal bool LoseNextAck { get; set; }
     internal Action? ChangeOnBlob { get; set; }
+    // Loses the response of the next committed channel send of this kind: a managed record kind
+    // (request, verdict, control), or "plain" for an ordinary send that is no review record.
     internal string? LoseNextSendKind { get; set; }
     // Fails the first channel read after the checkpoint that follows a managed send of this kind: the
     // read a completion makes once its control is sent and its ledger persisted.
@@ -538,8 +673,9 @@ internal sealed class ReviewFaultHandler(HttpMessageHandler inner) : DelegatingH
         {
             var json = await request.Content!.ReadFromJsonAsync<JsonElement>(ct);
             var content = json.GetProperty("content").GetString()!;
-            if (content.StartsWith("PEERS_REVIEW_V1\n", StringComparison.Ordinal) && content.Contains($"\"kind\":\"{LoseNextSendKind}\"", StringComparison.Ordinal))
-            { LoseNextSendKind = null; response.Dispose(); throw new HttpRequestException("Managed send committed; response lost"); }
+            var managed = content.StartsWith("PEERS_REVIEW_V1\n", StringComparison.Ordinal);
+            if (LoseNextSendKind == "plain" ? !managed : managed && content.Contains($"\"kind\":\"{LoseNextSendKind}\"", StringComparison.Ordinal))
+            { LoseNextSendKind = null; response.Dispose(); throw new HttpRequestException("Send committed; response lost"); }
         }
         if (FailReadAfterPersistedSendKind is { } failKind && request.Method == HttpMethod.Post)
         {

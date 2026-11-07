@@ -4,7 +4,6 @@ namespace Peers.Broker.Validation;
 
 public static class RequestLimits
 {
-    public const int MaxEntryContentBytes = 100 * 1024;     // 100 KB
     public const int MaxArtifactContentBytes = 1024 * 1024; // 1 MB
     public const int MaxTitleLength = 500;
     public const int MaxSummaryLength = 2000;
@@ -28,8 +27,8 @@ public static class RequestLimits
 
     public static IResult? ValidateSendMessage(Shared.Contracts.SendMessageRequest req)
     {
-        if (Utf8Bytes(req.Content) > MaxEntryContentBytes)
-            return Results.Json(new { error = $"Message content exceeds {MaxEntryContentBytes / 1024} KB." }, statusCode: 413);
+        if (Utf8Bytes(req.Content) > Shared.Contracts.SendMessageRequest.MaxContentBytes)
+            return Results.Json(new { error = $"Message content exceeds {Shared.Contracts.SendMessageRequest.MaxContentBytes / 1024} KB." }, statusCode: 413);
         if (req.To is { Length: > MaxMentionCount })
             return Results.BadRequest(new { error = $"A message can mention at most {MaxMentionCount} peers." });
         if (req.IdempotencyKey?.Length > MaxIdempotencyKeyLength)
