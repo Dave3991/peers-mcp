@@ -18,7 +18,8 @@ internal sealed class ReviewTools
         ILoggerFactory loggerFactory, ReviewStorageOptions storage,
         [Description(
             "publish (driver: needs request): publish a complete, immutable PLAN or CODE packet for independent review. PLAN approval precedes CODE.\n" +
-            "fetch (needs packet_id): fetch the packet's verified private evidence files. A fetch never approves; evidence claims are not executed.\n" +
+            "fetch (needs packet_id): verify and materialize the packet's private evidence files. The receipt gives paths and counts; " +
+            "the map at materialization_map_path lists every materialized file. A fetch never approves; evidence claims are not executed.\n" +
             "reply (selected reviewer: needs packet_id and reply): answer the packet as its exact selected reviewer.\n" +
             "Exact, lowercase."), AllowedValues("publish", "fetch", "reply")] string action,
         [Description("The review channel's channel_id.")] string channel_id,

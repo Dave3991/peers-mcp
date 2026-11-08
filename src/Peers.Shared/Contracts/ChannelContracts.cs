@@ -38,6 +38,12 @@ public sealed class ChannelSummary
 
 public sealed class SendMessageRequest
 {
+    /// <summary>
+    /// The largest <see cref="Content"/> the broker accepts, in UTF-8 bytes (100 KiB). The broker's request
+    /// validation and the MCP review reply check before its durable intent both read this one constant.
+    /// </summary>
+    public const int MaxContentBytes = 100 * 1024;
+
     public required string AuthorPeerId { get; init; }
 
     /// <summary>Explicit mentions: peer IDs (prefix match) or repo paths. Mentions are what makes a quiet message visible.</summary>

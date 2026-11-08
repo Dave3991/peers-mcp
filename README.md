@@ -288,6 +288,7 @@ The `review_packet` schema lists these allowed values as enums. It never adverti
 A rejected call names the field (for example `reply.findings[0].severity`), the value it got, and the allowed values.
 
 The reviewer fetches the exact immutable packet ID and reads the complete materialized payloads.
+The fetch receipt gives paths and counts; the map at `materialization_map_path` lists every materialized file.
 Packets include the full tracked binary diff, non-ignored untracked bytes or symlink target text, and supplied evidence.
 Multipart artifacts preserve binary and UTF-8 bytes. Hashes, sizes, order, message identity, and author roles gate decisions.
 An artifact's latest name, an inbox preview, raw approval text, or zero exit status cannot authorize completion.
@@ -354,6 +355,8 @@ Broker startup checks the reported contract after either readiness path.
 A stale selected build reports its actual/required contract and launch path instead of repeated replacement.
 Existing MCP sessions need a restart to expose new tools.
 The merged `channels`, `claims`, and `artifacts` tools and the tool profiles change the MCP server only. The broker contract stays 8.
+Cutover: fetch returns a receipt; the map at `materialization_map_path` lists the files. The receipt has no inline `files` array.
+This changes the MCP server only: the broker contract stays 8, and review protocol 1 (manifest and payload index) does not change.
 A new `dotnet run` session during source/build cutover can cause one transient broker replacement.
 The existing process-name kill guard remains in force.
 
